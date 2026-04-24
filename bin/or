@@ -1,0 +1,90 @@
+#!/bin/bash
+# OpenResty control helper
+# Usage: or {test|start|reload|stop|kill|status|conns|log}
+set -e
+
+OR=/usr/local/openresty/bin/openresty
+LOG_DIR=/usr/local/openresty/nginx/logs
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  test)
+    sudo "$OR" -t
+    ;;
+
+  start)
+    sudo "$OR" -t && sudo "$OR" && echo "started"
+    ;;
+
+  reload)
+    sudo "$OR" -t && sudo "$OR" -s reload && echo "reloaded"
+    ;;
+
+  stop)
+    # graceful: finish in-flight requests then exit
+    sudo "$OR" -s quit && echo "quit signal sent"
+    ;;
+
+  kill)
+    # force stop — closes all connections immediately
+    sudo "$OR" -s stop && echo "stop signal sent"
+    ;;
+
+  status)
+    echo "--- listening ports ---"
+    sudo ss -tlnp 2>/dev/null | grep -E 'openresty|nginx:' | head
+    echo
+    echo "--- processes ---"
+    ps -ef | grep -E 'nginx: (master|worker)' | grep -v grep | wc -l | xargs -I{} echo "{} nginx processes"
+    ps -ef | grep 'nginx: master' | grep -v grep
+    echo
+    echo "--- worker count by start time ---"
+    ps -o lstart= -p $(pgrep -f 'nginx: worker' 2>/dev/null) 2>/dev/null | sort | uniq -c || true
+    ;;
+
+  conns)
+    # dump active_conns counters if the /_active_conns endpoint exists
+    curl -sS http://127.0.0.1:18080/_active_conns 2>/dev/null || echo "not available"
+    echo
+    ;;
+
+  log)
+    # Usage:
+    #   or log            - last 10 of each (one-shot)
+    #   or log -f         - tail -f access.log (follow)
+    #   or log err        - last 20 error.log (non-info)
+    #   or log err -f     - tail -f error.log
+    sub="${2:-}"
+    flag="${3:-}"
+    if [ "$sub" = "-f" ]; then
+      sudo tail -F "$LOG_DIR/access.log"
+    elif [ "$sub" = "err" ] && [ "$flag" = "-f" ]; then
+      sudo tail -F "$LOG_DIR/error.log"
+    elif [ "$sub" = "err" ]; then
+      sudo grep -vE '\[info\]' "$LOG_DIR/error.log" 2>/dev/null | tail -20
+    else
+      echo "--- error.log (last 10 non-info) ---"
+      sudo grep -vE '\[info\]' "$LOG_DIR/error.log" 2>/dev/null | tail -10
+      echo
+      echo "--- access.log (last 10) ---"
+      sudo tail -10 "$LOG_DIR/access.log" 2>/dev/null
+    fi
+    ;;
+
+  *)
+    echo "Usage: or {test|start|reload|stop|kill|status|conns|log}"
+    echo "  test     - syntax check config"
+    echo "  start    - start openresty (must not be running)"
+    echo "  reload   - graceful reload after config change (does NOT drop connections)"
+    echo "  stop     - graceful shutdown (waits for in-flight requests)"
+    echo "  kill     - force stop (drops all connections)"
+    echo "  status   - show processes, ports, worker count"
+    echo "  conns    - dump /_active_conns counters"
+    echo "  log          - last 10 of access/error log (one-shot)"
+    echo "  log -f       - follow access.log in real time"
+    echo "  log err      - last 20 non-info error.log lines"
+    echo "  log err -f   - follow error.log in real time"
+    exit 1
+    ;;
+esac
