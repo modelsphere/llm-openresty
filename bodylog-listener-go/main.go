@@ -1,14 +1,14 @@
-// bodylog-listener: 接收 lua-resty-logger-socket 通过 TCP 发来的 JSONL 日志，
-// 在内存里抽出 SSE / OpenAI / Anthropic 响应里的纯文本结果，落盘成精简 entry。
+// bodylog-listener: 接收 openresty 通过 lua-resty-logger-socket 发来的
+// 长度前缀二进制帧，解析后落盘成抽取过 SSE content 的 JSONL。
 //
-// 替代 Python 版本的原因：单进程 Python 在高 qps（~23 req/s × 1500 chunk/req）
-// 下被 GIL 限到单核 ~28%，TCP recv 反压会让 openresty 端 cosocket send
-// 多 yield 几次（实测 W3 pct=100 TTFT +16%）。Go 用 goroutine 跑满所有核，
-// json.Unmarshal 比 Python 快几倍，反压基本消失。
+// 二进制帧（与 session_route.conf 里的 bodylog_finalize 保持同步，big-endian）：
+//   [u32 total_len][u16 meta_len][meta_json][u32 req_len][req_bytes][u32 resp_len][resp_bytes]
+// total_len 不含开头 4 字节自身。openresty 端只 cjson.encode 小 meta，
+// req_body / resp_body 作为裸字节传输，跳过大字符串 escape 扫描（实测能省 5-8ms / entry）。
 //
-// 接口与 Python 版完全一致：
+// 接口：
 //   - 监听 TCP 9999（BODYLOG_HOST / BODYLOG_PORT 可覆盖）
-//   - 落盘到 /usr/local/openresty/nginx/logs/bodies/YYYY-MM-DD.jsonl（BODYLOG_DIR 可覆盖）
+//   - 落盘 /usr/local/openresty/nginx/logs/bodies/YYYY-MM-DD.jsonl（BODYLOG_DIR 可覆盖）
 //   - 每天 0:00 切日，旧文件 gzip + 14 天滚动删除
 //   - SIGTERM/SIGINT 优雅退出
 package main
@@ -19,8 +19,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -31,20 +33,18 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
 	defaultHost = "127.0.0.1"
 	defaultPort = "9999"
 	defaultDir  = "/usr/local/openresty/nginx/logs/bodies"
-	maxLine     = 32 * 1024 * 1024 // 单条 entry 最大 32 MB（防御 OOM）
+	maxFrame    = 64 * 1024 * 1024 // 单帧最大 64 MB（防御 OOM；正常 256K input + 2M resp cap 远小于此）
 	keepDays    = 14
-	readBufSize = 1 << 20 // 1 MB bufio buffer
+	readBufSize = 1 << 20
 )
 
-// dayWriter: 单 fd + Mutex 串行 write；切日时关旧开新。
-// O_APPEND 在 ext4/xfs 下对 ≤PIPE_BUF (4KB) 是原子的，更大写入仍可能交错，
-// 所以用 Mutex 兜底（Go runtime 多 goroutine 并发写时可见）。
 type dayWriter struct {
 	mu  sync.Mutex
 	day string
@@ -71,7 +71,6 @@ func (w *dayWriter) write(p []byte) error {
 		w.f = f
 		w.day = today
 		log.Printf("opened %s", path)
-		// 切日异步触发 housekeep（gzip 大文件可能耗时几秒）
 		go housekeep(w.dir)
 	}
 	_, err := w.f.Write(p)
@@ -87,12 +86,7 @@ func (w *dayWriter) close() {
 	}
 }
 
-// extractText: 通用文本片段抽取，覆盖 OpenAI/vllm/Anthropic 三种 schema
-//
-//	OpenAI 流式: choices[].delta.content
-//	OpenAI 非流: choices[].message.content
-//	Anthropic 流式: delta.text
-//	Anthropic 非流: content[].text
+// extractText: OpenAI/vllm/Anthropic 通用文本片段抽取
 func extractText(obj map[string]any, parts *[]string) {
 	if choices, ok := obj["choices"].([]any); ok {
 		for _, c := range choices {
@@ -130,13 +124,12 @@ func extractText(obj map[string]any, parts *[]string) {
 	}
 }
 
-// extractResp: 从一段 SSE wire 或完整 JSON 抽出纯文本。失败返回原文。
+// extractResp: SSE wire / 完整 JSON → 纯文本结果。失败返回原文。
 func extractResp(s string) string {
 	if s == "" {
 		return s
 	}
 	parts := make([]string, 0, 32)
-	// 整体当 JSON 试一次（非流式响应）
 	var whole map[string]any
 	if err := json.Unmarshal([]byte(s), &whole); err == nil {
 		extractText(whole, &parts)
@@ -144,7 +137,6 @@ func extractResp(s string) string {
 			return strings.Join(parts, "")
 		}
 	}
-	// SSE: 按行扫 data: 前缀
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if !strings.HasPrefix(line, "data:") {
@@ -166,99 +158,109 @@ func extractResp(s string) string {
 	return s
 }
 
-// processLine: 解析 entry → 抽取 resp_body → 重新序列化。失败原样透传。
-func processLine(line []byte) []byte {
-	// 去掉尾部 \n 再 unmarshal
-	trimmed := bytes.TrimRight(line, "\n")
-	var e map[string]any
-	if err := json.Unmarshal(trimmed, &e); err != nil {
-		return line // 不是合法 JSON，原样写
+// readFrame 读一个完整二进制帧，返回 meta_json / req_body / resp_body 三段。
+// 帧布局：[u32 total_len][u16 meta_len][meta][u32 req_len][req][u32 resp_len][resp]
+func readFrame(r io.Reader) (meta, req, resp []byte, err error) {
+	var lenBuf [4]byte
+	if _, err = io.ReadFull(r, lenBuf[:]); err != nil {
+		return
 	}
-	rb, _ := e["resp_body"].(string)
-	if rb != "" {
-		if b64, _ := e["resp_body_b64"].(bool); b64 {
-			if raw, err := base64.StdEncoding.DecodeString(rb); err == nil {
-				e["resp_body"] = extractResp(string(raw))
-				// 抽取出来的多半是干净 utf-8，去掉 b64 标记
-				e["resp_body_b64"] = false
-			}
-		} else {
-			e["resp_body"] = extractResp(rb)
-		}
+	total := binary.BigEndian.Uint32(lenBuf[:])
+	if total == 0 || total > maxFrame {
+		err = fmt.Errorf("invalid frame length %d", total)
+		return
 	}
-	out, err := json.Marshal(e)
-	if err != nil {
-		return line
+	buf := make([]byte, total)
+	if _, err = io.ReadFull(r, buf); err != nil {
+		return
 	}
-	return append(out, '\n')
-}
-
-// readCappedLine: 读到 \n，超过 cap 字节丢弃整行（消化到下一个 \n）。
-// 返回 (line, dropped, err)：dropped=true 表示这一行超长被丢弃，应继续下一行。
-func readCappedLine(r *bufio.Reader, cap int) ([]byte, bool, error) {
-	line, err := r.ReadSlice('\n')
-	if err == nil {
-		// ReadSlice 返回的 slice 在下次 read 时会被复用，必须 copy
-		out := make([]byte, len(line))
-		copy(out, line)
-		return out, false, nil
+	if len(buf) < 2 {
+		err = fmt.Errorf("frame too short for meta_len")
+		return
 	}
-	if errors.Is(err, bufio.ErrBufferFull) {
-		// 行长 > buffer，逐段读到 \n 为止，统计大小
-		total := len(line)
-		for {
-			seg, err2 := r.ReadSlice('\n')
-			total += len(seg)
-			if err2 == nil {
-				break // 找到 \n 了
-			}
-			if errors.Is(err2, bufio.ErrBufferFull) {
-				if total > cap {
-					// 超 cap 还没结束，继续 drain 但不再分配
-					continue
-				}
-				continue
-			}
-			return nil, true, err2
-		}
-		log.Printf("oversized line dropped (~%d B > %d cap)", total, cap)
-		return nil, true, nil
+	metaLen := int(binary.BigEndian.Uint16(buf[:2]))
+	pos := 2
+	if pos+metaLen+4 > len(buf) {
+		err = fmt.Errorf("frame truncated at meta")
+		return
 	}
-	if errors.Is(err, io.EOF) {
-		if len(line) > 0 {
-			out := make([]byte, len(line)+1)
-			copy(out, line)
-			out[len(line)] = '\n'
-			return out, false, nil
-		}
-		return nil, false, io.EOF
+	meta = buf[pos : pos+metaLen]
+	pos += metaLen
+	reqLen := int(binary.BigEndian.Uint32(buf[pos : pos+4]))
+	pos += 4
+	if pos+reqLen+4 > len(buf) {
+		err = fmt.Errorf("frame truncated at req_body")
+		return
 	}
-	return nil, false, err
+	req = buf[pos : pos+reqLen]
+	pos += reqLen
+	respLen := int(binary.BigEndian.Uint32(buf[pos : pos+4]))
+	pos += 4
+	if pos+respLen != len(buf) {
+		err = fmt.Errorf("frame size mismatch: pos=%d+resp=%d != total=%d", pos, respLen, len(buf))
+		return
+	}
+	resp = buf[pos : pos+respLen]
+	return
 }
 
 func handleConn(c net.Conn, w *dayWriter) {
 	defer c.Close()
 	r := bufio.NewReaderSize(c, readBufSize)
 	for {
-		line, dropped, err := readCappedLine(r, maxLine)
+		meta, req, resp, err := readFrame(r)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				log.Printf("read err from %s: %v", c.RemoteAddr(), err)
 			}
 			return
 		}
-		if dropped {
+		out, err := assembleEntry(meta, req, resp)
+		if err != nil {
+			log.Printf("assemble err: %v", err)
 			continue
-		}
-		out := processLine(line)
-		if !bytes.HasSuffix(out, []byte{'\n'}) {
-			out = append(out, '\n')
 		}
 		if err := w.write(out); err != nil {
 			log.Printf("write err: %v", err)
 			return
 		}
 	}
+}
+
+// assembleEntry: 合并 meta_json + req(utf-8 检查/base64) + resp(SSE 抽取) → 单行 JSONL
+func assembleEntry(metaJSON, req, resp []byte) ([]byte, error) {
+	var m map[string]any
+	if err := json.Unmarshal(metaJSON, &m); err != nil {
+		return nil, fmt.Errorf("meta unmarshal: %w", err)
+	}
+	// req_body：utf8 → 直接放，否则 base64
+	if len(req) > 0 {
+		if utf8.Valid(req) {
+			m["req_body"] = string(req)
+		} else {
+			m["req_body"] = base64.StdEncoding.EncodeToString(req)
+			m["req_body_b64"] = true
+		}
+	} else {
+		m["req_body"] = ""
+	}
+	// resp_body：SSE 抽取后多半是干净 utf-8；不是就 base64 原始
+	if len(resp) > 0 {
+		extracted := extractResp(string(resp))
+		if utf8.ValidString(extracted) {
+			m["resp_body"] = extracted
+		} else {
+			m["resp_body"] = base64.StdEncoding.EncodeToString([]byte(extracted))
+			m["resp_body_b64"] = true
+		}
+	} else {
+		m["resp_body"] = ""
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("entry marshal: %w", err)
+	}
+	return append(out, '\n'), nil
 }
 
 func housekeep(dir string) {
@@ -280,7 +282,7 @@ func housekeep(dir string) {
 			src := filepath.Join(dir, name)
 			dst := src + ".gz"
 			if _, err := os.Stat(dst); err == nil {
-				continue // 已存在
+				continue
 			}
 			if err := gzipFile(src, dst); err != nil {
 				log.Printf("gzip %s failed: %v", src, err)
@@ -324,6 +326,9 @@ func envOr(k, dflt string) string {
 	return dflt
 }
 
+// 编译期防止 unused import
+var _ = bytes.Buffer{}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	host := envOr("BODYLOG_HOST", defaultHost)
@@ -349,9 +354,7 @@ func main() {
 		_ = ln.Close()
 	}()
 
-	// 启动时 housekeep 一次（冷启动覆盖错过的 day-rollover）
 	go housekeep(dir)
-	// 周期 housekeep（每 6h，覆盖零流量天）
 	go func() {
 		t := time.NewTicker(6 * time.Hour)
 		defer t.Stop()
