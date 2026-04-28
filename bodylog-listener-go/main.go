@@ -86,8 +86,19 @@ func (w *dayWriter) close() {
 	}
 }
 
-// extractText: OpenAI/vllm/Anthropic 通用文本片段抽取
-func extractText(obj map[string]any, parts *[]string) {
+// respFields: 从 SSE wire / JSON 抽取出的关键字段（用于 status<400 的精简 entry）
+type respFields struct {
+	parts        []string
+	finishReason string
+	model        string
+	usage        any
+	toolCalls    []any
+	stopReason   string // Anthropic
+	errorObj     any
+}
+
+// extractFromObj: OpenAI / vllm / Anthropic 通用字段抽取
+func extractFromObj(obj map[string]any, rf *respFields) {
 	if choices, ok := obj["choices"].([]any); ok {
 		for _, c := range choices {
 			cm, _ := c.(map[string]any)
@@ -96,19 +107,31 @@ func extractText(obj map[string]any, parts *[]string) {
 			}
 			if d, ok := cm["delta"].(map[string]any); ok {
 				if s, ok := d["content"].(string); ok {
-					*parts = append(*parts, s)
+					rf.parts = append(rf.parts, s)
+				}
+				if tc, ok := d["tool_calls"].([]any); ok {
+					rf.toolCalls = append(rf.toolCalls, tc...)
 				}
 			}
 			if m, ok := cm["message"].(map[string]any); ok {
 				if s, ok := m["content"].(string); ok {
-					*parts = append(*parts, s)
+					rf.parts = append(rf.parts, s)
 				}
+				if tc, ok := m["tool_calls"].([]any); ok {
+					rf.toolCalls = append(rf.toolCalls, tc...)
+				}
+			}
+			if fr, ok := cm["finish_reason"].(string); ok && fr != "" {
+				rf.finishReason = fr
 			}
 		}
 	}
 	if d, ok := obj["delta"].(map[string]any); ok {
 		if s, ok := d["text"].(string); ok {
-			*parts = append(*parts, s)
+			rf.parts = append(rf.parts, s)
+		}
+		if sr, ok := d["stop_reason"].(string); ok && sr != "" {
+			rf.stopReason = sr
 		}
 	}
 	if content, ok := obj["content"].([]any); ok {
@@ -118,23 +141,35 @@ func extractText(obj map[string]any, parts *[]string) {
 				continue
 			}
 			if s, ok := bm["text"].(string); ok {
-				*parts = append(*parts, s)
+				rf.parts = append(rf.parts, s)
 			}
 		}
 	}
+	if u, ok := obj["usage"].(map[string]any); ok && u != nil {
+		rf.usage = u
+	}
+	if m, ok := obj["model"].(string); ok && m != "" {
+		rf.model = m
+	}
+	if sr, ok := obj["stop_reason"].(string); ok && sr != "" {
+		rf.stopReason = sr
+	}
+	if e, ok := obj["error"]; ok && e != nil {
+		rf.errorObj = e
+	}
 }
 
-// extractResp: SSE wire / 完整 JSON → 纯文本结果。失败返回原文。
-func extractResp(s string) string {
+// extractResp: 从 SSE wire / 完整 JSON 抽出关键字段。失败时 parts 为空，调用方处理。
+func extractResp(s string) respFields {
+	rf := respFields{}
 	if s == "" {
-		return s
+		return rf
 	}
-	parts := make([]string, 0, 32)
 	var whole map[string]any
 	if err := json.Unmarshal([]byte(s), &whole); err == nil {
-		extractText(whole, &parts)
-		if len(parts) > 0 {
-			return strings.Join(parts, "")
+		extractFromObj(whole, &rf)
+		if len(rf.parts) > 0 || rf.errorObj != nil {
+			return rf
 		}
 	}
 	for _, line := range strings.Split(s, "\n") {
@@ -150,12 +185,36 @@ func extractResp(s string) string {
 		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
 			continue
 		}
-		extractText(obj, &parts)
+		extractFromObj(obj, &rf)
 	}
-	if len(parts) > 0 {
-		return strings.Join(parts, "")
+	return rf
+}
+
+// buildRespMeta: 把抽取出的非 content 字段组装成 resp_meta 子对象（仅在有内容时返回非 nil）
+func buildRespMeta(rf respFields) map[string]any {
+	m := map[string]any{}
+	if rf.finishReason != "" {
+		m["finish_reason"] = rf.finishReason
 	}
-	return s
+	if rf.model != "" {
+		m["model"] = rf.model
+	}
+	if rf.usage != nil {
+		m["usage"] = rf.usage
+	}
+	if len(rf.toolCalls) > 0 {
+		m["tool_calls"] = rf.toolCalls
+	}
+	if rf.stopReason != "" {
+		m["stop_reason"] = rf.stopReason
+	}
+	if rf.errorObj != nil {
+		m["error"] = rf.errorObj
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // readFrame 读一个完整二进制帧，返回 meta_json / req_body / resp_body 三段。
@@ -244,14 +303,43 @@ func assembleEntry(metaJSON, req, resp []byte) ([]byte, error) {
 	} else {
 		m["req_body"] = ""
 	}
-	// resp_body：SSE 抽取后多半是干净 utf-8；不是就 base64 原始
+	// resp_body 处理（option D）：
+	//   - status >= 400：完整 SSE wire（lossless 复盘）
+	//   - status < 400：抽取 content 文本 + resp_meta（finish_reason/usage/model/tool_calls/...）
+	statusCode := 0
+	if v, ok := m["status"].(float64); ok {
+		statusCode = int(v)
+	}
 	if len(resp) > 0 {
-		extracted := extractResp(string(resp))
-		if utf8.ValidString(extracted) {
-			m["resp_body"] = extracted
+		if statusCode >= 400 {
+			if utf8.Valid(resp) {
+				m["resp_body"] = string(resp)
+			} else {
+				m["resp_body"] = base64.StdEncoding.EncodeToString(resp)
+				m["resp_body_b64"] = true
+			}
 		} else {
-			m["resp_body"] = base64.StdEncoding.EncodeToString([]byte(extracted))
-			m["resp_body_b64"] = true
+			rf := extractResp(string(resp))
+			content := strings.Join(rf.parts, "")
+			if content == "" && rf.errorObj == nil && rf.finishReason == "" {
+				// 抽不出任何东西，原文兜底（不丢数据）
+				if utf8.Valid(resp) {
+					m["resp_body"] = string(resp)
+				} else {
+					m["resp_body"] = base64.StdEncoding.EncodeToString(resp)
+					m["resp_body_b64"] = true
+				}
+			} else {
+				if utf8.ValidString(content) {
+					m["resp_body"] = content
+				} else {
+					m["resp_body"] = base64.StdEncoding.EncodeToString([]byte(content))
+					m["resp_body_b64"] = true
+				}
+				if meta := buildRespMeta(rf); meta != nil {
+					m["resp_meta"] = meta
+				}
+			}
 		}
 	} else {
 		m["resp_body"] = ""
