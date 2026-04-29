@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -207,6 +208,71 @@ func extractResp(s string) respFields {
 	return rf
 }
 
+// reassembleToolCalls: SSE 流式把同一个 tool_call 切成多个 delta（按 index 共享）。
+// 每片只有 name 或 arguments 部分。这里按 index 合并 + arguments 拼接。
+// 非流式响应每个 fragment 已经是完整 call，按 index=0 单条直接返回。
+func reassembleToolCalls(fragments []any) []any {
+	byIdx := map[int]map[string]any{}
+	order := []int{}
+	nextSynthIdx := -1
+	for _, f := range fragments {
+		fm, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		idx := 0
+		if v, ok := fm["index"].(float64); ok {
+			idx = int(v)
+		} else {
+			// 非流式响应没有 index 字段，给每条单独 idx 避免误合并
+			idx = nextSynthIdx
+			nextSynthIdx--
+		}
+		cur, exists := byIdx[idx]
+		if !exists {
+			cur = map[string]any{}
+			byIdx[idx] = cur
+			order = append(order, idx)
+		}
+		for k, v := range fm {
+			if k == "function" {
+				continue
+			}
+			// 后到 fragment 不覆盖已有非空字段（id/type 通常首片就完整）
+			if _, has := cur[k]; !has {
+				cur[k] = v
+			}
+		}
+		if fn, ok := fm["function"].(map[string]any); ok {
+			existing, _ := cur["function"].(map[string]any)
+			if existing == nil {
+				existing = map[string]any{}
+				cur["function"] = existing
+			}
+			for fk, fv := range fn {
+				if fk == "arguments" {
+					if s, _ := fv.(string); s != "" {
+						prev, _ := existing["arguments"].(string)
+						existing["arguments"] = prev + s
+					} else if _, has := existing["arguments"]; !has {
+						existing["arguments"] = fv
+					}
+				} else {
+					if _, has := existing[fk]; !has {
+						existing[fk] = fv
+					}
+				}
+			}
+		}
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	out := make([]any, 0, len(order))
+	for _, idx := range order {
+		out = append(out, byIdx[idx])
+	}
+	return out
+}
+
 // buildRespMeta: 把抽取出的非 content 字段组装成 resp_meta 子对象（仅在有内容时返回非 nil）
 func buildRespMeta(rf respFields) map[string]any {
 	m := map[string]any{}
@@ -223,7 +289,7 @@ func buildRespMeta(rf respFields) map[string]any {
 		m["usage"] = rf.usage
 	}
 	if len(rf.toolCalls) > 0 {
-		m["tool_calls"] = rf.toolCalls
+		m["tool_calls"] = reassembleToolCalls(rf.toolCalls)
 	}
 	if len(rf.reasoning) > 0 {
 		m["reasoning"] = strings.Join(rf.reasoning, "")
