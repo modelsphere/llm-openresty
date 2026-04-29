@@ -100,13 +100,17 @@ type respFields struct {
 	errorObj     any
 }
 
-// extractFromObj: OpenAI / vllm / Anthropic 通用字段抽取
+// extractFromObj: OpenAI chat / OpenAI completions(legacy) / Anthropic messages 通用抽取
 func extractFromObj(obj map[string]any, rf *respFields) {
 	if choices, ok := obj["choices"].([]any); ok {
 		for _, c := range choices {
 			cm, _ := c.(map[string]any)
 			if cm == nil {
 				continue
+			}
+			// OpenAI legacy /v1/completions: choices[].text
+			if s, ok := cm["text"].(string); ok {
+				rf.parts = append(rf.parts, s)
 			}
 			if d, ok := cm["delta"].(map[string]any); ok {
 				if s, ok := d["content"].(string); ok {
@@ -141,14 +145,28 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 			}
 		}
 	}
+	// Anthropic /v1/messages 流式：delta.{text|thinking}
 	if d, ok := obj["delta"].(map[string]any); ok {
 		if s, ok := d["text"].(string); ok {
 			rf.parts = append(rf.parts, s)
+		}
+		if s, ok := d["thinking"].(string); ok {
+			rf.reasoning = append(rf.reasoning, s)
 		}
 		if sr, ok := d["stop_reason"].(string); ok && sr != "" {
 			rf.stopReason = sr
 		}
 	}
+	// Anthropic /v1/messages 流式 content_block_start.content_block 初始内容
+	if cb, ok := obj["content_block"].(map[string]any); ok {
+		if s, ok := cb["text"].(string); ok && s != "" {
+			rf.parts = append(rf.parts, s)
+		}
+		if s, ok := cb["thinking"].(string); ok && s != "" {
+			rf.reasoning = append(rf.reasoning, s)
+		}
+	}
+	// Anthropic /v1/messages 非流：content[] 数组（混合 text/thinking/tool_use 块）
 	if content, ok := obj["content"].([]any); ok {
 		for _, b := range content {
 			bm, _ := b.(map[string]any)
@@ -157,6 +175,13 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 			}
 			if s, ok := bm["text"].(string); ok {
 				rf.parts = append(rf.parts, s)
+			}
+			if s, ok := bm["thinking"].(string); ok {
+				rf.reasoning = append(rf.reasoning, s)
+			}
+			// tool_use 块映射成 OpenAI tool_calls 形态便于统一消费
+			if t, _ := bm["type"].(string); t == "tool_use" {
+				rf.toolCalls = append(rf.toolCalls, bm)
 			}
 		}
 	}
