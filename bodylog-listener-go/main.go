@@ -89,7 +89,8 @@ func (w *dayWriter) close() {
 // respFields: 从 SSE wire / JSON 抽取出的关键字段（用于 status<400 的精简 entry）
 type respFields struct {
 	parts        []string
-	id           string // OpenAI chatcmpl-xxx / Anthropic msg_xxx，用于跨日志关联
+	reasoning    []string // Kimi-K2.5 / GLM-5 / OpenAI o1 的思考链（message.reasoning / delta.reasoning）
+	id           string   // OpenAI chatcmpl-xxx / Anthropic msg_xxx，用于跨日志关联
 	finishReason string
 	model        string
 	usage        any
@@ -110,6 +111,12 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 				if s, ok := d["content"].(string); ok {
 					rf.parts = append(rf.parts, s)
 				}
+				if s, ok := d["reasoning"].(string); ok {
+					rf.reasoning = append(rf.reasoning, s)
+				}
+				if s, ok := d["reasoning_content"].(string); ok {
+					rf.reasoning = append(rf.reasoning, s)
+				}
 				if tc, ok := d["tool_calls"].([]any); ok {
 					rf.toolCalls = append(rf.toolCalls, tc...)
 				}
@@ -117,6 +124,12 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 			if m, ok := cm["message"].(map[string]any); ok {
 				if s, ok := m["content"].(string); ok {
 					rf.parts = append(rf.parts, s)
+				}
+				if s, ok := m["reasoning"].(string); ok {
+					rf.reasoning = append(rf.reasoning, s)
+				}
+				if s, ok := m["reasoning_content"].(string); ok {
+					rf.reasoning = append(rf.reasoning, s)
 				}
 				if tc, ok := m["tool_calls"].([]any); ok {
 					rf.toolCalls = append(rf.toolCalls, tc...)
@@ -172,7 +185,7 @@ func extractResp(s string) respFields {
 	var whole map[string]any
 	if err := json.Unmarshal([]byte(s), &whole); err == nil {
 		extractFromObj(whole, &rf)
-		if len(rf.parts) > 0 || rf.errorObj != nil {
+		if len(rf.parts) > 0 || len(rf.reasoning) > 0 || rf.errorObj != nil {
 			return rf
 		}
 	}
@@ -211,6 +224,9 @@ func buildRespMeta(rf respFields) map[string]any {
 	}
 	if len(rf.toolCalls) > 0 {
 		m["tool_calls"] = rf.toolCalls
+	}
+	if len(rf.reasoning) > 0 {
+		m["reasoning"] = strings.Join(rf.reasoning, "")
 	}
 	if rf.stopReason != "" {
 		m["stop_reason"] = rf.stopReason
@@ -328,7 +344,7 @@ func assembleEntry(metaJSON, req, resp []byte) ([]byte, error) {
 		} else {
 			rf := extractResp(string(resp))
 			content := strings.Join(rf.parts, "")
-			if content == "" && rf.errorObj == nil && rf.finishReason == "" {
+			if content == "" && len(rf.reasoning) == 0 && rf.errorObj == nil && rf.finishReason == "" {
 				// 抽不出任何东西，原文兜底（不丢数据）
 				if utf8.Valid(resp) {
 					m["resp_body"] = string(resp)
