@@ -8,7 +8,7 @@
 //
 // 接口：
 //   - 监听 TCP 9999（BODYLOG_HOST / BODYLOG_PORT 可覆盖）
-//   - 落盘 /usr/local/openresty/nginx/logs/bodies/YYYY-MM-DD.jsonl（BODYLOG_DIR 可覆盖）
+//   - 落盘 /mnt/nvme0n1/nginx/bodylog/YYYY-MM-DD.jsonl（BODYLOG_DIR 可覆盖）
 //   - 每天 0:00 切日，旧文件 gzip + 14 天滚动删除
 //   - SIGTERM/SIGINT 优雅退出
 package main
@@ -39,7 +39,7 @@ import (
 const (
 	defaultHost = "127.0.0.1"
 	defaultPort = "9999"
-	defaultDir  = "/usr/local/openresty/nginx/logs/bodies"
+	defaultDir  = "/mnt/nvme0n1/nginx/bodylog"
 	maxFrame    = 64 * 1024 * 1024 // 单帧最大 64 MB（防御 OOM；正常 256K input + 2M resp cap 远小于此）
 	keepDays    = 14
 	readBufSize = 1 << 20
