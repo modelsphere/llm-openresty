@@ -89,6 +89,7 @@ func (w *dayWriter) close() {
 // respFields: 从 SSE wire / JSON 抽取出的关键字段（用于 status<400 的精简 entry）
 type respFields struct {
 	parts        []string
+	id           string // OpenAI chatcmpl-xxx / Anthropic msg_xxx，用于跨日志关联
 	finishReason string
 	model        string
 	usage        any
@@ -151,6 +152,9 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 	if m, ok := obj["model"].(string); ok && m != "" {
 		rf.model = m
 	}
+	if id, ok := obj["id"].(string); ok && id != "" {
+		rf.id = id
+	}
 	if sr, ok := obj["stop_reason"].(string); ok && sr != "" {
 		rf.stopReason = sr
 	}
@@ -193,6 +197,9 @@ func extractResp(s string) respFields {
 // buildRespMeta: 把抽取出的非 content 字段组装成 resp_meta 子对象（仅在有内容时返回非 nil）
 func buildRespMeta(rf respFields) map[string]any {
 	m := map[string]any{}
+	if rf.id != "" {
+		m["id"] = rf.id
+	}
 	if rf.finishReason != "" {
 		m["finish_reason"] = rf.finishReason
 	}
