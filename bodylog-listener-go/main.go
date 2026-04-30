@@ -379,6 +379,13 @@ func readFrame(r io.Reader) (meta, req, resp []byte, err error) {
 
 func handleConn(c net.Conn, w *dayWriter) {
 	defer c.Close()
+	// 从 TCP RemoteAddr 取源 IP（去掉 :port）。loopback 写 "127.0.0.1"，
+	// LAN/跨机时是发送方 OpenResty 主机 IP；落盘到 entry.source_addr 字段，
+	// 用于多 OpenResty 共用同一 listener 时区分上游来源。
+	srcAddr := c.RemoteAddr().String()
+	if h, _, err := net.SplitHostPort(srcAddr); err == nil {
+		srcAddr = h
+	}
 	r := bufio.NewReaderSize(c, readBufSize)
 	for {
 		meta, req, resp, err := readFrame(r)
@@ -388,7 +395,7 @@ func handleConn(c net.Conn, w *dayWriter) {
 			}
 			return
 		}
-		out, err := assembleEntry(meta, req, resp)
+		out, err := assembleEntry(meta, req, resp, srcAddr)
 		if err != nil {
 			log.Printf("assemble err: %v", err)
 			continue
@@ -401,10 +408,15 @@ func handleConn(c net.Conn, w *dayWriter) {
 }
 
 // assembleEntry: 合并 meta_json + req(utf-8 检查/base64) + resp(SSE 抽取) → 单行 JSONL
-func assembleEntry(metaJSON, req, resp []byte) ([]byte, error) {
+func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) ([]byte, error) {
 	var m map[string]any
 	if err := json.Unmarshal(metaJSON, &m); err != nil {
 		return nil, fmt.Errorf("meta unmarshal: %w", err)
+	}
+	// 源地址（OpenResty 主机 IP，由 TCP 连接 RemoteAddr 注入；listener 端权威，
+	// 不依赖发送方 meta，防止伪造）
+	if sourceAddr != "" {
+		m["source_addr"] = sourceAddr
 	}
 	// req_body：utf8 → 直接放，否则 base64
 	if len(req) > 0 {
