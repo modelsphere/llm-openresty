@@ -8,12 +8,15 @@
 //
 // 接口：
 //   - 监听 TCP 9999（BODYLOG_HOST / BODYLOG_PORT 可覆盖）
-//   - 落盘 /mnt/nvme0n1/nginx/bodylog/YYYY-MM-DD.jsonl（BODYLOG_DIR 可覆盖）
-//   - 每天 0:00 切日，旧文件 gzip + 14 天滚动删除
+//   - 落盘 BODYLOG_DIR/YYYY-MM-DD/HH.jsonl（按天分目录、按小时切文件）
+//   - 跨日时：housekeep 把昨天目录整个 tar.gz → BODYLOG_DIR/YYYY-MM-DD.tar.gz，删原目录
+//   - 14 天后删历史 .tar.gz
+//   - 兼容迁移：BODYLOG_DIR 根上残留的旧版 .jsonl / .jsonl.gz 沿用旧 housekeep 逻辑
 //   - SIGTERM/SIGINT 优雅退出
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"compress/gzip"
@@ -46,39 +49,58 @@ const (
 	readBufSize = 1 << 20
 )
 
-type dayWriter struct {
-	mu  sync.Mutex
-	day string
-	f   *os.File
-	dir string
+// hourWriter: 按小时切的 jsonl 文件写入器。
+//
+// 路径规则：BODYLOG_DIR/YYYY-MM-DD/HH.jsonl
+//   - 跨小时：close 旧 fd，open 同日目录下新 HH.jsonl
+//   - 跨日：mkdir 新日目录，async 触发 housekeep 把上一日 tar.gz 归档
+//
+// 当天内不做压缩，所有小时文件保持 .jsonl 明文，便于实时 tail / grep。
+type hourWriter struct {
+	mu   sync.Mutex
+	day  string // "2026-05-04"
+	hour string // "13"
+	f    *os.File
+	dir  string
 }
 
-func (w *dayWriter) write(p []byte) error {
-	today := time.Now().Format("2006-01-02")
+func (w *hourWriter) write(p []byte) error {
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	thisHour := now.Format("15")
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.day != today {
+
+	dayChanged := w.day != today
+	hourChanged := dayChanged || w.hour != thisHour
+
+	if hourChanged {
 		if w.f != nil {
 			_ = w.f.Close()
 		}
-		if err := os.MkdirAll(w.dir, 0o755); err != nil {
+		dayDir := filepath.Join(w.dir, today)
+		if err := os.MkdirAll(dayDir, 0o755); err != nil {
 			return err
 		}
-		path := filepath.Join(w.dir, today+".jsonl")
+		path := filepath.Join(dayDir, thisHour+".jsonl")
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 		if err != nil {
 			return err
 		}
 		w.f = f
 		w.day = today
+		w.hour = thisHour
 		log.Printf("opened %s", path)
-		go housekeep(w.dir)
+		if dayChanged {
+			// 跨日才需要触发 housekeep（昨天目录待打包 + 14 天 cutoff）
+			go housekeep(w.dir)
+		}
 	}
 	_, err := w.f.Write(p)
 	return err
 }
 
-func (w *dayWriter) close() {
+func (w *hourWriter) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.f != nil {
@@ -377,7 +399,7 @@ func readFrame(r io.Reader) (meta, req, resp []byte, err error) {
 	return
 }
 
-func handleConn(c net.Conn, w *dayWriter) {
+func handleConn(c net.Conn, w *hourWriter) {
 	defer c.Close()
 	// 从 TCP RemoteAddr 取源 IP（去掉 :port）。loopback 写 "127.0.0.1"，
 	// LAN/跨机时是发送方 OpenResty 主机 IP；落盘到 entry.source_addr 字段，
@@ -477,6 +499,14 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) ([]byte, error
 	return append(out, '\n'), nil
 }
 
+// housekeep 扫描 BODYLOG_DIR，处理：
+//   1. YYYY-MM-DD/ 目录（非今日）→ tar.gz 整个目录 → 删原目录
+//   2. YYYY-MM-DD.tar.gz（≥ 14 天）→ 删
+//   3. .tar.gz.tmp 残留（上次崩溃没完成）→ 删
+//   4. （兼容）旧版 X.jsonl 在根目录 → gzip → 删原文件
+//   5. （兼容）旧版 X.jsonl.gz 在根目录（≥ 14 天）→ 删
+//
+// 多次并发触发是安全的：每个目标都先 Stat 检查 dst 是否已存在再处理。
 func housekeep(dir string) {
 	today := time.Now().Format("2006-01-02")
 	cutoff := time.Now().AddDate(0, 0, -keepDays).Format("2006-01-02")
@@ -487,31 +517,143 @@ func housekeep(dir string) {
 	}
 	for _, e := range entries {
 		name := e.Name()
+		full := filepath.Join(dir, name)
 		switch {
-		case strings.HasSuffix(name, ".jsonl"):
-			base := strings.TrimSuffix(name, ".jsonl")
-			if base == today || len(base) < 10 {
+		case e.IsDir() && isDateName(name):
+			if name == today {
+				continue // 今日目录还在写
+			}
+			dst := filepath.Join(dir, name+".tar.gz")
+			if _, err := os.Stat(dst); err == nil {
+				// .tar.gz 已存在但目录还没删（上次 housekeep 半路失败），删目录就行
+				if err := os.RemoveAll(full); err != nil {
+					log.Printf("housekeep remove stale dir %s: %v", full, err)
+				} else {
+					log.Printf("removed stale dir (tar.gz exists): %s", full)
+				}
 				continue
 			}
-			src := filepath.Join(dir, name)
-			dst := src + ".gz"
+			if err := tarGzDir(full, dst); err != nil {
+				log.Printf("tar.gz %s failed: %v", full, err)
+				continue
+			}
+			if err := os.RemoveAll(full); err != nil {
+				log.Printf("housekeep remove %s: %v", full, err)
+				continue
+			}
+			log.Printf("archived %s → %s", full, dst)
+
+		case !e.IsDir() && strings.HasSuffix(name, ".tar.gz"):
+			base := strings.TrimSuffix(name, ".tar.gz")
+			if isDateName(base) && base < cutoff {
+				_ = os.Remove(full)
+				log.Printf("removed old %s", name)
+			}
+
+		case !e.IsDir() && strings.HasSuffix(name, ".tar.gz.tmp"):
+			// 上次崩溃残留：直接删，下次 housekeep 会重新打包对应目录
+			_ = os.Remove(full)
+			log.Printf("removed crashed temp %s", name)
+
+		// ---- 向后兼容旧版（YYYY-MM-DD.jsonl 单日单文件模式）----
+		case !e.IsDir() && strings.HasSuffix(name, ".jsonl"):
+			base := strings.TrimSuffix(name, ".jsonl")
+			if base == today || !isDateName(base) {
+				continue
+			}
+			dst := full + ".gz"
 			if _, err := os.Stat(dst); err == nil {
 				continue
 			}
-			if err := gzipFile(src, dst); err != nil {
-				log.Printf("gzip %s failed: %v", src, err)
+			if err := gzipFile(full, dst); err != nil {
+				log.Printf("gzip %s failed: %v", full, err)
 				continue
 			}
-			_ = os.Remove(src)
-			log.Printf("compressed %s → %s", src, dst)
-		case strings.HasSuffix(name, ".jsonl.gz"):
+			_ = os.Remove(full)
+			log.Printf("compressed legacy %s → %s", full, dst)
+
+		case !e.IsDir() && strings.HasSuffix(name, ".jsonl.gz"):
 			base := strings.TrimSuffix(name, ".jsonl.gz")
-			if len(base) >= 10 && base < cutoff {
-				_ = os.Remove(filepath.Join(dir, name))
-				log.Printf("removed old %s", name)
+			if isDateName(base) && base < cutoff {
+				_ = os.Remove(full)
+				log.Printf("removed legacy old %s", name)
 			}
 		}
 	}
+}
+
+// isDateName 判断字符串是不是 YYYY-MM-DD 形式（最低粒度，不严格校验日期合法性）
+func isDateName(s string) bool {
+	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	for i, c := range s {
+		if i == 4 || i == 7 {
+			continue
+		}
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// tarGzDir 打包 srcDir → dst（先写 dst.tmp 再原子 rename，crash 时不会留半截 .tar.gz）
+func tarGzDir(srcDir, dst string) error {
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = out.Close()
+		// 失败时清掉 .tmp（成功路径上已经 rename 走了，不影响）
+		_ = os.Remove(tmp)
+	}()
+	gw, _ := gzip.NewWriterLevel(out, 6)
+	tw := tar.NewWriter(gw)
+
+	parent := filepath.Dir(srcDir)
+	walkErr := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(parent, path)
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = rel
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	if walkErr != nil {
+		return walkErr
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	if err := gw.Close(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 func gzipFile(src, dst string) error {
@@ -558,7 +700,7 @@ func main() {
 	}
 	log.Printf("listening on %s, writing to %s/", addr, dir)
 
-	w := &dayWriter{dir: dir}
+	w := &hourWriter{dir: dir}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
