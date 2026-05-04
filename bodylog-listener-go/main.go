@@ -29,10 +29,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -399,7 +401,7 @@ func readFrame(r io.Reader) (meta, req, resp []byte, err error) {
 	return
 }
 
-func handleConn(c net.Conn, w *hourWriter) {
+func handleConn(c net.Conn, w *hourWriter, agg *aggregator) {
 	defer c.Close()
 	// 从 TCP RemoteAddr 取源 IP（去掉 :port）。loopback 写 "127.0.0.1"，
 	// LAN/跨机时是发送方 OpenResty 主机 IP；落盘到 entry.source_addr 字段，
@@ -417,7 +419,7 @@ func handleConn(c net.Conn, w *hourWriter) {
 			}
 			return
 		}
-		out, err := assembleEntry(meta, req, resp, srcAddr)
+		m, out, err := assembleEntry(meta, req, resp, srcAddr)
 		if err != nil {
 			log.Printf("assemble err: %v", err)
 			continue
@@ -426,14 +428,21 @@ func handleConn(c net.Conn, w *hourWriter) {
 			log.Printf("write err: %v", err)
 			return
 		}
+		// 同步 agg.ingest：O(1) 加锁更新一个 bucket，纳秒级，不影响主路径吞吐
+		if agg != nil {
+			agg.ingest(m)
+		}
 	}
 }
 
 // assembleEntry: 合并 meta_json + req(utf-8 检查/base64) + resp(SSE 抽取) → 单行 JSONL
-func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) ([]byte, error) {
+//
+// 返回 (parsed map, jsonl bytes, err)。map 用于 aggregator.ingest 避免重复
+// JSON 解析；bytes 用于 hourWriter.write 落盘。
+func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]any, []byte, error) {
 	var m map[string]any
 	if err := json.Unmarshal(metaJSON, &m); err != nil {
-		return nil, fmt.Errorf("meta unmarshal: %w", err)
+		return nil, nil, fmt.Errorf("meta unmarshal: %w", err)
 	}
 	// 源地址（OpenResty 主机 IP，由 TCP 连接 RemoteAddr 注入；listener 端权威，
 	// 不依赖发送方 meta，防止伪造）
@@ -494,9 +503,9 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) ([]byte, error
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
-		return nil, fmt.Errorf("entry marshal: %w", err)
+		return nil, nil, fmt.Errorf("entry marshal: %w", err)
 	}
-	return append(out, '\n'), nil
+	return m, append(out, '\n'), nil
 }
 
 // housekeep 扫描 BODYLOG_DIR，处理：
@@ -675,6 +684,365 @@ func gzipFile(src, dst string) error {
 	return gw.Close()
 }
 
+// ─── per-minute 聚合器（按 peer 分组）────────────────────────────────────
+//
+// 每帧 entry 经 handleConn → assembleEntry 后调用 agg.ingest，按 ts 对齐到
+// minute、按 peer 分桶累计 token / 字节 / 状态码 / 延迟。
+//
+// 周期 flush（60s ticker）把 minute < now-90s 的 bucket 移到 archive 并
+// append 到 metrics/YYYY-MM-DD.jsonl（明文不压缩，永久保留）。
+//
+// HTTP server（默认 :9998）暴露 /summary?minutes=N，返回 N 分钟内 per-peer
+// aggregate（已合并所有分钟），可选 ?breakdown=true 返回每分钟 buckets。
+
+type bucket struct {
+	Minute    int64  `json:"minute"`
+	Peer      string `json:"peer"`
+	Requests  int64  `json:"requests"`
+	Status2xx int64  `json:"status_2xx"`
+	Status4xx int64  `json:"status_4xx"`
+	Status5xx int64  `json:"status_5xx"`
+	PromptTok int64  `json:"prompt_tok"`
+	ComplTok  int64  `json:"compl_tok"`
+	TotalTok  int64  `json:"total_tok"`
+	ReqBytes  int64  `json:"req_bytes"`
+	RespBytes int64  `json:"resp_bytes"`
+	RTSumMs   int64  `json:"rt_sum_ms"`
+	RTMaxMs   int64  `json:"rt_max_ms"`
+}
+
+type aggregator struct {
+	mu             sync.RWMutex
+	active         map[int64]map[string]*bucket // minute → peer → bucket
+	archive        []bucket                     // 已 flush 的 closed buckets，按 Minute 升序
+	dir            string                       // BODYLOG_DIR
+	archiveKeepMin int                          // 内存最多保留的分钟数（按 archive 中最老 minute 算）
+}
+
+func newAggregator(dir string, keepMin int) *aggregator {
+	return &aggregator{
+		active:         map[int64]map[string]*bucket{},
+		dir:            dir,
+		archiveKeepMin: keepMin,
+	}
+}
+
+// ts 是 openresty bodylog_finalize 写的 ISO8601 + 北京时区，毫秒精度，例：
+// "2026-05-04T10:30:00.123+08:00"
+const tsLayout = "2006-01-02T15:04:05.000-07:00"
+
+func parseEntryMinute(m map[string]any) int64 {
+	if ts, ok := m["ts"].(string); ok && ts != "" {
+		if t, err := time.Parse(tsLayout, ts); err == nil {
+			return t.Unix() - t.Unix()%60
+		}
+	}
+	now := time.Now().Unix()
+	return now - now%60
+}
+
+func getInt64(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case json.Number:
+		n, _ := x.Int64()
+		return n
+	}
+	return 0
+}
+
+func getString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func (a *aggregator) ingest(m map[string]any) {
+	if a == nil {
+		return
+	}
+	minute := parseEntryMinute(m)
+	peer := getString(m["peer"])
+	if peer == "" {
+		peer = "(none)"
+	}
+	status := int(getInt64(m["status"]))
+
+	var prompt, compl, total int64
+	if rm, ok := m["resp_meta"].(map[string]any); ok {
+		if u, ok := rm["usage"].(map[string]any); ok {
+			prompt = getInt64(u["prompt_tokens"])
+			compl = getInt64(u["completion_tokens"])
+			total = getInt64(u["total_tokens"])
+			// Anthropic /v1/messages: input_tokens / output_tokens
+			if prompt == 0 {
+				prompt = getInt64(u["input_tokens"])
+			}
+			if compl == 0 {
+				compl = getInt64(u["output_tokens"])
+			}
+			if total == 0 {
+				total = prompt + compl
+			}
+		}
+	}
+	reqBytes := int64(len(getString(m["req_body"])))
+	respBytes := int64(len(getString(m["resp_body"])))
+	var rtMs int64
+	if v, ok := m["rt"].(float64); ok {
+		rtMs = int64(v * 1000)
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	bk := a.active[minute]
+	if bk == nil {
+		bk = map[string]*bucket{}
+		a.active[minute] = bk
+	}
+	b := bk[peer]
+	if b == nil {
+		b = &bucket{Minute: minute, Peer: peer}
+		bk[peer] = b
+	}
+	b.Requests++
+	switch {
+	case status >= 200 && status < 300:
+		b.Status2xx++
+	case status >= 400 && status < 500:
+		b.Status4xx++
+	case status >= 500:
+		b.Status5xx++
+	}
+	b.PromptTok += prompt
+	b.ComplTok += compl
+	b.TotalTok += total
+	b.ReqBytes += reqBytes
+	b.RespBytes += respBytes
+	b.RTSumMs += rtMs
+	if rtMs > b.RTMaxMs {
+		b.RTMaxMs = rtMs
+	}
+}
+
+// flushClosedMinutes 把 minute < now-90s 的 bucket 从 active 移到 archive，
+// 并 append 写到 metrics/YYYY-MM-DD.jsonl（明文，每行一个 bucket）。
+// 90s 窗口容忍：跨日 / 异常 / 迟到 entry。
+func (a *aggregator) flushClosedMinutes() {
+	cutoff := time.Now().Unix() - 90
+
+	a.mu.Lock()
+	var closed []bucket
+	for m, bk := range a.active {
+		if m < cutoff {
+			for _, b := range bk {
+				closed = append(closed, *b)
+			}
+			delete(a.active, m)
+		}
+	}
+	if len(closed) > 0 {
+		a.archive = append(a.archive, closed...)
+		sort.Slice(a.archive, func(i, j int) bool { return a.archive[i].Minute < a.archive[j].Minute })
+	}
+	// 淘汰超 keepMin 的 archive 条目
+	if a.archiveKeepMin > 0 {
+		cutMin := time.Now().Unix() - int64(a.archiveKeepMin)*60
+		drop := 0
+		for drop < len(a.archive) && a.archive[drop].Minute < cutMin {
+			drop++
+		}
+		if drop > 0 {
+			a.archive = a.archive[drop:]
+		}
+	}
+	a.mu.Unlock()
+
+	if len(closed) > 0 {
+		a.appendToFile(closed)
+	}
+}
+
+func (a *aggregator) appendToFile(buckets []bucket) {
+	metricsDir := filepath.Join(a.dir, "metrics")
+	if err := os.MkdirAll(metricsDir, 0o755); err != nil {
+		log.Printf("metrics mkdir %s: %v", metricsDir, err)
+		return
+	}
+	// 用 bucket 自身的 minute 选择落盘日期（跨日 flush 时把跨过去的 bucket
+	// 写到正确的日期文件里）
+	byDay := map[string][]bucket{}
+	for _, b := range buckets {
+		day := time.Unix(b.Minute, 0).Format("2006-01-02")
+		byDay[day] = append(byDay[day], b)
+	}
+	for day, bs := range byDay {
+		path := filepath.Join(metricsDir, day+".jsonl")
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Printf("metrics open %s: %v", path, err)
+			continue
+		}
+		enc := json.NewEncoder(f)
+		for _, b := range bs {
+			if err := enc.Encode(b); err != nil {
+				log.Printf("metrics encode err: %v", err)
+			}
+		}
+		_ = f.Close()
+	}
+}
+
+// reload 从今日 metrics 文件恢复 archive；listener 重启不丢历史
+func (a *aggregator) reload() {
+	today := time.Now().Format("2006-01-02")
+	path := filepath.Join(a.dir, "metrics", today+".jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return // 没文件就跳过（首次启动 / 日期切了 / 还没 flush）
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	var loaded []bucket
+	for scanner.Scan() {
+		var b bucket
+		if json.Unmarshal(scanner.Bytes(), &b) == nil {
+			loaded = append(loaded, b)
+		}
+	}
+	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Minute < loaded[j].Minute })
+	a.mu.Lock()
+	a.archive = loaded
+	a.mu.Unlock()
+	log.Printf("reloaded %d metrics buckets from %s", len(loaded), path)
+}
+
+// HTTP
+
+type peerSummary struct {
+	Peer             string `json:"peer"`
+	Requests         int64  `json:"requests"`
+	Status2xx        int64  `json:"status_2xx"`
+	Status4xx        int64  `json:"status_4xx"`
+	Status5xx        int64  `json:"status_5xx"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	TotalTokens      int64  `json:"total_tokens"`
+	ReqBodyBytes     int64  `json:"req_body_bytes"`
+	RespBodyBytes    int64  `json:"resp_body_bytes"`
+	RTAvgMs          int64  `json:"rt_avg_ms"`
+	RTMaxMs          int64  `json:"rt_max_ms"`
+}
+
+func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
+	minutes, _ := strconv.Atoi(r.URL.Query().Get("minutes"))
+	if minutes <= 0 {
+		minutes = 5
+	}
+	if a.archiveKeepMin > 0 && minutes > a.archiveKeepMin {
+		minutes = a.archiveKeepMin
+	}
+	breakdown := r.URL.Query().Get("breakdown") == "true"
+
+	now := time.Now().Unix()
+	cutoff := now - int64(minutes)*60
+	cutoff = cutoff - cutoff%60
+
+	a.mu.RLock()
+	var rows []bucket
+	for _, b := range a.archive {
+		if b.Minute >= cutoff {
+			rows = append(rows, b)
+		}
+	}
+	for m, bk := range a.active {
+		if m >= cutoff {
+			for _, b := range bk {
+				rows = append(rows, *b)
+			}
+		}
+	}
+	a.mu.RUnlock()
+
+	// per-peer aggregate
+	perPeer := map[string]*bucket{}
+	for i := range rows {
+		b := &rows[i]
+		p := perPeer[b.Peer]
+		if p == nil {
+			p = &bucket{Peer: b.Peer}
+			perPeer[b.Peer] = p
+		}
+		p.Requests += b.Requests
+		p.Status2xx += b.Status2xx
+		p.Status4xx += b.Status4xx
+		p.Status5xx += b.Status5xx
+		p.PromptTok += b.PromptTok
+		p.ComplTok += b.ComplTok
+		p.TotalTok += b.TotalTok
+		p.ReqBytes += b.ReqBytes
+		p.RespBytes += b.RespBytes
+		p.RTSumMs += b.RTSumMs
+		if b.RTMaxMs > p.RTMaxMs {
+			p.RTMaxMs = b.RTMaxMs
+		}
+	}
+	peers := make([]peerSummary, 0, len(perPeer))
+	for _, p := range perPeer {
+		avg := int64(0)
+		if p.Requests > 0 {
+			avg = p.RTSumMs / p.Requests
+		}
+		peers = append(peers, peerSummary{
+			Peer: p.Peer, Requests: p.Requests,
+			Status2xx: p.Status2xx, Status4xx: p.Status4xx, Status5xx: p.Status5xx,
+			PromptTokens: p.PromptTok, CompletionTokens: p.ComplTok, TotalTokens: p.TotalTok,
+			ReqBodyBytes: p.ReqBytes, RespBodyBytes: p.RespBytes,
+			RTAvgMs: avg, RTMaxMs: p.RTMaxMs,
+		})
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].Peer < peers[j].Peer })
+
+	resp := map[string]any{
+		"from":    time.Unix(cutoff, 0).Format(time.RFC3339),
+		"to":      time.Now().Format(time.RFC3339),
+		"minutes": minutes,
+		"peers":   peers,
+	}
+	if breakdown {
+		// 按 (Minute, Peer) 升序便于消费
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].Minute != rows[j].Minute {
+				return rows[i].Minute < rows[j].Minute
+			}
+			return rows[i].Peer < rows[j].Peer
+		})
+		resp["buckets"] = rows
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (a *aggregator) serveHTTP(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/summary", a.summaryHandler)
+	log.Printf("HTTP listening on %s (try /summary?minutes=5)", addr)
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("HTTP server err: %v", err)
+	}
+}
+
 func envOr(k, dflt string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -702,6 +1070,10 @@ func main() {
 
 	w := &hourWriter{dir: dir}
 
+	// per-minute aggregator：archive 内存保留 7 天 = 10080 分钟
+	agg := newAggregator(dir, 7*24*60)
+	agg.reload()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	go func() {
@@ -724,6 +1096,25 @@ func main() {
 		}
 	}()
 
+	// 每 60s flush 一次：把 minute < now-90s 的 bucket 移到 archive 并写盘
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				agg.flushClosedMinutes() // shutdown 前最后冲一次（active 里旧的）
+				return
+			case <-t.C:
+				agg.flushClosedMinutes()
+			}
+		}
+	}()
+
+	// HTTP server（独立端口，独立 goroutine；listener crash 不影响 frame 接收）
+	httpAddr := envOr("BODYLOG_HTTP_HOST", "0.0.0.0") + ":" + envOr("BODYLOG_HTTP_PORT", "9998")
+	go agg.serveHTTP(httpAddr)
+
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -733,7 +1124,7 @@ func main() {
 			log.Printf("accept err: %v", err)
 			continue
 		}
-		go handleConn(c, w)
+		go handleConn(c, w, agg)
 	}
 	w.close()
 	log.Println("exited")
