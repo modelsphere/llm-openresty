@@ -703,6 +703,7 @@ type bucket struct {
 	Status4xx int64  `json:"status_4xx"`
 	Status5xx int64  `json:"status_5xx"`
 	PromptTok int64  `json:"prompt_tok"`
+	CachedTok int64  `json:"cached_tok"` // prompt_tokens_details.cached_tokens（vllm prefix cache 命中）
 	ComplTok  int64  `json:"compl_tok"`
 	TotalTok  int64  `json:"total_tok"`
 	ReqBytes  int64  `json:"req_bytes"`
@@ -774,7 +775,7 @@ func (a *aggregator) ingest(m map[string]any) {
 	}
 	status := int(getInt64(m["status"]))
 
-	var prompt, compl, total int64
+	var prompt, cached, compl, total int64
 	if rm, ok := m["resp_meta"].(map[string]any); ok {
 		if u, ok := rm["usage"].(map[string]any); ok {
 			prompt = getInt64(u["prompt_tokens"])
@@ -789,6 +790,10 @@ func (a *aggregator) ingest(m map[string]any) {
 			}
 			if total == 0 {
 				total = prompt + compl
+			}
+			// vllm prefix cache 命中：prompt_tokens_details.cached_tokens
+			if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
+				cached = getInt64(d["cached_tokens"])
 			}
 		}
 	}
@@ -821,6 +826,7 @@ func (a *aggregator) ingest(m map[string]any) {
 		b.Status5xx++
 	}
 	b.PromptTok += prompt
+	b.CachedTok += cached
 	b.ComplTok += compl
 	b.TotalTok += total
 	b.ReqBytes += reqBytes
@@ -933,6 +939,7 @@ type peerSummary struct {
 	Status4xx        int64  `json:"status_4xx"`
 	Status5xx        int64  `json:"status_5xx"`
 	PromptTokens     int64  `json:"prompt_tokens"`
+	CachedTokens     int64  `json:"cached_tokens"` // vllm prefix cache 命中数
 	CompletionTokens int64  `json:"completion_tokens"`
 	TotalTokens      int64  `json:"total_tokens"`
 	ReqBodyBytes     int64  `json:"req_body_bytes"`
@@ -985,6 +992,7 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 		p.Status4xx += b.Status4xx
 		p.Status5xx += b.Status5xx
 		p.PromptTok += b.PromptTok
+		p.CachedTok += b.CachedTok
 		p.ComplTok += b.ComplTok
 		p.TotalTok += b.TotalTok
 		p.ReqBytes += b.ReqBytes
@@ -1003,7 +1011,8 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 		peers = append(peers, peerSummary{
 			Peer: p.Peer, Requests: p.Requests,
 			Status2xx: p.Status2xx, Status4xx: p.Status4xx, Status5xx: p.Status5xx,
-			PromptTokens: p.PromptTok, CompletionTokens: p.ComplTok, TotalTokens: p.TotalTok,
+			PromptTokens: p.PromptTok, CachedTokens: p.CachedTok,
+			CompletionTokens: p.ComplTok, TotalTokens: p.TotalTok,
 			ReqBodyBytes: p.ReqBytes, RespBodyBytes: p.RespBytes,
 			RTAvgMs: avg, RTMaxMs: p.RTMaxMs,
 		})
