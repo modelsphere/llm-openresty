@@ -713,20 +713,24 @@ type bucket struct {
 }
 
 type aggregator struct {
-	mu             sync.RWMutex
-	active         map[int64]map[string]*bucket // minute → peer → bucket（当前 active）
-	archive        []*bucket                    // 已 flush 的 closed buckets，按 Minute 升序（指针，迟到请求可原地累加）
-	archiveIdx     map[int64]map[string]*bucket // archive 的 (minute, peer) 索引，O(1) 查找；与 archive slice 共享 bucket 指针
-	dir            string                       // BODYLOG_DIR
-	archiveKeepMin int                          // 内存最多保留的分钟数（按 archive 中最老 minute 算）
+	mu                 sync.RWMutex
+	active             map[int64]map[string]*bucket // minute → peer → bucket（当前 active）
+	archive            []*bucket                    // 已 flush 的 closed buckets，按 Minute 升序（指针，迟到请求可原地累加）
+	archiveIdx         map[int64]map[string]*bucket // archive 的 (minute, peer) 索引，O(1) 查找；与 archive slice 共享 bucket 指针
+	archiveDirty       map[*bucket]struct{}         // 上次 flush 之后被 ingest 修改过的 archive buckets
+	archiveLastWritten map[*bucket]bucket           // archive bucket 上次写盘时的快照，用于算 delta
+	dir                string                       // BODYLOG_DIR
+	archiveKeepMin     int                          // 内存最多保留的分钟数（按 archive 中最老 minute 算）
 }
 
 func newAggregator(dir string, keepMin int) *aggregator {
 	return &aggregator{
-		active:         map[int64]map[string]*bucket{},
-		archiveIdx:     map[int64]map[string]*bucket{},
-		dir:            dir,
-		archiveKeepMin: keepMin,
+		active:             map[int64]map[string]*bucket{},
+		archiveIdx:         map[int64]map[string]*bucket{},
+		archiveDirty:       map[*bucket]struct{}{},
+		archiveLastWritten: map[*bucket]bucket{},
+		dir:                dir,
+		archiveKeepMin:     keepMin,
 	}
 }
 
@@ -838,9 +842,15 @@ func (a *aggregator) ingest(m map[string]any) {
 			// archive 有这个 minute（其它 peer），但没这个 peer：新增到 archive
 			b = &bucket{Minute: minute, Peer: peer}
 			bkA[peer] = b
-			a.archive = append(a.archive, b)
-			sort.Slice(a.archive, func(i, j int) bool { return a.archive[i].Minute < a.archive[j].Minute })
+			// 二分插入保持 archive 升序（避免 O(N log N) 的全量 sort）
+			idx := sort.Search(len(a.archive), func(i int) bool { return a.archive[i].Minute >= minute })
+			a.archive = append(a.archive, nil)
+			copy(a.archive[idx+1:], a.archive[idx:])
+			a.archive[idx] = b
 		}
+		// 标记 dirty：下次 flush 时把累加后的快照再写一行到 metrics 文件，
+		// reload 会按 (minute, peer) 合并，保证重启后数据完整。
+		a.archiveDirty[b] = struct{}{}
 	} else {
 		// 既不在 active 也不在 archive（新 minute，或 minute 已超出 archiveKeepMin）
 		bk := map[string]*bucket{}
@@ -880,8 +890,9 @@ func (a *aggregator) flushClosedMinutes() {
 	cutoff := time.Now().Unix() - 90
 
 	a.mu.Lock()
-	var closed []bucket // 写盘用 value copy 快照，下面 append 时再取
+	var closed []bucket // 写盘用 value copy 快照
 	var newPtrs []*bucket
+	newPtrSet := map[*bucket]struct{}{}
 	for m, bk := range a.active {
 		if m < cutoff {
 			if a.archiveIdx[m] == nil {
@@ -890,7 +901,9 @@ func (a *aggregator) flushClosedMinutes() {
 			for peer, b := range bk {
 				closed = append(closed, *b) // 写盘快照
 				a.archiveIdx[m][peer] = b   // 索引（同一指针）
+				a.archiveLastWritten[b] = *b
 				newPtrs = append(newPtrs, b)
+				newPtrSet[b] = struct{}{}
 			}
 			delete(a.active, m)
 		}
@@ -899,7 +912,41 @@ func (a *aggregator) flushClosedMinutes() {
 		a.archive = append(a.archive, newPtrs...)
 		sort.Slice(a.archive, func(i, j int) bool { return a.archive[i].Minute < a.archive[j].Minute })
 	}
-	// 淘汰超 keepMin 的 archive 条目（同步清 archiveIdx）
+	// 收集自上次 flush 起被 ingest 修改过的 archive buckets（迟到请求累加）。
+	// 写**delta**（cur - lastWritten）而非当前累加快照，避免 reload 时与首次 flush 那行
+	// double-count。reload 把同 (minute, peer) 多行累加，初始 + 各次 delta = 当前累加值。
+	// 跳过本轮刚 close 的（已在 closed 里），避免立刻又写一行 0 delta。
+	var dirty []bucket
+	for b := range a.archiveDirty {
+		if _, isNew := newPtrSet[b]; isNew {
+			continue
+		}
+		last := a.archiveLastWritten[b]
+		cur := *b
+		delta := bucket{
+			Minute:    cur.Minute,
+			Peer:      cur.Peer,
+			Requests:  cur.Requests - last.Requests,
+			Status2xx: cur.Status2xx - last.Status2xx,
+			Status4xx: cur.Status4xx - last.Status4xx,
+			Status5xx: cur.Status5xx - last.Status5xx,
+			PromptTok: cur.PromptTok - last.PromptTok,
+			CachedTok: cur.CachedTok - last.CachedTok,
+			ComplTok:  cur.ComplTok - last.ComplTok,
+			TotalTok:  cur.TotalTok - last.TotalTok,
+			ReqBytes:  cur.ReqBytes - last.ReqBytes,
+			RespBytes: cur.RespBytes - last.RespBytes,
+			RTSumMs:   cur.RTSumMs - last.RTSumMs,
+			RTMaxMs:   cur.RTMaxMs, // max 不能算 delta，写当前值（reload 取 max）
+		}
+		if delta.Requests == 0 {
+			continue // 没新增请求，可能是别的字段被改了或者重复 ingest，跳过
+		}
+		dirty = append(dirty, delta)
+		a.archiveLastWritten[b] = cur
+	}
+	a.archiveDirty = map[*bucket]struct{}{} // 清空，下次 flush 起重新累积
+	// 淘汰超 keepMin 的 archive 条目（同步清 archiveIdx + archiveLastWritten）
 	if a.archiveKeepMin > 0 {
 		cutMin := time.Now().Unix() - int64(a.archiveKeepMin)*60
 		drop := 0
@@ -909,6 +956,7 @@ func (a *aggregator) flushClosedMinutes() {
 		if drop > 0 {
 			for i := 0; i < drop; i++ {
 				delete(a.archiveIdx, a.archive[i].Minute)
+				delete(a.archiveLastWritten, a.archive[i])
 			}
 			a.archive = a.archive[drop:]
 		}
@@ -917,6 +965,10 @@ func (a *aggregator) flushClosedMinutes() {
 
 	if len(closed) > 0 {
 		a.appendToFile(closed)
+	}
+	if len(dirty) > 0 {
+		// 迟到累加的 delta 落盘，reload 会合并（求和）首次 flush + 各 delta 行
+		a.appendToFile(dirty)
 	}
 }
 
