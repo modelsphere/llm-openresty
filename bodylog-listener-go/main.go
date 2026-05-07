@@ -714,8 +714,9 @@ type bucket struct {
 
 type aggregator struct {
 	mu             sync.RWMutex
-	active         map[int64]map[string]*bucket // minute → peer → bucket
-	archive        []bucket                     // 已 flush 的 closed buckets，按 Minute 升序
+	active         map[int64]map[string]*bucket // minute → peer → bucket（当前 active）
+	archive        []*bucket                    // 已 flush 的 closed buckets，按 Minute 升序（指针，迟到请求可原地累加）
+	archiveIdx     map[int64]map[string]*bucket // archive 的 (minute, peer) 索引，O(1) 查找；与 archive slice 共享 bucket 指针
 	dir            string                       // BODYLOG_DIR
 	archiveKeepMin int                          // 内存最多保留的分钟数（按 archive 中最老 minute 算）
 }
@@ -723,6 +724,7 @@ type aggregator struct {
 func newAggregator(dir string, keepMin int) *aggregator {
 	return &aggregator{
 		active:         map[int64]map[string]*bucket{},
+		archiveIdx:     map[int64]map[string]*bucket{},
 		dir:            dir,
 		archiveKeepMin: keepMin,
 	}
@@ -769,7 +771,21 @@ func (a *aggregator) ingest(m map[string]any) {
 		return
 	}
 	minute := parseEntryMinute(m)
+	// router 场景：openresty 选中的 peer 是 router_ip:port（中间层），
+	// router 在响应里回 X-Routed-Peer 标识真实后端 vllm，bodylog_finalize 把它写到
+	// forwarded_to 字段。优先按真实后端聚合，让 monitor 的 per-peer TPM 不被 router 塌缩成一行。
 	peer := getString(m["peer"])
+	if fwd := getString(m["forwarded_to"]); fwd != "" {
+		// 归一化：去掉 "http://"、"https://" 前缀，剥掉 path（保留 host:port）
+		fwd = strings.TrimPrefix(fwd, "https://")
+		fwd = strings.TrimPrefix(fwd, "http://")
+		if i := strings.IndexByte(fwd, '/'); i >= 0 {
+			fwd = fwd[:i]
+		}
+		if fwd != "" {
+			peer = fwd
+		}
+	}
 	if peer == "" {
 		peer = "(none)"
 	}
@@ -806,15 +822,31 @@ func (a *aggregator) ingest(m map[string]any) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	bk := a.active[minute]
-	if bk == nil {
-		bk = map[string]*bucket{}
-		a.active[minute] = bk
-	}
-	b := bk[peer]
-	if b == nil {
+
+	// 选 bucket：优先 active；其次 archive（迟到请求 rt > 90s）；最后兜底新建 active
+	// 这样同 (minute, peer) 永远只有一个 bucket，不会因为 minute 已被 flush 就重建副本
+	var b *bucket
+	if bk, ok := a.active[minute]; ok {
+		b = bk[peer]
+		if b == nil {
+			b = &bucket{Minute: minute, Peer: peer}
+			bk[peer] = b
+		}
+	} else if bkA, ok := a.archiveIdx[minute]; ok {
+		b = bkA[peer]
+		if b == nil {
+			// archive 有这个 minute（其它 peer），但没这个 peer：新增到 archive
+			b = &bucket{Minute: minute, Peer: peer}
+			bkA[peer] = b
+			a.archive = append(a.archive, b)
+			sort.Slice(a.archive, func(i, j int) bool { return a.archive[i].Minute < a.archive[j].Minute })
+		}
+	} else {
+		// 既不在 active 也不在 archive（新 minute，或 minute 已超出 archiveKeepMin）
+		bk := map[string]*bucket{}
 		b = &bucket{Minute: minute, Peer: peer}
 		bk[peer] = b
+		a.active[minute] = bk
 	}
 	b.Requests++
 	switch {
@@ -840,24 +872,34 @@ func (a *aggregator) ingest(m map[string]any) {
 // flushClosedMinutes 把 minute < now-90s 的 bucket 从 active 移到 archive，
 // 并 append 写到 metrics/YYYY-MM-DD.jsonl（明文，每行一个 bucket）。
 // 90s 窗口容忍：跨日 / 异常 / 迟到 entry。
+//
+// 注意：archive 存指针，archiveIdx 是 (minute, peer) → 同一指针 的索引。
+// 迟到请求（rt > 90s）的 ingest 会通过 archiveIdx 找到 archive 里的 bucket
+// 原地累加，避免重复 (minute, peer) bucket。
 func (a *aggregator) flushClosedMinutes() {
 	cutoff := time.Now().Unix() - 90
 
 	a.mu.Lock()
-	var closed []bucket
+	var closed []bucket // 写盘用 value copy 快照，下面 append 时再取
+	var newPtrs []*bucket
 	for m, bk := range a.active {
 		if m < cutoff {
-			for _, b := range bk {
-				closed = append(closed, *b)
+			if a.archiveIdx[m] == nil {
+				a.archiveIdx[m] = map[string]*bucket{}
+			}
+			for peer, b := range bk {
+				closed = append(closed, *b) // 写盘快照
+				a.archiveIdx[m][peer] = b   // 索引（同一指针）
+				newPtrs = append(newPtrs, b)
 			}
 			delete(a.active, m)
 		}
 	}
-	if len(closed) > 0 {
-		a.archive = append(a.archive, closed...)
+	if len(newPtrs) > 0 {
+		a.archive = append(a.archive, newPtrs...)
 		sort.Slice(a.archive, func(i, j int) bool { return a.archive[i].Minute < a.archive[j].Minute })
 	}
-	// 淘汰超 keepMin 的 archive 条目
+	// 淘汰超 keepMin 的 archive 条目（同步清 archiveIdx）
 	if a.archiveKeepMin > 0 {
 		cutMin := time.Now().Unix() - int64(a.archiveKeepMin)*60
 		drop := 0
@@ -865,6 +907,9 @@ func (a *aggregator) flushClosedMinutes() {
 			drop++
 		}
 		if drop > 0 {
+			for i := 0; i < drop; i++ {
+				delete(a.archiveIdx, a.archive[i].Minute)
+			}
 			a.archive = a.archive[drop:]
 		}
 	}
@@ -916,18 +961,51 @@ func (a *aggregator) reload() {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	var loaded []bucket
+	// metrics 文件历史上可能存在同 (minute, peer) 多行（修复前的迟到请求 bug）
+	// reload 时按 (minute, peer) 累加合并，恢复出干净的单条 bucket
+	idx := map[int64]map[string]*bucket{}
 	for scanner.Scan() {
 		var b bucket
-		if json.Unmarshal(scanner.Bytes(), &b) == nil {
-			loaded = append(loaded, b)
+		if json.Unmarshal(scanner.Bytes(), &b) != nil {
+			continue
+		}
+		mp := idx[b.Minute]
+		if mp == nil {
+			mp = map[string]*bucket{}
+			idx[b.Minute] = mp
+		}
+		if existing, ok := mp[b.Peer]; ok {
+			existing.Requests += b.Requests
+			existing.Status2xx += b.Status2xx
+			existing.Status4xx += b.Status4xx
+			existing.Status5xx += b.Status5xx
+			existing.PromptTok += b.PromptTok
+			existing.CachedTok += b.CachedTok
+			existing.ComplTok += b.ComplTok
+			existing.TotalTok += b.TotalTok
+			existing.ReqBytes += b.ReqBytes
+			existing.RespBytes += b.RespBytes
+			existing.RTSumMs += b.RTSumMs
+			if b.RTMaxMs > existing.RTMaxMs {
+				existing.RTMaxMs = b.RTMaxMs
+			}
+		} else {
+			cp := b
+			mp[b.Peer] = &cp
+		}
+	}
+	var loaded []*bucket
+	for _, mp := range idx {
+		for _, p := range mp {
+			loaded = append(loaded, p)
 		}
 	}
 	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Minute < loaded[j].Minute })
 	a.mu.Lock()
 	a.archive = loaded
+	a.archiveIdx = idx
 	a.mu.Unlock()
-	log.Printf("reloaded %d metrics buckets from %s", len(loaded), path)
+	log.Printf("reloaded %d metrics buckets from %s (merged from raw lines)", len(loaded), path)
 }
 
 // HTTP
@@ -966,7 +1044,7 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 	var rows []bucket
 	for _, b := range a.archive {
 		if b.Minute >= cutoff {
-			rows = append(rows, b)
+			rows = append(rows, *b) // 拷贝快照，避免 RUnlock 后 archive 被并发更新
 		}
 	}
 	for m, bk := range a.active {
