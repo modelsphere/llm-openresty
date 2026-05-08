@@ -148,6 +148,33 @@ worker 0 每 10s TCP connect + `GET /health`，失败 → ban 300s（自动续�
 - `GET /_health_status` — 返回 JSON，每 peer 的 `{active, banned}` 状态
 - `GET /_route_debug?sid=xxx` — 静态 hash 预览，不发往后端
 - `POST /_route_inspect` — 按真实请求 extract sid 并返回决策，不发后端
+- `GET /_active_conns_set` — 矫正 active_conns 计数器（仅 127.0.0.1 可访问）
+
+### `/_active_conns_set` —— 矫正 phantom 计数
+
+**何时需要**：用 `kill -TERM` / `kill -9` 砍 worker 时，被砍掉的 in-flight 请求不会
+跑到 log_by_lua 阶段执行 `dict:incr(peer, -1)`，导致 `active_conns` 计数永久 +1。
+查 `/_active_conns` 返回值与实际 ESTAB 连接数对不上时就是 leak。
+
+```bash
+# 先查实际连接数
+sudo ss -tn | grep '10.0.0.1:8050' | wc -l            # 跨机连接：直接计数
+sudo ss -tn | grep '127.0.0.1:8060' | wc -l              # loopback：除以 2
+
+# 矫正单个 peer 的计数
+curl 'http://127.0.0.1:18080/_active_conns_set?peer=10.0.0.1:8050&value=2'
+# {"ok":true,"action":"set","peer":"10.0.0.1:8050","value":2}
+
+# 删除某个 peer 的 key（PEERS 里删除某 peer 后清理残留 key）
+curl 'http://127.0.0.1:18080/_active_conns_set?peer=127.0.0.1:8060&delete=1'
+
+# 全部清空（慎用，所有 peer 计数清零）
+curl 'http://127.0.0.1:18080/_active_conns_set?flush=1'
+```
+
+**预防 phantom 计数**：以后停 worker 改用 `kill -QUIT <pid>`（graceful，等连接结束）
+或者 nginx.conf 加 `worker_shutdown_timeout 600s;` —— reload 时 graceful 等连接
+最多 10 分钟，不至于无限挂。
 
 ## API Key 鉴权
 
