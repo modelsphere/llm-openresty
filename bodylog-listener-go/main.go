@@ -710,6 +710,13 @@ type bucket struct {
 	RespBytes int64  `json:"resp_bytes"`
 	RTSumMs   int64  `json:"rt_sum_ms"`
 	RTMaxMs   int64  `json:"rt_max_ms"`
+	// first_chunk_t = ngx.now() - ngx.req.start_time()（openresty body_filter
+	// 收到第一个响应 chunk 时记录），流式响应里约等于 TTFT（首 token 到达）；
+	// 非流式响应里等于完整 rt。每分钟 Sum/Max 聚合（N 用 Status2xx 近似不另存：
+	// 只有 2xx 成功才有 first_chunk_t，OpenResty Lua 那侧已经过滤了 nil 值）。
+	FrtSumMs int64 `json:"frt_sum_ms"`
+	FrtMaxMs int64 `json:"frt_max_ms"`
+	FrtN     int64 `json:"frt_n"` // 实际带 first_chunk_t 的请求数（兼容老数据用，可能 < Status2xx）
 }
 
 type aggregator struct {
@@ -823,6 +830,13 @@ func (a *aggregator) ingest(m map[string]any) {
 	if v, ok := m["rt"].(float64); ok {
 		rtMs = int64(v * 1000)
 	}
+	// first_chunk_t（≈ TTFT for streaming responses，全 rt for 非流式）
+	var frtMs int64
+	hasFrt := false
+	if v, ok := m["first_chunk_t"].(float64); ok && v > 0 {
+		frtMs = int64(v * 1000)
+		hasFrt = true
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -876,6 +890,13 @@ func (a *aggregator) ingest(m map[string]any) {
 	b.RTSumMs += rtMs
 	if rtMs > b.RTMaxMs {
 		b.RTMaxMs = rtMs
+	}
+	if hasFrt {
+		b.FrtSumMs += frtMs
+		b.FrtN++
+		if frtMs > b.FrtMaxMs {
+			b.FrtMaxMs = frtMs
+		}
 	}
 }
 
@@ -1041,6 +1062,11 @@ func (a *aggregator) reload() {
 			if b.RTMaxMs > existing.RTMaxMs {
 				existing.RTMaxMs = b.RTMaxMs
 			}
+			existing.FrtSumMs += b.FrtSumMs
+			existing.FrtN += b.FrtN
+			if b.FrtMaxMs > existing.FrtMaxMs {
+				existing.FrtMaxMs = b.FrtMaxMs
+			}
 		} else {
 			cp := b
 			mp[b.Peer] = &cp
@@ -1076,6 +1102,11 @@ type peerSummary struct {
 	RespBodyBytes    int64  `json:"resp_body_bytes"`
 	RTAvgMs          int64  `json:"rt_avg_ms"`
 	RTMaxMs          int64  `json:"rt_max_ms"`
+	// TTFT（first_chunk_t）：仅在请求带 first_chunk_t 字段时累计（流式响应必有；
+	// 非流式响应近似等于 rt），FrtN 为实际带 frt 的请求数；FrtAvgMs 用 FrtN 做分母
+	FrtAvgMs int64 `json:"frt_avg_ms"`
+	FrtMaxMs int64 `json:"frt_max_ms"`
+	FrtN     int64 `json:"frt_n"`
 }
 
 func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
@@ -1131,12 +1162,21 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 		if b.RTMaxMs > p.RTMaxMs {
 			p.RTMaxMs = b.RTMaxMs
 		}
+		p.FrtSumMs += b.FrtSumMs
+		p.FrtN += b.FrtN
+		if b.FrtMaxMs > p.FrtMaxMs {
+			p.FrtMaxMs = b.FrtMaxMs
+		}
 	}
 	peers := make([]peerSummary, 0, len(perPeer))
 	for _, p := range perPeer {
 		avg := int64(0)
 		if p.Requests > 0 {
 			avg = p.RTSumMs / p.Requests
+		}
+		frtAvg := int64(0)
+		if p.FrtN > 0 {
+			frtAvg = p.FrtSumMs / p.FrtN
 		}
 		peers = append(peers, peerSummary{
 			Peer: p.Peer, Requests: p.Requests,
@@ -1145,6 +1185,7 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 			CompletionTokens: p.ComplTok, TotalTokens: p.TotalTok,
 			ReqBodyBytes: p.ReqBytes, RespBodyBytes: p.RespBytes,
 			RTAvgMs: avg, RTMaxMs: p.RTMaxMs,
+			FrtAvgMs: frtAvg, FrtMaxMs: p.FrtMaxMs, FrtN: p.FrtN,
 		})
 	}
 	sort.Slice(peers, func(i, j int) bool { return peers[i].Peer < peers[j].Peer })
