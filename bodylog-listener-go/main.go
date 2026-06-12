@@ -2,7 +2,9 @@
 // 长度前缀二进制帧，解析后落盘成抽取过 SSE content 的 JSONL。
 //
 // 二进制帧（与 session_route.conf 里的 bodylog_finalize 保持同步，big-endian）：
-//   [u32 total_len][u16 meta_len][meta_json][u32 req_len][req_bytes][u32 resp_len][resp_bytes]
+//
+//	[u32 total_len][u16 meta_len][meta_json][u32 req_len][req_bytes][u32 resp_len][resp_bytes]
+//
 // total_len 不含开头 4 字节自身。openresty 端只 cjson.encode 小 meta，
 // req_body / resp_body 作为裸字节传输，跳过大字符串 escape 扫描（实测能省 5-8ms / entry）。
 //
@@ -10,7 +12,7 @@
 //   - 监听 TCP 9999（BODYLOG_HOST / BODYLOG_PORT 可覆盖）
 //   - 落盘 BODYLOG_DIR/YYYY-MM-DD/HH.jsonl（按天分目录、按小时切文件）
 //   - 跨日时：housekeep 把昨天目录整个 tar.gz → BODYLOG_DIR/YYYY-MM-DD.tar.gz，删原目录
-//   - 14 天后删历史 .tar.gz
+//   - keepDays 天后删历史 .tar.gz（默认 90，BODYLOG_KEEP_DAYS 可覆盖）
 //   - 兼容迁移：BODYLOG_DIR 根上残留的旧版 .jsonl / .jsonl.gz 沿用旧 housekeep 逻辑
 //   - SIGTERM/SIGINT 优雅退出
 package main
@@ -43,13 +45,16 @@ import (
 )
 
 const (
-	defaultHost = "127.0.0.1"
-	defaultPort = "9999"
-	defaultDir  = "/mnt/nvme0n1/nginx/bodylog"
-	maxFrame    = 64 * 1024 * 1024 // 单帧最大 64 MB（防御 OOM；正常 256K input + 2M resp cap 远小于此）
-	keepDays    = 14
-	readBufSize = 1 << 20
+	defaultHost     = "127.0.0.1"
+	defaultPort     = "9999"
+	defaultDir      = "/mnt/nvme0n1/nginx/bodylog"
+	maxFrame        = 64 * 1024 * 1024 // 单帧最大 64 MB（防御 OOM；正常 256K input + 2M resp cap 远小于此）
+	defaultKeepDays = 90               // 历史 .tar.gz 默认保留天数，可被 BODYLOG_KEEP_DAYS 覆盖
+	readBufSize     = 1 << 20
 )
+
+// keepDays: 历史归档保留天数。默认 defaultKeepDays，main() 启动时从 BODYLOG_KEEP_DAYS 覆盖。
+var keepDays = defaultKeepDays
 
 // hourWriter: 按小时切的 jsonl 文件写入器。
 //
@@ -94,7 +99,7 @@ func (w *hourWriter) write(p []byte) error {
 		w.hour = thisHour
 		log.Printf("opened %s", path)
 		if dayChanged {
-			// 跨日才需要触发 housekeep（昨天目录待打包 + 14 天 cutoff）
+			// 跨日才需要触发 housekeep（昨天目录待打包 + keepDays cutoff）
 			go housekeep(w.dir)
 		}
 	}
@@ -509,11 +514,11 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 }
 
 // housekeep 扫描 BODYLOG_DIR，处理：
-//   1. YYYY-MM-DD/ 目录（非今日）→ tar.gz 整个目录 → 删原目录
-//   2. YYYY-MM-DD.tar.gz（≥ 14 天）→ 删
-//   3. .tar.gz.tmp 残留（上次崩溃没完成）→ 删
-//   4. （兼容）旧版 X.jsonl 在根目录 → gzip → 删原文件
-//   5. （兼容）旧版 X.jsonl.gz 在根目录（≥ 14 天）→ 删
+//  1. YYYY-MM-DD/ 目录（非今日）→ tar.gz 整个目录 → 删原目录
+//  2. YYYY-MM-DD.tar.gz（≥ keepDays 天）→ 删
+//  3. .tar.gz.tmp 残留（上次崩溃没完成）→ 删
+//  4. （兼容）旧版 X.jsonl 在根目录 → gzip → 删原文件
+//  5. （兼容）旧版 X.jsonl.gz 在根目录（≥ keepDays 天）→ 删
 //
 // 多次并发触发是安全的：每个目标都先 Stat 检查 dst 是否已存在再处理。
 func housekeep(dir string) {
@@ -1230,6 +1235,17 @@ func envOr(k, dflt string) string {
 	return dflt
 }
 
+// envOrInt 读 int 型环境变量；非法/非正数则回退默认值并告警。
+func envOrInt(k string, dflt int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+		log.Printf("invalid %s=%q (need positive int), using default %d", k, v, dflt)
+	}
+	return dflt
+}
+
 // 编译期防止 unused import
 var _ = bytes.Buffer{}
 
@@ -1238,6 +1254,8 @@ func main() {
 	host := envOr("BODYLOG_HOST", defaultHost)
 	port := envOr("BODYLOG_PORT", defaultPort)
 	dir := envOr("BODYLOG_DIR", defaultDir)
+	keepDays = envOrInt("BODYLOG_KEEP_DAYS", defaultKeepDays)
+	log.Printf("history archives retention: %d days (BODYLOG_KEEP_DAYS)", keepDays)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", dir, err)
 	}
