@@ -199,6 +199,19 @@ async def health(request: web.Request):
     return web.Response(text="OK")
 
 
+async def models_list(request: web.Request):
+    """openresty health probe 打 GET /v1/models，只看状态行是否含 200。
+    回一个 OpenAI 兼容的模型列表（id 用 --name，便于辨认是哪个 mock）。"""
+    name = request.app["name"]
+    st = request.app.get("models_status", 200)
+    if st != 200:
+        return web.Response(status=st, text="mock forced %d" % st)
+    return web.json_response({
+        "object": "list",
+        "data": [{"id": name, "object": "model", "owned_by": "mock"}],
+    })
+
+
 async def stats(request: web.Request):
     s = request.app["stats"]
     return web.json_response({
@@ -227,6 +240,10 @@ async def chat_completions(request: web.Request):
     app = request.app
     stats = app["stats"]
     stats["req_count"] += 1
+    cs = app.get("chat_status", 200)
+    if cs != 200:
+        return web.Response(status=cs, text="mock forced %d" % cs,
+                            headers={"X-Mock-Peer": app["name"]})
     stats["in_flight"] += 1
     try:
         body, model, sid, out_len, chunk_delay, prefill_delay = await _read_params(request)
@@ -235,6 +252,13 @@ async def chat_completions(request: web.Request):
         emit_tool_call = bool(body.get("emit_tool_call"))
         token = _REASONING_TOKEN if emit_reasoning else _CONTENT_TOKEN
         kind = "reasoning" if emit_reasoning else "content"
+        # token_bytes：每个 token 放大到 N 字节，少量 out_len 即可产出 MB 级响应(G8 截断测试用)
+        token_bytes = max(1, int(body.get("token_bytes") or 1))
+        unit = token * token_bytes
+        # emit_routed_peer：模拟 router 上游回 X-Routed-Peer，验证 bodylog forwarded_to(G17)
+        extra_hdr = {}
+        if body.get("emit_routed_peer"):
+            extra_hdr["X-Routed-Peer"] = "http://mock-upstream/" + app["name"]
         cid = _gen_id("chatcmpl")
         created = int(time.time())
         prompt_tokens = max(1, len(json.dumps(body.get("messages") or [])) // 4)
@@ -243,8 +267,8 @@ async def chat_completions(request: web.Request):
         if not stream:
             # ── 非流：一次性返回 chat.completion 对象 ──
             await asyncio.sleep(prefill_delay + chunk_delay * out_len)
-            content_text = token * out_len if not emit_reasoning else ""
-            reasoning_text = token * out_len if emit_reasoning else None
+            content_text = unit * out_len if not emit_reasoning else ""
+            reasoning_text = unit * out_len if emit_reasoning else None
             tool_calls = []
             if emit_tool_call:
                 tool_calls = [{"id": "call_" + uuid.uuid4().hex[:12], "type": "function",
@@ -270,14 +294,17 @@ async def chat_completions(request: web.Request):
                 "prompt_logprobs": None, "prompt_token_ids": None,
                 "kv_transfer_params": None,
             }
-            return web.json_response(payload, headers={"X-Mock-Peer": app["name"]})
+            h = {"X-Mock-Peer": app["name"]}; h.update(extra_hdr)
+            return web.json_response(payload, headers=h)
 
         # ── 流式 ──
-        resp = web.StreamResponse(status=200, headers={
+        _sh = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             "X-Mock-Peer": app["name"],
-        })
+        }
+        _sh.update(extra_hdr)
+        resp = web.StreamResponse(status=200, headers=_sh)
         await resp.prepare(request)
         if prefill_delay > 0:
             await asyncio.sleep(prefill_delay)
@@ -287,18 +314,18 @@ async def chat_completions(request: web.Request):
 
         # N - 1 个普通 content/reasoning chunk
         for i in range(out_len - 1):
-            await resp.write(_chat_content_chunk(cid, model, created, token, kind=kind))
+            await resp.write(_chat_content_chunk(cid, model, created, unit, kind=kind))
             if chunk_delay > 0:
                 await asyncio.sleep(chunk_delay)
 
         # 最后一个 content chunk 带 finish_reason（与真 vllm 一致——last chunk 在
         # delta 里也带 reasoning/content，且在 choices[0].finish_reason 填写值）
         if not emit_tool_call:
-            await resp.write(_chat_content_chunk(cid, model, created, token,
+            await resp.write(_chat_content_chunk(cid, model, created, unit,
                                                  finish_reason=finish_reason, kind=kind))
         else:
             # tool_calls 路径：finish_reason 在 tool_call chunk 之后单独一个空 delta chunk
-            await resp.write(_chat_content_chunk(cid, model, created, token, kind=kind))
+            await resp.write(_chat_content_chunk(cid, model, created, unit, kind=kind))
             await resp.write(_chat_tool_call_chunk(cid, model, created,
                                                     "get_weather", '{"city":"Beijing"}'))
             # finish chunk: empty delta + finish_reason
@@ -444,8 +471,11 @@ def make_app(args):
     app["output_len"] = args.output_len
     app["chunk_delay_ms"] = args.chunk_delay_ms
     app["prefill_delay_ms"] = args.prefill_delay_ms
+    app["models_status"] = args.models_status
+    app["chat_status"] = args.chat_status
     app["stats"] = {"req_count": 0, "in_flight": 0}
     app.router.add_get("/health", health)
+    app.router.add_get("/v1/models", models_list)
     app.router.add_get("/_stats", stats)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_post("/v1/completions", completions)
@@ -460,6 +490,8 @@ def main():
     p.add_argument("--output-len", type=int, default=int(os.environ.get("OUTPUT_LEN", "1500")))
     p.add_argument("--chunk-delay-ms", type=float, default=float(os.environ.get("CHUNK_DELAY_MS", "5")))
     p.add_argument("--prefill-delay-ms", type=float, default=float(os.environ.get("PREFILL_DELAY_MS", "50")))
+    p.add_argument("--models-status", type=int, default=200, help="坏 mock 模拟:/v1/models 返此状态(F5 测健康探测 ban)")
+    p.add_argument("--chat-status", type=int, default=200, help="坏 mock 模拟:/v1/chat/completions 返此状态(E5 测 next_upstream retry)")
     args = p.parse_args()
 
     app = make_app(args)

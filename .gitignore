@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 *.swp
+
+# 测试用路由 conf 不入库(仅本地/chat 测试环境用,勿与生产 conf 混)
+session_route_multitest.conf
+test/session_route_empty.conf
+test/session_route_*test*.conf
