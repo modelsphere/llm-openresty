@@ -6,3 +6,6 @@ __pycache__/
 session_route_multitest.conf
 test/session_route_empty.conf
 test/session_route_*test*.conf
+
+# 测试数据集(从 bodylog 提取的 TTFT 样本等,体积大,不入库)
+test/data/
