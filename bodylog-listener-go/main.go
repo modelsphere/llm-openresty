@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -31,10 +32,10 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,19 +43,37 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	_ "github.com/marcboeker/go-duckdb"
 )
 
 const (
-	defaultHost     = "127.0.0.1"
-	defaultPort     = "9999"
-	defaultDir      = "/mnt/nvme0n1/nginx/bodylog"
-	maxFrame        = 64 * 1024 * 1024 // 单帧最大 64 MB（防御 OOM；正常 256K input + 2M resp cap 远小于此）
-	defaultKeepDays = 90               // 历史 .tar.gz 默认保留天数，可被 BODYLOG_KEEP_DAYS 覆盖
-	readBufSize     = 1 << 20
+	defaultHost            = "127.0.0.1"
+	defaultPort            = "9999"
+	defaultDir             = "/mnt/nvme0n1/nginx/bodylog"
+	maxFrame               = 64 * 1024 * 1024 // 单帧最大 64 MB（防御 OOM；正常 256K input + 2M resp cap 远小于此）
+	defaultKeepDays        = 90               // 历史 .tar.gz 默认保留天数，可被 BODYLOG_KEEP_DAYS 覆盖
+	defaultDetailsKeepDays = 365              // metrics 明细 parquet 保留天数，可被 BODYLOG_DETAILS_KEEP_DAYS 覆盖
+	metricsMaxRows         = 5000             // /metrics 单次返回硬上限（≈2.5MB JSON）；截断时回 returned_to 供按 ts 续取
+	readBufSize            = 1 << 20
 )
 
 // keepDays: 历史归档保留天数。默认 defaultKeepDays，main() 启动时从 BODYLOG_KEEP_DAYS 覆盖。
 var keepDays = defaultKeepDays
+
+// detailsKeepDays: metrics 明细 parquet 保留天数。main() 从 BODYLOG_DETAILS_KEEP_DAYS 覆盖。
+var detailsKeepDays = defaultDetailsKeepDays
+
+// duckDB: 进程内 in-memory DuckDB（go-duckdb / CGO）。用于 metrics/details 的
+// 每日 jsonl→parquet 转换 与 /metrics 接口的混读查询。main() 启动时 sql.Open；
+// 若打开失败则保持 nil，相关功能优雅降级（/metrics 返回 503，rotate 跳过）。
+var duckDB *sql.DB
+
+// httpToken: /summary 与 /metrics 的鉴权 token（BODYLOG_HTTP_TOKEN）。
+// 空="" → 不鉴权（opt-in，向后兼容：不设就跟以前一样开放）。非空 → 两接口要求
+// Authorization: Bearer <token> 或 ?token=<token>。/healthz 永远开放。
+// ⚠️ 启用后，调用方(monitor 的 /summary 拉取)必须带上同一个 token，否则 401。
+var httpToken string
 
 // hourWriter: 按小时切的 jsonl 文件写入器。
 //
@@ -108,6 +127,127 @@ func (w *hourWriter) write(p []byte) error {
 }
 
 func (w *hourWriter) close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
+}
+
+// detailRecord: 每请求 metrics 明细（剥掉所有正文：req_body / resp_body / req_headers /
+// resp_meta.reasoning / resp_meta.tool_calls）。~400B/行，按天写 metrics/details/<date>.jsonl，
+// 跨天封口后由 housekeep 转 parquet。/metrics 接口查的就是这份。
+type detailRecord struct {
+	Ts               string  `json:"ts"`
+	RequestID        string  `json:"request_id,omitempty"`
+	SourceAddr       string  `json:"source_addr,omitempty"`
+	URI              string  `json:"uri,omitempty"`
+	Method           string  `json:"method,omitempty"`
+	Stream           *bool   `json:"stream,omitempty"` // 请求参数 stream，从 req_body 提取（null=无法判定）
+	Status           int64   `json:"status"`
+	Peer             string  `json:"peer,omitempty"`         // openresty 选中的上游（可能是 router 中间层）
+	ForwardedTo      string  `json:"forwarded_to,omitempty"` // 原始 X-Routed-Peer URL
+	Backend          string  `json:"backend"`                // 归一化后的真实后端 host:port（= 聚合用的 peer key）
+	Mode             string  `json:"mode,omitempty"`
+	SessionSrc       string  `json:"session_src,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	FinishReason     string  `json:"finish_reason,omitempty"`
+	Frt              float64 `json:"frt"` // first_chunk_t（≈ TTFT，流式首 token）
+	Lct              float64 `json:"lct"` // last_chunk_t
+	Rt               float64 `json:"rt"`
+	ChunkCount       int64   `json:"chunk_count"`
+	ReqBytes         int64   `json:"req_bytes"`
+	RespBytes        int64   `json:"resp_bytes"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	ReasoningTokens  int64   `json:"reasoning_tokens"`
+}
+
+// extractDetail: 从 assembleEntry 解析好的 map 里抽出 metrics 明细，不带任何正文。
+// 复用 normalizePeer / extractUsage，与 aggregator.ingest 口径一致。
+func extractDetail(m map[string]any) detailRecord {
+	u := extractUsage(m)
+	d := detailRecord{
+		Ts:               getString(m["ts"]),
+		RequestID:        getString(m["request_id"]),
+		SourceAddr:       getString(m["source_addr"]),
+		URI:              getString(m["uri"]),
+		Method:           getString(m["method"]),
+		Stream:           streamOf(m),
+		Status:           getInt64(m["status"]),
+		Peer:             getString(m["peer"]),
+		ForwardedTo:      getString(m["forwarded_to"]),
+		Backend:          normalizePeer(m),
+		Mode:             getString(m["mode"]),
+		SessionSrc:       getString(m["session_src"]),
+		Frt:              getFloat(m["first_chunk_t"]),
+		Lct:              getFloat(m["last_chunk_t"]),
+		Rt:               getFloat(m["rt"]),
+		ChunkCount:       getInt64(m["chunk_count"]),
+		ReqBytes:         int64(len(getString(m["req_body"]))),
+		RespBytes:        getInt64(m["resp_bytes"]),
+		PromptTokens:     u.prompt,
+		CompletionTokens: u.compl,
+		CachedTokens:     u.cached,
+		TotalTokens:      u.total,
+		ReasoningTokens:  u.reasoning,
+	}
+	if rm, ok := m["resp_meta"].(map[string]any); ok {
+		d.Model = getString(rm["model"])
+		d.FinishReason = getString(rm["finish_reason"])
+	}
+	if d.RespBytes == 0 {
+		// openresty 未带 resp_bytes 时兜底用抽取后的 resp_body 长度
+		d.RespBytes = int64(len(getString(m["resp_body"])))
+	}
+	return d
+}
+
+// detailsWriter: 按天切的 metrics 明细 jsonl 写入器。
+// 路径：BODYLOG_DIR/metrics/details/<date>.jsonl（与分钟聚合 metrics/<date>.jsonl 分子目录，
+// 避免被同一 glob 误读）。跨天 close 旧 fd、open 新日文件；当天保持明文便于 tail。
+type detailsWriter struct {
+	mu  sync.Mutex
+	day string
+	f   *os.File
+	dir string // BODYLOG_DIR
+}
+
+func (w *detailsWriter) write(d detailRecord) error {
+	today := time.Now().Format("2006-01-02")
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.day != today {
+		if w.f != nil {
+			_ = w.f.Close()
+		}
+		ddir := filepath.Join(w.dir, "metrics", "details")
+		if err := os.MkdirAll(ddir, 0o755); err != nil {
+			return err
+		}
+		path := filepath.Join(ddir, today+".jsonl")
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		w.f = f
+		w.day = today
+		log.Printf("opened %s", path)
+	}
+	b, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	// 单次 Write（<4KB append 在本地 fs 上原子，不会写出半行 → DuckDB 读 live jsonl 不会读到撕裂行）
+	_, err = w.f.Write(b)
+	return err
+}
+
+func (w *detailsWriter) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.f != nil {
@@ -406,7 +546,7 @@ func readFrame(r io.Reader) (meta, req, resp []byte, err error) {
 	return
 }
 
-func handleConn(c net.Conn, w *hourWriter, agg *aggregator) {
+func handleConn(c net.Conn, w *hourWriter, dw *detailsWriter, agg *aggregator) {
 	defer c.Close()
 	// 从 TCP RemoteAddr 取源 IP（去掉 :port）。loopback 写 "127.0.0.1"，
 	// LAN/跨机时是发送方 OpenResty 主机 IP；落盘到 entry.source_addr 字段，
@@ -433,9 +573,18 @@ func handleConn(c net.Conn, w *hourWriter, agg *aggregator) {
 			log.Printf("write err: %v", err)
 			return
 		}
+		// 预算 stream(扫一次 req_body),缓存进 m 供 ingest(分桶)与 extractDetail(明细)复用。
+		// 在 out 落盘之后做,不影响全量 bodylog（__stream 不入 out）。
+		m["__stream"] = extractStream(m)
 		// 同步 agg.ingest：O(1) 加锁更新一个 bucket，纳秒级，不影响主路径吞吐
 		if agg != nil {
 			agg.ingest(m)
+		}
+		// per-request metrics 明细（剥正文，~400B）：旁挂写，失败只告警不影响主落盘
+		if dw != nil {
+			if err := dw.write(extractDetail(m)); err != nil {
+				log.Printf("details write err: %v", err)
+			}
 		}
 	}
 }
@@ -594,6 +743,65 @@ func housekeep(dir string) {
 			}
 		}
 	}
+
+	// metrics 明细：把封口的 <date>.jsonl 转 parquet + 清过期 parquet（与 housekeep 同节奏）
+	rotateDetails(dir)
+}
+
+// rotateDetails 处理 BODYLOG_DIR/metrics/details/：
+//  1. 非今日且无同名 .parquet 的 <date>.jsonl → DuckDB COPY 转 zstd parquet，成功后删 jsonl
+//  2. <date>.parquet 已存在但 jsonl 还在（上次崩溃）→ 删多余 jsonl
+//  3. 超过 detailsKeepDays 的 .parquet → 删
+//
+// duckDB 为 nil（go-duckdb 打开失败）时整体跳过：当天 jsonl 仍在写、不丢数据，
+// 只是不转 parquet，/metrics 也会因 duckDB nil 而 503。
+func rotateDetails(dir string) {
+	if duckDB == nil {
+		return
+	}
+	ddir := filepath.Join(dir, "metrics", "details")
+	entries, err := os.ReadDir(ddir)
+	if err != nil {
+		return // 目录还没建（无明细产生），正常
+	}
+	today := time.Now().Format("2006-01-02")
+	cutoff := time.Now().AddDate(0, 0, -detailsKeepDays).Format("2006-01-02")
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(name, ".jsonl"):
+			date := strings.TrimSuffix(name, ".jsonl")
+			if !isDateName(date) || date == today {
+				continue
+			}
+			jsonlPath := filepath.Join(ddir, name)
+			parquetPath := filepath.Join(ddir, date+".parquet")
+			if _, err := os.Stat(parquetPath); err == nil {
+				_ = os.Remove(jsonlPath) // parquet 已在，清残留 jsonl
+				continue
+			}
+			q := fmt.Sprintf(
+				"COPY (SELECT * FROM %s) TO %s (FORMAT parquet, COMPRESSION zstd)",
+				readDetailsJSON(sqlStr(jsonlPath)), sqlStr(parquetPath))
+			if _, err := duckDB.Exec(q); err != nil {
+				log.Printf("details parquet convert %s failed: %v", name, err)
+				_ = os.Remove(parquetPath) // 删可能的半截输出，下轮重试
+				continue
+			}
+			_ = os.Remove(jsonlPath)
+			log.Printf("details rotated %s → %s.parquet", name, date)
+
+		case strings.HasSuffix(name, ".parquet"):
+			date := strings.TrimSuffix(name, ".parquet")
+			if isDateName(date) && date < cutoff {
+				_ = os.Remove(filepath.Join(ddir, name))
+				log.Printf("details removed old %s", name)
+			}
+		}
+	}
 }
 
 // isDateName 判断字符串是不是 YYYY-MM-DD 形式（最低粒度，不严格校验日期合法性）
@@ -701,8 +909,13 @@ func gzipFile(src, dst string) error {
 // aggregate（已合并所有分钟），可选 ?breakdown=true 返回每分钟 buckets。
 
 type bucket struct {
-	Minute    int64  `json:"minute"`
-	Peer      string `json:"peer"`
+	Minute int64  `json:"minute"`
+	Peer   string `json:"peer"`
+	// Stream: "true"/"false"/"" —— 按请求参数 stream 分桶。空="未知"(req_body 缺/base64/未传)。
+	// metrics/<date>.jsonl 因此每 (minute,peer) 可有多行(不同 stream);reload 按
+	// (minute,peer,stream) 合并。/summary 默认跨 stream 合回 (minute,peer)(monitor 兼容),
+	// ?stream=true/false 时按此过滤。
+	Stream    string `json:"stream,omitempty"`
 	Requests  int64  `json:"requests"`
 	Status2xx int64  `json:"status_2xx"`
 	Status4xx int64  `json:"status_4xx"`
@@ -782,17 +995,23 @@ func getString(v any) string {
 	return ""
 }
 
-func (a *aggregator) ingest(m map[string]any) {
-	if a == nil {
-		return
+func getFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case json.Number:
+		f, _ := x.Float64()
+		return f
 	}
-	minute := parseEntryMinute(m)
-	// router 场景：openresty 选中的 peer 是 router_ip:port（中间层），
-	// router 在响应里回 X-Routed-Peer 标识真实后端 vllm，bodylog_finalize 把它写到
-	// forwarded_to 字段。优先按真实后端聚合，让 monitor 的 per-peer TPM 不被 router 塌缩成一行。
+	return 0
+}
+
+// normalizePeer: 优先用 forwarded_to（router 回的真实后端）聚合，否则用 openresty 选中的 peer。
+// 去掉 http(s):// 前缀、剥 path，留 host:port；空则 "(none)"。aggregator.ingest 与
+// extractDetail 共用，保证明细的 backend 字段与分钟聚合的 peer key 口径一致。
+func normalizePeer(m map[string]any) string {
 	peer := getString(m["peer"])
 	if fwd := getString(m["forwarded_to"]); fwd != "" {
-		// 归一化：去掉 "http://"、"https://" 前缀，剥掉 path（保留 host:port）
 		fwd = strings.TrimPrefix(fwd, "https://")
 		fwd = strings.TrimPrefix(fwd, "http://")
 		if i := strings.IndexByte(fwd, '/'); i >= 0 {
@@ -805,30 +1024,140 @@ func (a *aggregator) ingest(m map[string]any) {
 	if peer == "" {
 		peer = "(none)"
 	}
+	return peer
+}
+
+type usageTokens struct {
+	prompt, cached, compl, total, reasoning int64
+}
+
+// extractUsage: 从 resp_meta.usage 抽 token 计数，兼容 OpenAI(prompt/completion_tokens)
+// 与 Anthropic(input/output_tokens)；cached 取 prompt_tokens_details.cached_tokens，
+// reasoning 取 completion_tokens_details.reasoning_tokens。
+func extractUsage(m map[string]any) usageTokens {
+	var u usageTokens
+	rm, ok := m["resp_meta"].(map[string]any)
+	if !ok {
+		return u
+	}
+	us, ok := rm["usage"].(map[string]any)
+	if !ok {
+		return u
+	}
+	u.prompt = getInt64(us["prompt_tokens"])
+	u.compl = getInt64(us["completion_tokens"])
+	u.total = getInt64(us["total_tokens"])
+	if u.prompt == 0 {
+		u.prompt = getInt64(us["input_tokens"])
+	}
+	if u.compl == 0 {
+		u.compl = getInt64(us["output_tokens"])
+	}
+	if u.total == 0 {
+		u.total = u.prompt + u.compl
+	}
+	if d, ok := us["prompt_tokens_details"].(map[string]any); ok {
+		u.cached = getInt64(d["cached_tokens"])
+	}
+	if d, ok := us["completion_tokens_details"].(map[string]any); ok {
+		u.reasoning = getInt64(d["reasoning_tokens"])
+	}
+	return u
+}
+
+// streamRe 匹配 req_body 里的 "stream":true/false。要求 key 前是 { 或 ,（JSON 对象
+// key 位置）→ 避开 "stream_options" 以及正文里转义的 \"stream\"（前缀是 \ 不是 {/,）。
+var streamRe = regexp.MustCompile(`[{,]\s*"stream"\s*:\s*(true|false)`)
+
+// extractStream 从 req_body 提取请求参数 stream。req_body 为空 / base64（非 utf8）/
+// 找不到时返回 nil（明细里该字段省略=null）。用定向正则而非全量 json.Unmarshal，
+// 避免为一个布尔解析整个可能上 MB 的请求体。
+func extractStream(m map[string]any) *bool {
+	if b, _ := m["req_body_b64"].(bool); b {
+		return nil
+	}
+	body := getString(m["req_body"])
+	if body == "" {
+		return nil
+	}
+	mt := streamRe.FindStringSubmatch(body)
+	if mt == nil {
+		return nil
+	}
+	v := mt[1] == "true"
+	return &v
+}
+
+// streamOf 取请求的 stream(*bool)。handleConn 会预先把 extractStream 结果缓存进
+// m["__stream"](避免 ingest 与 extractDetail 各扫一遍 req_body);没缓存时现算兜底。
+func streamOf(m map[string]any) *bool {
+	if v, ok := m["__stream"]; ok {
+		if b, ok := v.(*bool); ok {
+			return b
+		}
+		return nil
+	}
+	return extractStream(m)
+}
+
+// streamKeyOf: *bool → 分桶 key 字符串。nil→""(未知),true→"true",false→"false"。
+func streamKeyOf(sp *bool) string {
+	if sp == nil {
+		return ""
+	}
+	if *sp {
+		return "true"
+	}
+	return "false"
+}
+
+// bkey: aggregator 内层 map 的 (peer, stream) 复合键。用 \x00 分隔(peer/stream 都不含)。
+func bkey(peer, stream string) string { return peer + "\x00" + stream }
+
+// sqlStr: DuckDB SQL 字符串字面量转义（单引号翻倍）。用于把文件路径安全拼进
+// read_json/read_parquet/COPY 的 SQL（路径来自日期/配置，仍统一转义防御）。
+func sqlStr(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// detailsColumns: 明细各列的显式 DuckDB schema。固定类型（避免依赖 read_json_auto
+// 的数据相关推断）→ 保证 rotateDetails 写出的 parquet 与 metricsHandler 读的 live jsonl
+// 列类型完全一致，UNION ALL BY NAME 不会因两边类型分歧报错。
+//
+// 踩坑（e2e 抓到）：32 位十六进制 request_id 被某文件的 read_json_auto 推断成 HUGEINT，
+// 跨「parquet + jsonl」合并时把另一文件的字符串 id 往 INT128 转 → "Could not convert
+// string ... to INT128"。显式 VARCHAR 根治。
+const detailsColumns = "{" +
+	"'ts':'VARCHAR','request_id':'VARCHAR','source_addr':'VARCHAR','uri':'VARCHAR'," +
+	"'method':'VARCHAR','stream':'BOOLEAN','status':'BIGINT','peer':'VARCHAR','forwarded_to':'VARCHAR'," +
+	"'backend':'VARCHAR','mode':'VARCHAR','session_src':'VARCHAR','model':'VARCHAR'," +
+	"'finish_reason':'VARCHAR','frt':'DOUBLE','lct':'DOUBLE','rt':'DOUBLE'," +
+	"'chunk_count':'BIGINT','req_bytes':'BIGINT','resp_bytes':'BIGINT'," +
+	"'prompt_tokens':'BIGINT','completion_tokens':'BIGINT','cached_tokens':'BIGINT'," +
+	"'total_tokens':'BIGINT','reasoning_tokens':'BIGINT'}"
+
+// readDetailsJSON: 用显式 schema 读明细 jsonl 的 DuckDB 表达式。arg 是单个 sqlStr 路径
+// 或文件名列表（read_json 两者都接受）。rotateDetails 与 metricsHandler 共用，保证写/读
+// 口径一致。NDJSON（一行一条）→ format='newline_delimited'。
+func readDetailsJSON(arg string) string {
+	return "read_json(" + arg + ", columns=" + detailsColumns + ", format='newline_delimited')"
+}
+
+func (a *aggregator) ingest(m map[string]any) {
+	if a == nil {
+		return
+	}
+	minute := parseEntryMinute(m)
+	// router 场景：openresty 选中的 peer 是 router_ip:port（中间层），router 在响应里回
+	// X-Routed-Peer 标识真实后端 vllm（写到 forwarded_to）。normalizePeer 优先按真实后端聚合，
+	// 让 monitor 的 per-peer TPM 不被 router 塌缩成一行。
+	peer := normalizePeer(m)
+	streamKey := streamKeyOf(streamOf(m))
+	pkey := bkey(peer, streamKey) // 内层 map 按 (peer, stream) 分桶
 	status := int(getInt64(m["status"]))
 
-	var prompt, cached, compl, total int64
-	if rm, ok := m["resp_meta"].(map[string]any); ok {
-		if u, ok := rm["usage"].(map[string]any); ok {
-			prompt = getInt64(u["prompt_tokens"])
-			compl = getInt64(u["completion_tokens"])
-			total = getInt64(u["total_tokens"])
-			// Anthropic /v1/messages: input_tokens / output_tokens
-			if prompt == 0 {
-				prompt = getInt64(u["input_tokens"])
-			}
-			if compl == 0 {
-				compl = getInt64(u["output_tokens"])
-			}
-			if total == 0 {
-				total = prompt + compl
-			}
-			// vllm prefix cache 命中：prompt_tokens_details.cached_tokens
-			if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
-				cached = getInt64(d["cached_tokens"])
-			}
-		}
-	}
+	u := extractUsage(m)
+	prompt, cached, compl, total := u.prompt, u.cached, u.compl, u.total
 	reqBytes := int64(len(getString(m["req_body"])))
 	respBytes := int64(len(getString(m["resp_body"])))
 	var rtMs int64
@@ -850,17 +1179,17 @@ func (a *aggregator) ingest(m map[string]any) {
 	// 这样同 (minute, peer) 永远只有一个 bucket，不会因为 minute 已被 flush 就重建副本
 	var b *bucket
 	if bk, ok := a.active[minute]; ok {
-		b = bk[peer]
+		b = bk[pkey]
 		if b == nil {
-			b = &bucket{Minute: minute, Peer: peer}
-			bk[peer] = b
+			b = &bucket{Minute: minute, Peer: peer, Stream: streamKey}
+			bk[pkey] = b
 		}
 	} else if bkA, ok := a.archiveIdx[minute]; ok {
-		b = bkA[peer]
+		b = bkA[pkey]
 		if b == nil {
-			// archive 有这个 minute（其它 peer），但没这个 peer：新增到 archive
-			b = &bucket{Minute: minute, Peer: peer}
-			bkA[peer] = b
+			// archive 有这个 minute（其它 peer/stream），但没这个 (peer,stream)：新增到 archive
+			b = &bucket{Minute: minute, Peer: peer, Stream: streamKey}
+			bkA[pkey] = b
 			// 二分插入保持 archive 升序（避免 O(N log N) 的全量 sort）
 			idx := sort.Search(len(a.archive), func(i int) bool { return a.archive[i].Minute >= minute })
 			a.archive = append(a.archive, nil)
@@ -868,13 +1197,13 @@ func (a *aggregator) ingest(m map[string]any) {
 			a.archive[idx] = b
 		}
 		// 标记 dirty：下次 flush 时把累加后的快照再写一行到 metrics 文件，
-		// reload 会按 (minute, peer) 合并，保证重启后数据完整。
+		// reload 会按 (minute, peer, stream) 合并，保证重启后数据完整。
 		a.archiveDirty[b] = struct{}{}
 	} else {
 		// 既不在 active 也不在 archive（新 minute，或 minute 已超出 archiveKeepMin）
 		bk := map[string]*bucket{}
-		b = &bucket{Minute: minute, Peer: peer}
-		bk[peer] = b
+		b = &bucket{Minute: minute, Peer: peer, Stream: streamKey}
+		bk[pkey] = b
 		a.active[minute] = bk
 	}
 	b.Requests++
@@ -924,9 +1253,9 @@ func (a *aggregator) flushClosedMinutes() {
 			if a.archiveIdx[m] == nil {
 				a.archiveIdx[m] = map[string]*bucket{}
 			}
-			for peer, b := range bk {
+			for pkey, b := range bk {
 				closed = append(closed, *b) // 写盘快照
-				a.archiveIdx[m][peer] = b   // 索引（同一指针）
+				a.archiveIdx[m][pkey] = b   // 索引（同一指针，(peer,stream) 复合键）
 				a.archiveLastWritten[b] = *b
 				newPtrs = append(newPtrs, b)
 				newPtrSet[b] = struct{}{}
@@ -952,6 +1281,7 @@ func (a *aggregator) flushClosedMinutes() {
 		delta := bucket{
 			Minute:    cur.Minute,
 			Peer:      cur.Peer,
+			Stream:    cur.Stream,
 			Requests:  cur.Requests - last.Requests,
 			Status2xx: cur.Status2xx - last.Status2xx,
 			Status4xx: cur.Status4xx - last.Status4xx,
@@ -1052,7 +1382,8 @@ func (a *aggregator) reload() {
 			mp = map[string]*bucket{}
 			idx[b.Minute] = mp
 		}
-		if existing, ok := mp[b.Peer]; ok {
+		k := bkey(b.Peer, b.Stream)
+		if existing, ok := mp[k]; ok {
 			existing.Requests += b.Requests
 			existing.Status2xx += b.Status2xx
 			existing.Status4xx += b.Status4xx
@@ -1074,7 +1405,7 @@ func (a *aggregator) reload() {
 			}
 		} else {
 			cp := b
-			mp[b.Peer] = &cp
+			mp[k] = &cp
 		}
 	}
 	var loaded []*bucket
@@ -1089,143 +1420,6 @@ func (a *aggregator) reload() {
 	a.archiveIdx = idx
 	a.mu.Unlock()
 	log.Printf("reloaded %d metrics buckets from %s (merged from raw lines)", len(loaded), path)
-}
-
-// HTTP
-
-type peerSummary struct {
-	Peer             string `json:"peer"`
-	Requests         int64  `json:"requests"`
-	Status2xx        int64  `json:"status_2xx"`
-	Status4xx        int64  `json:"status_4xx"`
-	Status5xx        int64  `json:"status_5xx"`
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CachedTokens     int64  `json:"cached_tokens"` // vllm prefix cache 命中数
-	CompletionTokens int64  `json:"completion_tokens"`
-	TotalTokens      int64  `json:"total_tokens"`
-	ReqBodyBytes     int64  `json:"req_body_bytes"`
-	RespBodyBytes    int64  `json:"resp_body_bytes"`
-	RTAvgMs          int64  `json:"rt_avg_ms"`
-	RTMaxMs          int64  `json:"rt_max_ms"`
-	// TTFT（first_chunk_t）：仅在请求带 first_chunk_t 字段时累计（流式响应必有；
-	// 非流式响应近似等于 rt），FrtN 为实际带 frt 的请求数；FrtAvgMs 用 FrtN 做分母
-	FrtAvgMs int64 `json:"frt_avg_ms"`
-	FrtMaxMs int64 `json:"frt_max_ms"`
-	FrtN     int64 `json:"frt_n"`
-}
-
-func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
-	minutes, _ := strconv.Atoi(r.URL.Query().Get("minutes"))
-	if minutes <= 0 {
-		minutes = 5
-	}
-	if a.archiveKeepMin > 0 && minutes > a.archiveKeepMin {
-		minutes = a.archiveKeepMin
-	}
-	breakdown := r.URL.Query().Get("breakdown") == "true"
-
-	now := time.Now().Unix()
-	cutoff := now - int64(minutes)*60
-	cutoff = cutoff - cutoff%60
-
-	a.mu.RLock()
-	var rows []bucket
-	for _, b := range a.archive {
-		if b.Minute >= cutoff {
-			rows = append(rows, *b) // 拷贝快照，避免 RUnlock 后 archive 被并发更新
-		}
-	}
-	for m, bk := range a.active {
-		if m >= cutoff {
-			for _, b := range bk {
-				rows = append(rows, *b)
-			}
-		}
-	}
-	a.mu.RUnlock()
-
-	// per-peer aggregate
-	perPeer := map[string]*bucket{}
-	for i := range rows {
-		b := &rows[i]
-		p := perPeer[b.Peer]
-		if p == nil {
-			p = &bucket{Peer: b.Peer}
-			perPeer[b.Peer] = p
-		}
-		p.Requests += b.Requests
-		p.Status2xx += b.Status2xx
-		p.Status4xx += b.Status4xx
-		p.Status5xx += b.Status5xx
-		p.PromptTok += b.PromptTok
-		p.CachedTok += b.CachedTok
-		p.ComplTok += b.ComplTok
-		p.TotalTok += b.TotalTok
-		p.ReqBytes += b.ReqBytes
-		p.RespBytes += b.RespBytes
-		p.RTSumMs += b.RTSumMs
-		if b.RTMaxMs > p.RTMaxMs {
-			p.RTMaxMs = b.RTMaxMs
-		}
-		p.FrtSumMs += b.FrtSumMs
-		p.FrtN += b.FrtN
-		if b.FrtMaxMs > p.FrtMaxMs {
-			p.FrtMaxMs = b.FrtMaxMs
-		}
-	}
-	peers := make([]peerSummary, 0, len(perPeer))
-	for _, p := range perPeer {
-		avg := int64(0)
-		if p.Requests > 0 {
-			avg = p.RTSumMs / p.Requests
-		}
-		frtAvg := int64(0)
-		if p.FrtN > 0 {
-			frtAvg = p.FrtSumMs / p.FrtN
-		}
-		peers = append(peers, peerSummary{
-			Peer: p.Peer, Requests: p.Requests,
-			Status2xx: p.Status2xx, Status4xx: p.Status4xx, Status5xx: p.Status5xx,
-			PromptTokens: p.PromptTok, CachedTokens: p.CachedTok,
-			CompletionTokens: p.ComplTok, TotalTokens: p.TotalTok,
-			ReqBodyBytes: p.ReqBytes, RespBodyBytes: p.RespBytes,
-			RTAvgMs: avg, RTMaxMs: p.RTMaxMs,
-			FrtAvgMs: frtAvg, FrtMaxMs: p.FrtMaxMs, FrtN: p.FrtN,
-		})
-	}
-	sort.Slice(peers, func(i, j int) bool { return peers[i].Peer < peers[j].Peer })
-
-	resp := map[string]any{
-		"from":    time.Unix(cutoff, 0).Format(time.RFC3339),
-		"to":      time.Now().Format(time.RFC3339),
-		"minutes": minutes,
-		"peers":   peers,
-	}
-	if breakdown {
-		// 按 (Minute, Peer) 升序便于消费
-		sort.Slice(rows, func(i, j int) bool {
-			if rows[i].Minute != rows[j].Minute {
-				return rows[i].Minute < rows[j].Minute
-			}
-			return rows[i].Peer < rows[j].Peer
-		})
-		resp["buckets"] = rows
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-func (a *aggregator) serveHTTP(addr string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/summary", a.summaryHandler)
-	log.Printf("HTTP listening on %s (try /summary?minutes=5)", addr)
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Printf("HTTP server err: %v", err)
-	}
 }
 
 func envOr(k, dflt string) string {
@@ -1255,10 +1449,31 @@ func main() {
 	port := envOr("BODYLOG_PORT", defaultPort)
 	dir := envOr("BODYLOG_DIR", defaultDir)
 	keepDays = envOrInt("BODYLOG_KEEP_DAYS", defaultKeepDays)
-	log.Printf("history archives retention: %d days (BODYLOG_KEEP_DAYS)", keepDays)
+	detailsKeepDays = envOrInt("BODYLOG_DETAILS_KEEP_DAYS", defaultDetailsKeepDays)
+	httpToken = envOr("BODYLOG_HTTP_TOKEN", "")
+	if httpToken != "" {
+		log.Printf("HTTP auth: ON — /summary + /metrics require Bearer token (BODYLOG_HTTP_TOKEN)")
+	} else {
+		log.Printf("HTTP auth: OFF — /summary + /metrics open (set BODYLOG_HTTP_TOKEN to enable)")
+	}
+	log.Printf("history archives retention: %d days (BODYLOG_KEEP_DAYS); details parquet retention: %d days (BODYLOG_DETAILS_KEEP_DAYS)", keepDays, detailsKeepDays)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", dir, err)
 	}
+
+	// 进程内 DuckDB（in-memory）：metrics/details 的 jsonl→parquet 转换 + /metrics 混读查询。
+	// 打开失败不致命——主落盘/聚合不依赖它，只是明细不转 parquet、/metrics 返回 503。
+	if ddb, err := sql.Open("duckdb", ""); err != nil {
+		log.Printf("duckdb open failed (/metrics + parquet rotate disabled): %v", err)
+	} else if err := ddb.Ping(); err != nil {
+		log.Printf("duckdb ping failed (/metrics + parquet rotate disabled): %v", err)
+		_ = ddb.Close()
+	} else {
+		duckDB = ddb
+		defer duckDB.Close()
+		log.Printf("duckdb ready (in-process, metrics/details parquet + /metrics enabled)")
+	}
+
 	addr := host + ":" + port
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -1267,6 +1482,17 @@ func main() {
 	log.Printf("listening on %s, writing to %s/", addr, dir)
 
 	w := &hourWriter{dir: dir}
+
+	// per-request metrics 明细（剥正文），按天写 metrics/details/。BODYLOG_DETAILS=off 时
+	// 不创建 → handleConn 里 dw==nil 跳过 extractDetail+写盘，每请求零额外开销（kill-switch +
+	// 性能 A/B 对照基线）。
+	var dw *detailsWriter
+	if envOr("BODYLOG_DETAILS", "on") != "off" {
+		dw = &detailsWriter{dir: dir}
+		log.Printf("per-request details sink: ON (metrics/details/)")
+	} else {
+		log.Printf("per-request details sink: OFF (BODYLOG_DETAILS=off)")
+	}
 
 	// per-minute aggregator：archive 内存保留 7 天 = 10080 分钟
 	agg := newAggregator(dir, 7*24*60)
@@ -1322,8 +1548,11 @@ func main() {
 			log.Printf("accept err: %v", err)
 			continue
 		}
-		go handleConn(c, w, agg)
+		go handleConn(c, w, dw, agg)
 	}
 	w.close()
+	if dw != nil {
+		dw.close()
+	}
 	log.Println("exited")
 }
