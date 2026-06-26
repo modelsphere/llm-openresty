@@ -336,11 +336,15 @@ func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 选文件：按 local 日期枚举 [lo,end] 覆盖的天，每天优先 parquet 否则 live jsonl
+	// 选文件：按 local 日期枚举 [lo,end] 覆盖的天，每天优先 parquet 否则 live jsonl。
+	// end 侧多枚举 1 天：明细文件按【写入时刻】(time.Now())命名，而过滤按 ts_end；写入
+	// 时刻 = ts_end + logger flush 延迟(periodic_flush≤1s，listener 补发时更久)，故恒
+	// ≥ ts_end → 一条 ts_end 落在某天末尾的记录,其帧可能在次日才写入 → 进次日文件。
+	// 多读 1 天把这类记录纳入候选,WHERE 仍按 ts_end 精确过滤,不会引入越界行。
 	ddir := filepath.Join(a.dir, "metrics", "details")
 	var parquets, jsonls []string
 	d := time.Date(lo.In(time.Local).Year(), lo.In(time.Local).Month(), lo.In(time.Local).Day(), 0, 0, 0, 0, time.Local)
-	endDay := end.In(time.Local)
+	endDay := end.In(time.Local).AddDate(0, 0, 1)
 	for !d.After(endDay) {
 		date := d.Format("2006-01-02")
 		pq := filepath.Join(ddir, date+".parquet")
@@ -504,8 +508,8 @@ func rowEndTs(row map[string]any) string {
 		return tsStr
 	}
 	rt := getFloat(row["rt"])
-	if rt <= 0 {
-		return tsStr
+	if rt == 0 {
+		return tsStr // ts + 0 = ts，与 SQL COALESCE(rt,0) 一致；非 0(含理论负值)一律加，避免与 endTs 分歧
 	}
 	t, err := parseTimeParam(tsStr)
 	if err != nil {

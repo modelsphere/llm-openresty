@@ -756,16 +756,14 @@ func housekeep(dir string) {
 }
 
 // rotateDetails 处理 BODYLOG_DIR/metrics/details/：
-//  1. 非今日且无同名 .parquet 的 <date>.jsonl → DuckDB COPY 转 zstd parquet，成功后删 jsonl
-//  2. <date>.parquet 已存在但 jsonl 还在（上次崩溃）→ 删多余 jsonl
-//  3. 超过 detailsKeepDays 的 .parquet → 删
+//  1. 超过 detailsKeepDays 的 <date>.jsonl / <date>.parquet → 删（保留期裁剪，永远执行）
+//  2. 非今日且无同名 .parquet 的 <date>.jsonl → DuckDB COPY 转 zstd parquet，成功后删 jsonl
+//  3. <date>.parquet 已存在但 jsonl 还在（上次崩溃）→ 删多余 jsonl
 //
-// duckDB 为 nil（go-duckdb 打开失败）时整体跳过：当天 jsonl 仍在写、不丢数据，
-// 只是不转 parquet，/metrics 也会因 duckDB nil 而 503。
+// duckDB 为 nil（go-duckdb 打开失败 / CGO_ENABLED=0 构建）时：跳过 parquet 转换(2)，
+// 当天 jsonl 仍在写、/metrics 因 duckDB nil 返回 503；但【保留期裁剪(1) 照常执行】，
+// 否则旧 jsonl 永不清理 → 无限增长撑爆磁盘（比改造前更糟的 outage）。
 func rotateDetails(dir string) {
-	if duckDB == nil {
-		return
-	}
 	ddir := filepath.Join(dir, "metrics", "details")
 	entries, err := os.ReadDir(ddir)
 	if err != nil {
@@ -785,9 +783,20 @@ func rotateDetails(dir string) {
 				continue
 			}
 			jsonlPath := filepath.Join(ddir, name)
+			// 保留期裁剪：超期旧 jsonl 直接删（含 duckDB==nil 无法转 parquet 的场景，
+			// 否则 jsonl 永不清理 → 无限增长）。
+			if date < cutoff {
+				_ = os.Remove(jsonlPath)
+				log.Printf("details removed old %s", name)
+				continue
+			}
 			parquetPath := filepath.Join(ddir, date+".parquet")
 			if _, err := os.Stat(parquetPath); err == nil {
 				_ = os.Remove(jsonlPath) // parquet 已在，清残留 jsonl
+				continue
+			}
+			// 转 parquet 需 duckDB；无 CGO 时保留 jsonl（已受上面 detailsKeepDays 上限约束）。
+			if duckDB == nil {
 				continue
 			}
 			q := fmt.Sprintf(
