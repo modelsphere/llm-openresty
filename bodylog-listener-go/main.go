@@ -139,7 +139,8 @@ func (w *hourWriter) close() {
 // resp_meta.reasoning / resp_meta.tool_calls）。~400B/行，按天写 metrics/details/<date>.jsonl，
 // 跨天封口后由 housekeep 转 parquet。/metrics 接口查的就是这份。
 type detailRecord struct {
-	Ts               string  `json:"ts"`
+	Ts               string  `json:"ts"`                // 请求开始时刻
+	TsEnd            string  `json:"ts_end,omitempty"`  // 请求结束时刻 = ts + rt（聚合分桶用此）
 	RequestID        string  `json:"request_id,omitempty"`
 	SourceAddr       string  `json:"source_addr,omitempty"`
 	URI              string  `json:"uri,omitempty"`
@@ -172,6 +173,7 @@ func extractDetail(m map[string]any) detailRecord {
 	u := extractUsage(m)
 	d := detailRecord{
 		Ts:               getString(m["ts"]),
+		TsEnd:            getString(m["ts_end"]),
 		RequestID:        getString(m["request_id"]),
 		SourceAddr:       getString(m["source_addr"]),
 		URI:              getString(m["uri"]),
@@ -655,6 +657,11 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 	} else {
 		m["resp_body"] = ""
 	}
+	// ts_end = ts + rt（请求结束时刻）。落盘冗余一份，便于按完成时间复盘/对账，
+	// 也与 ingest 的结束时刻分桶口径（parseEntryMinute）保持一致。
+	if end, ok := entryEndTime(m); ok {
+		m["ts_end"] = end.Format(tsLayout)
+	}
 	out, err := json.Marshal(m)
 	if err != nil {
 		return nil, nil, fmt.Errorf("entry marshal: %w", err)
@@ -899,8 +906,9 @@ func gzipFile(src, dst string) error {
 
 // ─── per-minute 聚合器（按 peer 分组）────────────────────────────────────
 //
-// 每帧 entry 经 handleConn → assembleEntry 后调用 agg.ingest，按 ts 对齐到
-// minute、按 peer 分桶累计 token / 字节 / 状态码 / 延迟。
+// 每帧 entry 经 handleConn → assembleEntry 后调用 agg.ingest，按【结束时刻
+// ts+rt】(parseEntryMinute) 对齐到 minute、按 peer 分桶累计 token / 字节 /
+// 状态码 / 延迟。按结束时刻分桶 → 桶分钟 == ingest 分钟 → 无 rt 长尾迟到漏算。
 //
 // 周期 flush（60s ticker）把 minute < now-90s 的 bucket 移到 archive 并
 // append 到 metrics/YYYY-MM-DD.jsonl（明文不压缩，永久保留）。
@@ -960,12 +968,34 @@ func newAggregator(dir string, keepMin int) *aggregator {
 }
 
 // ts 是 openresty bodylog_finalize 写的 ISO8601 + 北京时区，毫秒精度，例：
-// "2026-05-04T10:30:00.123+08:00"
+// "2026-05-04T10:30:00.123+08:00"。ts 是请求开始时刻；结束时刻 = ts + rt(秒)。
 const tsLayout = "2006-01-02T15:04:05.000-07:00"
 
+// entryEndTime 返回请求结束时刻 = ts(开始) + rt(秒)。ts 缺失/解析失败返回 (零值,false)。
+// listener 在请求结束时才收到帧并 ingest，所以按结束时刻分桶能保证「桶的分钟 ==
+// ingest 的分钟」：一个桶在它自己那一分钟过去后就再也收不到新数据，下游(monitor)
+// 落盘冻结时桶已收齐——根除「rt 超过 persist 延迟的长请求在开始分钟桶被冻结后才
+// 完成、token 永远补不进去」的漏算（按开始时间 ts 分桶时 ingest 分钟比桶分钟晚 rt）。
+func entryEndTime(m map[string]any) (time.Time, bool) {
+	ts, ok := m["ts"].(string)
+	if !ok || ts == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(tsLayout, ts)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if rt, ok := m["rt"].(float64); ok && rt > 0 {
+		t = t.Add(time.Duration(rt * float64(time.Second)))
+	}
+	return t, true
+}
+
+// parseEntryMinute 把 entry 对齐到分钟桶，按【结束时刻】。直接读 assembleEntry 已
+// 算好并落盘的 m["ts_end"](= ts+rt，见 entryEndTime)，不重复计算。
 func parseEntryMinute(m map[string]any) int64 {
-	if ts, ok := m["ts"].(string); ok && ts != "" {
-		if t, err := time.Parse(tsLayout, ts); err == nil {
+	if tsEnd, ok := m["ts_end"].(string); ok && tsEnd != "" {
+		if t, err := time.Parse(tsLayout, tsEnd); err == nil {
 			return t.Unix() - t.Unix()%60
 		}
 	}
@@ -1033,7 +1063,8 @@ type usageTokens struct {
 
 // extractUsage: 从 resp_meta.usage 抽 token 计数，兼容 OpenAI(prompt/completion_tokens)
 // 与 Anthropic(input/output_tokens)；cached 取 prompt_tokens_details.cached_tokens，
-// reasoning 取 completion_tokens_details.reasoning_tokens。
+// reasoning 取 completion_tokens_details.reasoning_tokens，取不到再回退 usage 顶层
+// reasoning_tokens（sglang Kimi 放顶层）。
 func extractUsage(m map[string]any) usageTokens {
 	var u usageTokens
 	rm, ok := m["resp_meta"].(map[string]any)
@@ -1061,6 +1092,13 @@ func extractUsage(m map[string]any) usageTokens {
 	}
 	if d, ok := us["completion_tokens_details"].(map[string]any); ok {
 		u.reasoning = getInt64(d["reasoning_tokens"])
+	}
+	// 兜底：部分后端（sglang Kimi-K2.x）把 reasoning_tokens 放在 usage 顶层，而非
+	// completion_tokens_details 子对象里（实测 resp_meta.usage 形如
+	// {"completion_tokens":N,"reasoning_tokens":M,"total_tokens":...}，无 *_details）。
+	// 上面取不到时回退读顶层，避免明细 reasoning_tokens 恒为 0。
+	if u.reasoning == 0 {
+		u.reasoning = getInt64(us["reasoning_tokens"])
 	}
 	return u
 }
@@ -1128,7 +1166,7 @@ func sqlStr(s string) string {
 // 跨「parquet + jsonl」合并时把另一文件的字符串 id 往 INT128 转 → "Could not convert
 // string ... to INT128"。显式 VARCHAR 根治。
 const detailsColumns = "{" +
-	"'ts':'VARCHAR','request_id':'VARCHAR','source_addr':'VARCHAR','uri':'VARCHAR'," +
+	"'ts':'VARCHAR','ts_end':'VARCHAR','request_id':'VARCHAR','source_addr':'VARCHAR','uri':'VARCHAR'," +
 	"'method':'VARCHAR','stream':'BOOLEAN','status':'BIGINT','peer':'VARCHAR','forwarded_to':'VARCHAR'," +
 	"'backend':'VARCHAR','mode':'VARCHAR','session_src':'VARCHAR','model':'VARCHAR'," +
 	"'finish_reason':'VARCHAR','frt':'DOUBLE','lct':'DOUBLE','rt':'DOUBLE'," +

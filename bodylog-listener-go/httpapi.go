@@ -283,6 +283,8 @@ func parseTimeParam(s string) (time.Time, error) {
 // 返回时间窗内每条请求的 metrics 明细（JSON 数组，非流式）。历史天读 metrics/details/<date>.parquet，
 // 当天读 live <date>.jsonl，两支用 UNION ALL BY NAME 合并（DuckDB 没有单函数同时吃两种格式）。
 // 硬上限 metricsMaxRows 条：多查 1 条探测，超限只回前 N 条 + truncated=true。
+// 时间窗 [start,end) 与排序/游标统一按【结束时刻】，与 /summary 的结束时刻分桶口径一致：
+// 优先 ts_end 列，历史无 ts_end 的行按 ts + rt 现算（见 endTs / rowEndTs）。
 func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	if !authOK(r) {
 		writeUnauthorized(w)
@@ -373,17 +375,24 @@ func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	src := strings.Join(branches, " UNION ALL BY NAME ")
 
-	// 过滤条件：上界 end 开区间;下界——带 cursor 用 (ts,request_id) 元组严格大于(keyset，零重叠)，
+	// 过滤/排序/游标统一按【结束时刻】(与 /summary 的结束时刻分桶口径一致)，已是 TIMESTAMPTZ。
+	// endTs：优先 ts_end 列；历史数据无 ts_end(UNION ALL BY NAME 填 NULL)→ 按 ts + rt 现算
+	// 结束时刻；rt 也缺则 +0=ts。否则 NULL 比较会把旧记录全部排除/乱序。
+	// 注：本版 DuckDB 无 +(TIMESTAMPTZ, INTERVAL) 重载，故走 epoch 秒空间：
+	//   to_timestamp(epoch_us(ts)/1e6 + rt) —— tz 安全、保留亚秒，与 Go 侧 rowEndTs 一致。
+	// 明细文件按完成日期切，按天枚举 [lo,end] 边界与结束时刻落点对齐。
+	// 上界 end 开区间;下界——带 cursor 用 (endTs,request_id) 元组严格大于(keyset，零重叠)，
 	// 否则用 start 闭区间。再叠可选 model/peer/status/min_frt。
+	const endTs = "COALESCE(ts_end::TIMESTAMPTZ, to_timestamp(epoch_us(ts::TIMESTAMPTZ) / 1000000.0 + COALESCE(rt, 0)))"
 	where := []string{
-		fmt.Sprintf("ts::TIMESTAMPTZ < TIMESTAMPTZ %s", sqlStr(end.Format(time.RFC3339Nano))),
+		fmt.Sprintf("%s < TIMESTAMPTZ %s", endTs, sqlStr(end.Format(time.RFC3339Nano))),
 	}
 	if hasCursor {
 		where = append(where, fmt.Sprintf(
-			"(ts::TIMESTAMPTZ, COALESCE(request_id,'')) > (TIMESTAMPTZ %s, %s)",
-			sqlStr(cursorTs), sqlStr(cursorID)))
+			"(%s, COALESCE(request_id,'')) > (TIMESTAMPTZ %s, %s)",
+			endTs, sqlStr(cursorTs), sqlStr(cursorID)))
 	} else {
-		where = append(where, fmt.Sprintf("ts::TIMESTAMPTZ >= TIMESTAMPTZ %s", sqlStr(lo.Format(time.RFC3339Nano))))
+		where = append(where, fmt.Sprintf("%s >= TIMESTAMPTZ %s", endTs, sqlStr(lo.Format(time.RFC3339Nano))))
 	}
 	if v := q.Get("model"); v != "" {
 		where = append(where, "model = "+sqlStr(v))
@@ -423,10 +432,10 @@ func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ORDER BY (ts, request_id) 给出确定的全序，使 keyset 游标能精确切分(ts 不唯一)
+	// ORDER BY (endTs, request_id) 给出确定的全序，使 keyset 游标能精确切分(endTs 不唯一)
 	sqlText := fmt.Sprintf(
-		"SELECT * FROM (%s) WHERE %s ORDER BY ts, COALESCE(request_id,'') LIMIT %d",
-		src, strings.Join(where, " AND "), limit+1)
+		"SELECT * FROM (%s) WHERE %s ORDER BY %s, COALESCE(request_id,'') LIMIT %d",
+		src, strings.Join(where, " AND "), endTs, limit+1)
 
 	rows, err := duckDB.QueryContext(r.Context(), sqlText)
 	if err != nil {
@@ -466,18 +475,43 @@ func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{"count": len(out), "truncated": truncated, "rows": out}
 	if truncated && len(out) > 0 {
-		// 结果按 (ts,request_id) 升序，截断时回本段覆盖的 [returned_from, returned_to] +
-		// next_cursor。下一段用 cursor=next_cursor&end=<同 end> 精确续取(零重叠、无需去重)。
+		// 结果按 (endTs,request_id) 升序，截断时回本段覆盖的 [returned_from, returned_to] +
+		// next_cursor。游标键必须与 SQL 侧 COALESCE(ts_end,ts) 一致 → 用 rowEndTs 取有效结束
+		// 时刻(ts_end 缺失回退 ts)。下一段用 cursor=next_cursor&end=<同 end> 精确续取(零重叠)。
 		last := out[len(out)-1]
-		from := tsString(out[0]["ts"])
-		to := tsString(last["ts"])
+		from := rowEndTs(out[0])
+		to := rowEndTs(last)
 		resp["returned_from"] = from
 		resp["returned_to"] = to
 		resp["next_cursor"] = makeCursor(to, anyStr(last["request_id"]))
-		resp["hint"] = fmt.Sprintf("命中上限 %d 条(按 ts,request_id 升序截断);本段覆盖 [%s, %s];下一段用 cursor=<next_cursor>&end=<同 end> 精确续取(零重叠、无需去重),或加 model/peer/status/min_frt 过滤收窄", limit, from, to)
+		resp["hint"] = fmt.Sprintf("命中上限 %d 条(按 ts_end,request_id 升序截断);本段覆盖 [%s, %s];下一段用 cursor=<next_cursor>&end=<同 end> 精确续取(零重叠、无需去重),或加 model/peer/status/min_frt 过滤收窄", limit, from, to)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// rowEndTs 取行的有效结束时刻字符串 = ts_end，缺失(历史数据无该列→nil/空)则按 ts + rt 现算。
+// 必须与 SQL 侧 endTs = COALESCE(ts_end, to_timestamp(epoch_us(ts)/1e6 + rt)) 一致(同在秒空间
+// 加 rt)，否则 next_cursor 与 ORDER BY 键错位会导致分页跳行/重复。
+func rowEndTs(row map[string]any) string {
+	if v := row["ts_end"]; v != nil {
+		if s := tsString(v); s != "" {
+			return s
+		}
+	}
+	tsStr := tsString(row["ts"])
+	if tsStr == "" {
+		return tsStr
+	}
+	rt := getFloat(row["rt"])
+	if rt <= 0 {
+		return tsStr
+	}
+	t, err := parseTimeParam(tsStr)
+	if err != nil {
+		return tsStr
+	}
+	return t.Add(time.Duration(rt * float64(time.Second))).Format(time.RFC3339Nano)
 }
 
 // tsString 把 ts 列值统一成字符串(保留亚秒精度):DuckDB 可能把 ts 推断成 VARCHAR(原样字符串)
