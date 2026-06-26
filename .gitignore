@@ -9,3 +9,6 @@ test/session_route_*test*.conf
 
 # 测试数据集(从 bodylog 提取的 TTFT 样本等,体积大,不入库)
 test/data/
+
+# 内部鉴权 token,不入库(权威源在本地/部署机,手工分发到 monitor.env + service)
+bodylog_http_token
