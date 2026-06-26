@@ -168,9 +168,9 @@ type detailRecord struct {
 }
 
 // extractDetail: 从 assembleEntry 解析好的 map 里抽出 metrics 明细，不带任何正文。
-// 复用 normalizePeer / extractUsage，与 aggregator.ingest 口径一致。
+// 复用 cachedPeer / cachedUsage（handleConn 已预算），与 aggregator.ingest 口径一致。
 func extractDetail(m map[string]any) detailRecord {
-	u := extractUsage(m)
+	u := cachedUsage(m)
 	d := detailRecord{
 		Ts:               getString(m["ts"]),
 		TsEnd:            getString(m["ts_end"]),
@@ -182,7 +182,7 @@ func extractDetail(m map[string]any) detailRecord {
 		Status:           getInt64(m["status"]),
 		Peer:             getString(m["peer"]),
 		ForwardedTo:      getString(m["forwarded_to"]),
-		Backend:          normalizePeer(m),
+		Backend:          cachedPeer(m),
 		Mode:             getString(m["mode"]),
 		SessionSrc:       getString(m["session_src"]),
 		Frt:              getFloat(m["first_chunk_t"]),
@@ -575,9 +575,11 @@ func handleConn(c net.Conn, w *hourWriter, dw *detailsWriter, agg *aggregator) {
 			log.Printf("write err: %v", err)
 			return
 		}
-		// 预算 stream(扫一次 req_body),缓存进 m 供 ingest(分桶)与 extractDetail(明细)复用。
-		// 在 out 落盘之后做,不影响全量 bodylog（__stream 不入 out）。
+		// 预算 stream/usage/peer 各一次,缓存进 m 供 ingest(分桶)与 extractDetail(明细)复用,
+		// 避免两者在每帧热路径上各算一遍。在 out 落盘之后做,不影响全量 bodylog（__* 不入 out）。
 		m["__stream"] = extractStream(m)
+		m["__usage"] = extractUsage(m)
+		m["__peer"] = normalizePeer(m)
 		// 同步 agg.ingest：O(1) 加锁更新一个 bucket，纳秒级，不影响主路径吞吐
 		if agg != nil {
 			agg.ingest(m)
@@ -954,6 +956,31 @@ type bucket struct {
 	FrtN     int64 `json:"frt_n"` // 实际带 first_chunk_t 的请求数（兼容老数据用，可能 < Status2xx）
 }
 
+// add 把 src 的计数累加进 dst：sum 各计数，max 取 RT/Frt 峰值（Minute/Peer/Stream 不动）。
+// /summary perPeer 聚合、mergeBucketsByPeer、reload 合并三处共用同一套字段累加规则，
+// 新增/改名 bucket 计数字段时只改这一处，避免三处漏改导致 /summary 静默丢字段。
+func (dst *bucket) add(src *bucket) {
+	dst.Requests += src.Requests
+	dst.Status2xx += src.Status2xx
+	dst.Status4xx += src.Status4xx
+	dst.Status5xx += src.Status5xx
+	dst.PromptTok += src.PromptTok
+	dst.CachedTok += src.CachedTok
+	dst.ComplTok += src.ComplTok
+	dst.TotalTok += src.TotalTok
+	dst.ReqBytes += src.ReqBytes
+	dst.RespBytes += src.RespBytes
+	dst.RTSumMs += src.RTSumMs
+	if src.RTMaxMs > dst.RTMaxMs {
+		dst.RTMaxMs = src.RTMaxMs
+	}
+	dst.FrtSumMs += src.FrtSumMs
+	dst.FrtN += src.FrtN
+	if src.FrtMaxMs > dst.FrtMaxMs {
+		dst.FrtMaxMs = src.FrtMaxMs
+	}
+}
+
 type aggregator struct {
 	mu                 sync.RWMutex
 	active             map[int64]map[string]*bucket // minute → peer → bucket（当前 active）
@@ -1112,6 +1139,22 @@ func extractUsage(m map[string]any) usageTokens {
 	return u
 }
 
+// cachedUsage / cachedPeer 复用 handleConn 预算并缓存到 m 的结果（__usage / __peer），
+// 避免 ingest 与 extractDetail 在每帧热路径上各算一遍（与 __stream 同模式）。缓存缺失现算兜底。
+func cachedUsage(m map[string]any) usageTokens {
+	if u, ok := m["__usage"].(usageTokens); ok {
+		return u
+	}
+	return extractUsage(m)
+}
+
+func cachedPeer(m map[string]any) string {
+	if p, ok := m["__peer"].(string); ok {
+		return p
+	}
+	return normalizePeer(m)
+}
+
 // streamRe 匹配 req_body 里的 "stream":true/false。要求 key 前是 { 或 ,（JSON 对象
 // key 位置）→ 避开 "stream_options" 以及正文里转义的 \"stream\"（前缀是 \ 不是 {/,）。
 var streamRe = regexp.MustCompile(`[{,]\s*"stream"\s*:\s*(true|false)`)
@@ -1198,12 +1241,12 @@ func (a *aggregator) ingest(m map[string]any) {
 	// router 场景：openresty 选中的 peer 是 router_ip:port（中间层），router 在响应里回
 	// X-Routed-Peer 标识真实后端 vllm（写到 forwarded_to）。normalizePeer 优先按真实后端聚合，
 	// 让 monitor 的 per-peer TPM 不被 router 塌缩成一行。
-	peer := normalizePeer(m)
+	peer := cachedPeer(m)
 	streamKey := streamKeyOf(streamOf(m))
 	pkey := bkey(peer, streamKey) // 内层 map 按 (peer, stream) 分桶
 	status := int(getInt64(m["status"]))
 
-	u := extractUsage(m)
+	u := cachedUsage(m)
 	prompt, cached, compl, total := u.prompt, u.cached, u.compl, u.total
 	reqBytes := int64(len(getString(m["req_body"])))
 	respBytes := int64(len(getString(m["resp_body"])))
@@ -1416,8 +1459,11 @@ func (a *aggregator) reload() {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	// metrics 文件历史上可能存在同 (minute, peer) 多行（修复前的迟到请求 bug）
-	// reload 时按 (minute, peer) 累加合并，恢复出干净的单条 bucket
+	// 按 (minute, peer, stream) 合并(bkey)，与运行时 ingest 的分桶键一致——保证重启后
+	// /summary?stream=true|false 仍能对 reload 出来的数据做过滤。同 (minute,peer) 不同 stream
+	// (含 stream="" 未知类,如部署前老数据或 req_body 缺失)是合法的独立桶，不在此折叠；
+	// 对外展示由 /summary 的 perPeer 求和 / mergeBucketsByPeer 跨 stream 合回 (minute,peer)。
+	// 文件里同 (minute,peer,stream) 多行(修复前迟到请求 bug 残留)在此累加成单条。
 	idx := map[int64]map[string]*bucket{}
 	for scanner.Scan() {
 		var b bucket
@@ -1431,25 +1477,7 @@ func (a *aggregator) reload() {
 		}
 		k := bkey(b.Peer, b.Stream)
 		if existing, ok := mp[k]; ok {
-			existing.Requests += b.Requests
-			existing.Status2xx += b.Status2xx
-			existing.Status4xx += b.Status4xx
-			existing.Status5xx += b.Status5xx
-			existing.PromptTok += b.PromptTok
-			existing.CachedTok += b.CachedTok
-			existing.ComplTok += b.ComplTok
-			existing.TotalTok += b.TotalTok
-			existing.ReqBytes += b.ReqBytes
-			existing.RespBytes += b.RespBytes
-			existing.RTSumMs += b.RTSumMs
-			if b.RTMaxMs > existing.RTMaxMs {
-				existing.RTMaxMs = b.RTMaxMs
-			}
-			existing.FrtSumMs += b.FrtSumMs
-			existing.FrtN += b.FrtN
-			if b.FrtMaxMs > existing.FrtMaxMs {
-				existing.FrtMaxMs = b.FrtMaxMs
-			}
+			existing.add(&b)
 		} else {
 			cp := b
 			mp[k] = &cp

@@ -88,7 +88,17 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 	// stream 过滤: ""=不过滤(默认,跨 stream 合并); true/1=只流式; false/0=只非流式。
 	// 内部桶按 (minute,peer,stream) 分;默认必须合回 (minute,peer) 保证 buckets[] 一行一
 	// (minute,peer)——monitor 按 (minute,peer) last-write-wins 消费,分裂会丢一半 TPM。
+	// 非法值显式 400(与 metricsHandler 一致),避免把 typo 静默当 false 只回非流式子集。
 	streamFilter := r.URL.Query().Get("stream")
+	switch streamFilter {
+	case "", "true", "1", "false", "0":
+		// ok
+	default:
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "bad stream (want true/1/false/0 or empty)"})
+		return
+	}
 
 	now := time.Now().Unix()
 	cutoff := now - int64(minutes)*60
@@ -133,25 +143,7 @@ func (a *aggregator) summaryHandler(w http.ResponseWriter, r *http.Request) {
 			p = &bucket{Peer: b.Peer}
 			perPeer[b.Peer] = p
 		}
-		p.Requests += b.Requests
-		p.Status2xx += b.Status2xx
-		p.Status4xx += b.Status4xx
-		p.Status5xx += b.Status5xx
-		p.PromptTok += b.PromptTok
-		p.CachedTok += b.CachedTok
-		p.ComplTok += b.ComplTok
-		p.TotalTok += b.TotalTok
-		p.ReqBytes += b.ReqBytes
-		p.RespBytes += b.RespBytes
-		p.RTSumMs += b.RTSumMs
-		if b.RTMaxMs > p.RTMaxMs {
-			p.RTMaxMs = b.RTMaxMs
-		}
-		p.FrtSumMs += b.FrtSumMs
-		p.FrtN += b.FrtN
-		if b.FrtMaxMs > p.FrtMaxMs {
-			p.FrtMaxMs = b.FrtMaxMs
-		}
+		p.add(b)
 	}
 	peers := make([]peerSummary, 0, len(perPeer))
 	for _, p := range perPeer {
@@ -217,25 +209,7 @@ func mergeBucketsByPeer(rows []bucket) []bucket {
 			order = append(order, &nb)
 			continue
 		}
-		e.Requests += b.Requests
-		e.Status2xx += b.Status2xx
-		e.Status4xx += b.Status4xx
-		e.Status5xx += b.Status5xx
-		e.PromptTok += b.PromptTok
-		e.CachedTok += b.CachedTok
-		e.ComplTok += b.ComplTok
-		e.TotalTok += b.TotalTok
-		e.ReqBytes += b.ReqBytes
-		e.RespBytes += b.RespBytes
-		e.RTSumMs += b.RTSumMs
-		if b.RTMaxMs > e.RTMaxMs {
-			e.RTMaxMs = b.RTMaxMs
-		}
-		e.FrtSumMs += b.FrtSumMs
-		e.FrtN += b.FrtN
-		if b.FrtMaxMs > e.FrtMaxMs {
-			e.FrtMaxMs = b.FrtMaxMs
-		}
+		e.add(b)
 	}
 	out := make([]bucket, len(order))
 	for i, p := range order {
