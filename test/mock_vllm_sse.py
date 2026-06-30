@@ -336,6 +336,14 @@ async def chat_completions(request: web.Request):
                              "token_ids": None}]
             })))
 
+        # decoy_ct（测 TPS gmatch 末匹配 fix#3）：在真 usage 前塞一个 content chunk，
+        # 其文本含 "completion_tokens": <decoy> 字面量（模拟正文里 tool-call/JSON 回显）。
+        # 正确实现应取流末尾真 usage 的 completion_tokens，而非这个更早的 decoy。
+        dct = body.get("decoy_ct")
+        if dct is not None:
+            await resp.write(_chat_content_chunk(cid, model, created,
+                '{"completion_tokens": %d}' % int(dct), kind="content"))
+
         # usage chunk（仅当 stream_options.include_usage=true）
         if (body.get("stream_options") or {}).get("include_usage"):
             await resp.write(_chat_usage_chunk(cid, model, created, prompt_tokens, out_len))
