@@ -49,11 +49,11 @@ http {
     -- ac:自适应,显式 min=2,加速参数;rt_limit_factor=1(闸更紧,小并发即可触发)
     _G.register_route("ac",  function() return R({peers=p2, tps_limit_tps=50, rt_limit_factor=1,
         adaptive_cc=true, adaptive_cc_min=2, adaptive_cc_interval=2, adaptive_cc_dec=0.5, adaptive_cc_inc=2.0}) end)
-    -- acd:自适应,不配 min → 派生 = 静态max×0.25 = 10(仅查 status)
+    -- acd:配 tps_limit_tps 但**不写 adaptive_cc** → 应按全局默认翻成自适应(验证 default-on);不配 min → 派生 10
     _G.register_route("acd", function() return R({peers=p2big, tps_limit_tps=50,
-        adaptive_cc=true, adaptive_cc_interval=2}) end)
-    -- hard:硬熔断对照(不开 adaptive)→ 仍 tps-429
-    _G.register_route("hd",  function() return R({peers=p2, tps_limit_tps=50}) end)
+        adaptive_cc_interval=2}) end)
+    -- hard:硬熔断对照(显式 adaptive_cc=false;全局默认已翻自适应)→ 仍 tps-429
+    _G.register_route("hd",  function() return R({peers=p2, tps_limit_tps=50, adaptive_cc=false}) end)
   }
   server { listen 19490; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.ac) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.ac) } }
@@ -135,10 +135,11 @@ sleep 26; cc5heal=$(acc $AC)                            # 静默 >> CC_TTL → c
   && ok "AC5 无信号:短缺口保持(cc=$cc5hold,ewma空)→ 持续静默自愈过期(cc空)" \
   || no "AC5 cc5a=$cc5a hold=$cc5hold ewma='$ev5' heal='$cc5heal'"
 
-# AC6 派生 min + clamp 边界:acd 不配 min → 派生=静态max(40)*0.25=10;on=true,max=40;cc 不越 min
+# AC6 默认开 + 派生 min:acd 只配 tps_limit_tps(未写 adaptive_cc)→ 全局默认翻自适应(on=true);
+#   不配 min → 派生=静态max(40)*0.25=10,max=40
 read on mn_ mx_ < <(curl -s "$ACD/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);mn=d.get('adaptive_cc_min') or {};mx=d.get('adaptive_cc_max') or {};print(d.get('adaptive_cc_on'), mn.get('_'), mx.get('_'))")
 { [ "$on" = "True" ] && [ "$mn_" = "10" ] && [ "$mx_" = "40" ]; } \
-  && ok "AC6 派生 min:acd on=$on,min=$mn_(=40*0.25),max=$mx_" || no "AC6 on=$on min=$mn_ max=$mx_"
+  && ok "AC6 默认开(只配tps_limit_tps→on=$on)+派生min=$mn_(=40*0.25),max=$mx_" || no "AC6 on=$on min=$mn_ max=$mx_"
 
 # AC7 零回归对照:hard 路由(不开 adaptive)慢流 → 仍 tps-429(硬熔断存活 + 互斥真实)
 expire; estab_seq $HD 50 20

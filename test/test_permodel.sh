@@ -33,7 +33,7 @@ http {
     _G.register_route("pm", function() return {
       peers_by_model={["kimi-k2.6"]={{"127.0.0.1",28931,"k1"},{"127.0.0.1",28932,"k2"}},["glm-5.1-fp8"]={{"127.0.0.1",28933,"g1"}}},
       default_max=50, bodylog_default_enabled=false, health_check_interval=9999,
-      tps_limit_tps=30, tps_limit_by_model={["kimi-k2.6"]=50,["glm-5.1-fp8"]=10},
+      tps_limit_tps=30, tps_limit_by_model={["kimi-k2.6"]=50,["glm-5.1-fp8"]=10}, adaptive_cc=false,
       tps_window=3, tps_ttl=8, tps_probe_window=3, tps_probe_per_window=5, tps_min_decode_s=0.3,
       ttft_limit_ms=1000, ttft_limit_by_model={["kimi-k2.6"]=400,["glm-5.1-fp8"]=1500},
       ttft_window=3, ttft_ttl=8, ttft_probe_window=3, ttft_probe_per_window=5 } end)

@@ -43,7 +43,7 @@ http {
     math.randomseed(ngx.now()*1000 + ngx.worker.pid())
     _G.TPS_BUCKETS = {5,10,20,40,80,150,300}   -- 测试用小桶(溢出>300→P20代表=600)
     local mk={{"127.0.0.1",28911,"m1"},{"127.0.0.1",28912,"m2"},{"127.0.0.1",28913,"m3"}}
-    local C={default_max=50,bodylog_default_enabled=false,health_check_interval=5,tps_window=3,tps_ttl=8,tps_probe_window=3,tps_probe_per_window=5,tps_min_decode_s=0.3}
+    local C={default_max=50,bodylog_default_enabled=false,health_check_interval=5,tps_window=3,tps_ttl=8,tps_probe_window=3,tps_probe_per_window=5,tps_min_decode_s=0.3,adaptive_cc=false}  -- 本套件专测硬熔断;全局默认已翻自适应,显式 false 保持硬熔断
     local function R(x) local t={} for k,v in pairs(C) do t[k]=v end for k,v in pairs(x) do t[k]=v end return t end
     _G.register_route("s",  function() return R({peers=mk, tps_limit_tps=50, tps_ewma_alpha=0.3}) end)
     _G.register_route("pm", function() return R({peers_by_model={["kimi-k2.6"]={{"127.0.0.1",28911,"k1"},{"127.0.0.1",28912,"k2"}},["glm-5.1-fp8"]={{"127.0.0.1",28913,"g1"}}}, tps_limit_tps=50, tps_limit_by_model={["kimi-k2.6"]=50,["glm-5.1-fp8"]=10}}) end)
