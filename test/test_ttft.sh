@@ -18,7 +18,9 @@ cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null
 trap cleanup EXIT
 mkdir -p "$PREFIX/logs" "$PREFIX/temp"
 srv=$(grep -n "^server {" "$ENGINE"|head -1|cut -d: -f1); end=$(awk -v s="$srv" 'NR<s && /^}/{l=NR} END{print l}' "$ENGINE")
-sed -n "100,${end}p" "$ENGINE" > "$PREFIX/initblock.conf"
+# 动态定位 init_by_lua_block(原硬编码 100 随 config 增长失效:该块函数定义才是要抽的,init_worker 由本测试自带)
+start=$(grep -n "^init_by_lua_block {" "$ENGINE"|head -1|cut -d: -f1)
+sed -n "${start},${end}p" "$ENGINE" > "$PREFIX/initblock.conf"
 
 cat > "$PREFIX/nginx.conf" <<'EOF'
 worker_processes 1; error_log logs/error.log warn; pid logs/nginx.pid;
