@@ -90,14 +90,16 @@ align(){ local now=$(date +%s); sleep $((3 - now % 3)); }
 estab(){ align; for i in 1 2 3 4 5 6; do fire "$1" "$2" "$3" "${4:-x}" >/dev/null; done; sleep 4; fire "$1" "$2" "$3" "${4:-x}" >/dev/null; sleep 1; }
 expire(){ sleep 10; }
 burst(){ local u=$1 n=$2 cd=$3 mx=$4 md=${5:-x} d="$PREFIX/b"; rm -f ${d}_*; for i in $(seq 1 $n); do ( fire "$u" "$cd" "$mx" "$md"; echo ) >${d}_$i & done; wait; cat ${d}_* | sort | uniq -c | tr '\n' ' '; }
+# 持续并发压力($4=model,$5=dur秒):制造"并发顶到 cc"的压力 + 快流喂 ewma → cc 才 ×inc 爬(新逻辑)
+load(){ local u=$1 cd=$2 mx=$3 md=${4:-x} dur=$5; local endt=$((SECONDS+dur)); while [ "$SECONDS" -lt "$endt" ]; do for i in 1 2 3 4 5 6 7 8; do fire "$u" "$cd" "$mx" "$md" >/dev/null 2>&1 & done; sleep 0.3; done; wait; }
 acc(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);cc=d.get('adaptive_cc') or {};print(cc.get('${2:-_}') if cc.get('${2:-_}') is not None else '')"; }
 accmin(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);m=d.get('adaptive_cc_min') or {};print(m.get('${2:-_}'))"; }
 
 echo "########## 自适应并发 边界 cases ##########"
 
-# B1 clamp 上界:快流多个 tick(inc×2)→ cc 封顶在 max=6,绝不超(不会 12)
-expire; estab $CB 10 40; sleep 8; c=$(acc $CB)
-{ [ "$c" = "6" ]; } && ok "B1 clamp 上界:快流多tick → cc=$c(=max6,不越界)" || no "B1 cc=$c(期望 6)"
+# B1 clamp 上界:快流+并发压力多个 tick(inc×2)→ cc 封顶在 max=6,绝不超(不会 12)
+expire; estab $CB 10 40; load $CB 10 40 x 8; c=$(acc $CB)
+{ [ "$c" = "6" ]; } && ok "B1 clamp 上界:快流+压力多tick → cc=$c(=max6,不越界)" || no "B1 cc=$c(期望 6)"
 
 # B2 clamp 下界:慢流多个 tick(dec×0.5)→ cc 落底在 min=2,绝不低于(不会 1/0)
 expire; estab $CB 50 20; sleep 10; c=$(acc $CB)
@@ -114,10 +116,15 @@ r=$(burst $CF 6 50 20); b429=$(echo "$r"|grep -oE "[0-9]+ 429"|grep -oE "^[0-9]+
 { awk "BEGIN{exit !($ccf<=3)}" && [ "$b429" -ge 1 ] && [ "$b429" -le 3 ]; } \
   && ok "B4 factor×cc:cc=$ccf,gate=cc×2≈4 → burst6=[$r](甩 $b429,≈2)" || no "B4 cc=$ccf 429=$b429 r=[$r]"
 
-# B5 peers_by_model 每模型独立 cc:kimi 慢(cc缩) / glm 快(cc保持 max3),互不影响
+# B5 peers_by_model 每模型独立 cc:kimi 慢+无压力(cc缩到min) / glm 快+压力(cc涨到max3),互不影响
+# 每模型独立 rt_sum(tps_key_prefix 带 model)→ 压力也各判各的
 expire; align
-for i in 1 2 3 4; do fire $PM 50 20 kimi-k2.6 >/dev/null; fire $PM 10 40 glm-5.1-fp8 >/dev/null; done
-sleep 4; fire $PM 50 20 kimi-k2.6 >/dev/null; fire $PM 10 40 glm-5.1-fp8 >/dev/null; sleep 8
+_e5=$((SECONDS+9))
+while [ "$SECONDS" -lt "$_e5" ]; do
+  fire $PM 50 20 kimi-k2.6 >/dev/null 2>&1 &                          # kimi 慢、单发(低并发无压力 + ewma<阈值 → 缩)
+  for i in 1 2 3 4 5 6; do fire $PM 10 40 glm-5.1-fp8 >/dev/null 2>&1 & done  # glm 快×6(压力+高ewma → 涨到 max3)
+  sleep 0.4
+done; wait
 ck=$(acc $PM kimi-k2.6); cg=$(acc $PM glm-5.1-fp8)
 { [ -n "$ck" ] && [ -n "$cg" ] && awk "BEGIN{exit !($ck < $cg)}"; } \
   && ok "B5 每模型独立:kimi慢 cc=$ck < glm快 cc=$cg(各自 AIMD,互不干扰)" || no "B5 kimi=$ck glm=$cg"

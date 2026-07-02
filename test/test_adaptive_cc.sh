@@ -91,27 +91,38 @@ estab_seq(){ align; for i in 1 2 3 4 5 6; do fire "$1" "$2" "$3" >/dev/null; don
 expire(){ sleep 10; }   # > ewma ttl(8s):清 ewma;10s < CC_TTL(16s)故 adaptive_cc 仍保持(不误过期)
 # 并发 burst,返回 "N 200 M 429"
 burst(){ local u=$1 n=$2 cd=$3 mx=$4 d="$PREFIX/b"; rm -f ${d}_*; for i in $(seq 1 $n); do ( fire "$u" "$cd" "$mx"; echo ) >${d}_$i & done; wait; cat ${d}_* | sort | uniq -c | tr '\n' ' '; }
+# 持续并发压力:dur 秒内每 0.3s 发一批 8 并发。制造"并发顶到 cc"的压力(do_route 存高 rt_sum)+
+# 被 admit 的快流喂 ewma(≥阈值)→ cc 才会 ×inc 爬(新逻辑:只有有压力才涨)。cd 小=快解码=高 ewma。
+load(){ local u=$1 cd=$2 mx=$3 dur=$4; local endt=$((SECONDS+dur)); while [ "$SECONDS" -lt "$endt" ]; do for i in 1 2 3 4 5 6 7 8; do fire "$u" "$cd" "$mx" >/dev/null 2>&1 & done; sleep 0.3; done; wait; }
 acc(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);cc=d.get('adaptive_cc') or {};print(cc.get('${2:-_}') if cc.get('${2:-_}') is not None else '')"; }
 ev(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['ewma_tps'].get('${2:-_}',''))"; }
 stf(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2'))"; }
 
 echo "########## 自适应并发(AIMD)cases ##########"
 
-# AC1 减:prime 到 max(6)→ 切慢流 ewma<50 → cc 每 interval ×0.5 降到 min(2)
-expire; estab_seq $AC 10 40; sleep 7            # 快流 ewma~100 → cc 升到 6
+# AC1 减:快流+并发压力 prime 到 max(6)→ 切慢流 ewma<50 → cc 每 interval ×0.5 降到 min(2)
+expire; estab_seq $AC 10 40; load $AC 10 40 8   # 快流(ewma~100)+持续并发压力 → cc 顶着爬到 6
 ccmax=$(acc $AC)
-expire                                           # 清 ewma(cc 保持 6)
-estab_seq $AC 50 20; sleep 7                     # 慢流 ewma~20 → cc 降
+expire                                           # 清 ewma(cc 保持)
+estab_seq $AC 50 20; sleep 7                     # 慢流 ewma~20 → cc 降(缩不看压力)
 cclow=$(acc $AC); elo=$(ev $AC)
 { [ -n "$ccmax" ] && [ -n "$cclow" ] && awk "BEGIN{exit !($cclow<$ccmax && $cclow<=3 && $cclow>=2)}"; } \
   && ok "AC1 减:cc $ccmax→$cclow(降到 min2 区间,ewma=$elo<50)" || no "AC1 ccmax=$ccmax cclow=$cclow ewma=$elo"
 
-# AC2 增:切快流 ewma>=50 → cc ×2 回升到 max(6);轻并发(5<6)不 429
-expire; estab_seq $AC 10 40; sleep 7            # 快流 ewma~100 → cc 升
+# AC2 增:快流+并发压力 → cc ×2 回升到 max(6)
+expire; estab_seq $AC 10 40; load $AC 10 40 8   # 快流+压力 → cc 升到 6
 cchi=$(acc $AC); ehi=$(ev $AC)
-r2=$(burst $AC 5 10 40)
-{ awk "BEGIN{exit !($cchi>$cclow && $cchi>=5)}" && ! echo "$r2"|grep -q 429; } \
-  && ok "AC2 增:cc $cclow→$cchi(回升到 max6,ewma=$ehi),轻并发5 不429[$r2]" || no "AC2 cchi=$cchi ewma=$ehi burst=[$r2]"
+{ awk "BEGIN{exit !($cchi>$cclow && $cchi>=5)}"; } \
+  && ok "AC2 增:cc $cclow→$cchi(有压力时回升到 max6,ewma=$ehi)" || no "AC2 cchi=$cchi ewma=$ehi"
+
+# AC2b 健康但无压力(快流顺序发,并发~1)→ cc **不涨**(本次改动核心:只有顶到 cc 才爬)
+# 先把 cc 压到 min(2):慢流;再快流顺序发(ewma>阈值但并发低)→ cc 应保持 2 不动
+expire; estab_seq $AC 50 20; sleep 6            # cc→min 2
+cc_before=$(acc $AC)
+expire; for r in 1 2 3 4 5 6; do fire $AC 10 40 >/dev/null; sleep 2; done   # 快流顺序(ewma~100 但并发~1),跨 3 tick
+cc_after=$(acc $AC); e2b=$(ev $AC)
+{ [ -n "$cc_before" ] && [ -n "$cc_after" ] && awk "BEGIN{exit !($cc_after<=$cc_before+0.01)}"; } \
+  && ok "AC2b 健康无压力不涨:cc $cc_before→$cc_after(ewma=$e2b≥阈值但并发低 → 保持不爬)" || no "AC2b cc $cc_before→$cc_after(不该涨)"
 
 # AC3 不甩轻流 + 互斥:慢流把 cc 压到 2,单发(rt_sum=1<2)→ 200,且 body 不含 tps-429
 expire; estab_seq $AC 50 20; sleep 7            # cc→2,ewma<50
