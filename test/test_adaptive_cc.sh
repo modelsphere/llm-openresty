@@ -65,7 +65,9 @@ http {
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.acd) } } }
   server { listen 19492; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.hd) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.hd) } }
-    location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.hd) } } }
+    location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.hd) } }
+    location = /_active_conns_set { content_by_lua_block { _G.dbg_active_conns_set(_G.__route_opts.hd) } }
+    location = /_ban_set { content_by_lua_block { local o=_G.__route_opts.hd; ngx.shared[o.bad_peers_dict]:set(ngx.var.arg_peer, true, tonumber(ngx.var.arg_ttl) or 30); ngx.say("ok") } } }
 }
 EOF
 
@@ -191,6 +193,20 @@ curl -s -X POST "$AC/_tps_toggle?on=1" >/dev/null          # 复原
 off429=$(echo "$res_off"|grep -oE "[0-9]+ 429"|grep -oE "^[0-9]+"); off429=${off429:-0}
 { awk "BEGIN{exit !($cc_on<=3)}" && [ "$off429" -le 3 ]; } \
   && ok "AC8 __off 统一关:cc生效=$cc_on(甩6);__off 后回退 pool_limit(只甩 $off429≤3)" || no "AC8 cc_on=$cc_on off429=$off429 res=[$res_off]"
+
+# AC9 rt_sum 含 banned peer 的在途连接(2026-07-03):ban 只是"不发新流量"的路由决策,被 ban peer 上
+#   残留的在途流仍是真实负载,必须计入 rt_sum(尤其转发型 peer 共享下游池,如 CART router)。用 hd 路由
+#   (非自适应,免 adaptive_cc 阈值干扰):28931/28932 各 max3。ban 28932(pin 3 条在途)→ healthy 仅
+#   28931 → limit=3;set 28931=2。旧逻辑漏算 banned:rt_sum=2<3 → 放行(真实负载 5 被忽略、过量 admit)。
+#   新逻辑:rt_sum=2+3=5 ≥ 3 → 429,body realtime=5(含 banned 的 3)。
+curl -s "$HD/_active_conns_set?peer=127.0.0.1:28931&value=2" >/dev/null
+curl -s "$HD/_active_conns_set?peer=127.0.0.1:28932&value=3" >/dev/null
+curl -s "$HD/_ban_set?peer=127.0.0.1:28932&ttl=30" >/dev/null
+b9=$(fireb $HD 10 20)     # 立即打一发(趁 health timer 未解 ban)
+rt9=$(echo "$b9" | grep -oE '"realtime":[0-9]+' | grep -oE '[0-9]+')
+{ echo "$b9" | grep -q '"trigger":"realtime' && [ "${rt9:-0}" -eq 5 ]; } \
+  && ok "AC9 rt_sum 含 banned:ban 28932(3在途)+28931(2)→ rt_sum=$rt9=5 ≥ limit3 → 429 甩(旧逻辑漏算成2会放行)" \
+  || no "AC9 期望 429+realtime=5,实得 realtime=$rt9 body=[$b9]"
 
 echo ""
 echo "================ 自适应并发套件: PASS=$P FAIL=$F ================"
