@@ -94,6 +94,8 @@ burst(){ local u=$1 n=$2 cd=$3 mx=$4 d="$PREFIX/b"; rm -f ${d}_*; for i in $(seq
 # 持续并发压力:dur 秒内每 0.3s 发一批 8 并发。制造"并发顶到 cc"的压力(do_route 存高 rt_sum)+
 # 被 admit 的快流喂 ewma(≥阈值)→ cc 才会 ×inc 爬(新逻辑:只有有压力才涨)。cd 小=快解码=高 ewma。
 load(){ local u=$1 cd=$2 mx=$3 dur=$4; local endt=$((SECONDS+dur)); while [ "$SECONDS" -lt "$endt" ]; do for i in 1 2 3 4 5 6 7 8; do fire "$u" "$cd" "$mx" >/dev/null 2>&1 & done; sleep 0.3; done; wait; }
+# 可调并发的持续负载($1=并发数 $2=秒):每 0.4s 发 n 个较长(chunk10×60=600ms)快解码请求 → 维持 ~n 重叠并发(rt_sum≥1)
+load_n(){ local n=$1 dur=$2; local endt=$((SECONDS+dur)); while [ "$SECONDS" -lt "$endt" ]; do for i in $(seq 1 $n); do fire $AC 10 60 >/dev/null 2>&1 & done; sleep 0.4; done; wait; }
 acc(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);cc=d.get('adaptive_cc') or {};print(cc.get('${2:-_}') if cc.get('${2:-_}') is not None else '')"; }
 ev(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['ewma_tps'].get('${2:-_}',''))"; }
 stf(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2'))"; }
@@ -125,13 +127,24 @@ cc_after=$(acc $AC); e2b=$(ev $AC)
 { [ -n "$cc_before" ] && [ -n "$cc_after" ] && [ -n "$e2b" ] && awk "BEGIN{exit !($cc_after<=$cc_before+0.01 && $e2b>=50)}"; } \
   && ok "AC2b 健康无压力不涨:cc $cc_before→$cc_after(ewma=$e2b≥阈值50 但并发低 → 不爬,停在 min)" || no "AC2b cc $cc_before→$cc_after ewma=$e2b(需 ewma≥50 且 cc 不涨)"
 
-# AC2c 空闲缩(#1 补洞):压力 prime 到 max6 → 切快流细流(ewma健康但并发低)→ cc 往下缩,不卡在旧峰值
+# AC2c 忙→真实低并发缩:压力 prime 到 max6 → 切**轻量重叠并发(~2,conc≥1)**(ewma健康)→ cc 往下跟到中位
+# (顺序单发 rt_sum=0 会命中"conc=0 保持"分支——那是防空闲/长请求误缩,不是这里要测的;故用重叠并发)
 expire; estab_seq $AC 10 40; load $AC 10 40 8   # cc→6
 cc_hi=$(acc $AC)
-for r in 1 2 3 4 5; do fire $AC 10 40 >/dev/null; sleep 2; done   # 快解码细流(ewma≥阈值)+并发~1 → conc<cc×slack → ×dec 缩
+load_n 2 12                                      # ~2 重叠并发(conc≥1)+ 快解码(ewma~100)→ conc<cc×slack → 缩到中位
 cc_lo=$(acc $AC); e2c=$(ev $AC)
-{ [ -n "$cc_hi" ] && [ -n "$cc_lo" ] && [ -n "$e2c" ] && awk "BEGIN{exit !($cc_lo<$cc_hi && $e2c>=50)}"; } \
-  && ok "AC2c 空闲缩:cc $cc_hi→$cc_lo(ewma=$e2c≥阈值但并发低 → cc 跟着降,不卡峰值)" || no "AC2c cc $cc_hi→$cc_lo ewma=$e2c(应缩)"
+{ [ -n "$cc_hi" ] && [ -n "$cc_lo" ] && [ -n "$e2c" ] && awk "BEGIN{exit !($cc_lo<$cc_hi && $cc_lo>=2 && $e2c>=50)}"; } \
+  && ok "AC2c 忙→低并发缩:cc $cc_hi→$cc_lo(ewma=$e2c≥阈值,真实低并发 → cc 跟着降到中位≥min,不卡峰值)" || no "AC2c cc $cc_hi→$cc_lo ewma=$e2c(应缩到中位)"
+
+# AC2d 收敛到中位平衡点 + 不振荡(#2/#3/#4):把并发精确钉在 3(/_active_conns_set)→ cc 应收敛到 ~3/mid=3.75
+# (中位:>min2 且 <max6),且跨 tick 稳定(mid-clamp 不 ping-pong;若无 clamp 大步长会 6↔3 弹)。
+setc(){ curl -s "$AC/_active_conns_set?peer=127.0.0.1:28931&value=$1" >/dev/null 2>&1; }
+expire; estab_seq $AC 10 40                       # ewma 健康
+for k in 1 2 3 4 5 6; do setc 3; fire $AC 10 40 >/dev/null 2>&1; sleep 2; done  # 钉并发3:触发 do_route 存 rt_sum=3 + 喂 ewma(cc>3 后 fire 不 429)
+cc_eq1=$(acc $AC); sleep 2; cc_eq2=$(acc $AC)     # 两次读验稳定
+setc 0
+{ [ -n "$cc_eq1" ] && [ -n "$cc_eq2" ] && awk "BEGIN{exit !($cc_eq1>2.5 && $cc_eq1<5 && $cc_eq2>2.5 && $cc_eq2<5)}"; } \
+  && ok "AC2d 收敛中位不振荡:cc≈$cc_eq1/$cc_eq2(并发钉3 → cc 停 ~3.75,不到 min/max、跨 tick 稳)" || no "AC2d cc=$cc_eq1/$cc_eq2(应≈3.75 稳定)"
 
 # AC3 不甩轻流 + 互斥:慢流把 cc 压到 2,单发(rt_sum=1<2)→ 200,且 body 不含 tps-429
 expire; estab_seq $AC 50 20; sleep 7            # cc→2,ewma<50
