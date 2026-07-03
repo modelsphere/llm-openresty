@@ -109,20 +109,29 @@ cclow=$(acc $AC); elo=$(ev $AC)
 { [ -n "$ccmax" ] && [ -n "$cclow" ] && awk "BEGIN{exit !($cclow<$ccmax && $cclow<=3 && $cclow>=2)}"; } \
   && ok "AC1 减:cc $ccmax→$cclow(降到 min2 区间,ewma=$elo<50)" || no "AC1 ccmax=$ccmax cclow=$cclow ewma=$elo"
 
-# AC2 增:快流+并发压力 → cc ×2 回升到 max(6)
+# AC2 增:快流+并发压力 → cc ×2 回升到 max(6);且低于 cc 的并发(5<6)不被 429
 expire; estab_seq $AC 10 40; load $AC 10 40 8   # 快流+压力 → cc 升到 6
 cchi=$(acc $AC); ehi=$(ev $AC)
-{ awk "BEGIN{exit !($cchi>$cclow && $cchi>=5)}"; } \
-  && ok "AC2 增:cc $cclow→$cchi(有压力时回升到 max6,ewma=$ehi)" || no "AC2 cchi=$cchi ewma=$ehi"
+r2=$(burst $AC 5 10 40)                          # 轻并发 5 < cc6 → 应全 200,不 429(守"低于 cc 放行")
+{ awk "BEGIN{exit !($cchi>$cclow && $cchi>=5)}" && ! echo "$r2"|grep -q 429; } \
+  && ok "AC2 增:cc $cclow→$cchi(有压力回升 max6,ewma=$ehi)+低于cc并发5不429[$r2]" || no "AC2 cchi=$cchi ewma=$ehi burst=[$r2]"
 
-# AC2b 健康但无压力(快流顺序发,并发~1)→ cc **不涨**(本次改动核心:只有顶到 cc 才爬)
-# 先把 cc 压到 min(2):慢流;再快流顺序发(ewma>阈值但并发低)→ cc 应保持 2 不动
+# AC2b 健康但无压力(快流顺序发 ewma≥阈值 但并发~1)→ cc **不涨**(已在 min2,slack 缩也被 min 兜住 → 停 2)
+# 断言 ewma 确实 ≥阈值(否则 cc 平是 ewma<thr 造成、而非压力门,会假过)
 expire; estab_seq $AC 50 20; sleep 6            # cc→min 2
 cc_before=$(acc $AC)
-expire; for r in 1 2 3 4 5 6; do fire $AC 10 40 >/dev/null; sleep 2; done   # 快流顺序(ewma~100 但并发~1),跨 3 tick
+expire; for r in 1 2 3 4 5 6; do fire $AC 10 40 >/dev/null; sleep 2; done   # 快流顺序(ewma~100,并发~1),跨 3 tick
 cc_after=$(acc $AC); e2b=$(ev $AC)
-{ [ -n "$cc_before" ] && [ -n "$cc_after" ] && awk "BEGIN{exit !($cc_after<=$cc_before+0.01)}"; } \
-  && ok "AC2b 健康无压力不涨:cc $cc_before→$cc_after(ewma=$e2b≥阈值但并发低 → 保持不爬)" || no "AC2b cc $cc_before→$cc_after(不该涨)"
+{ [ -n "$cc_before" ] && [ -n "$cc_after" ] && [ -n "$e2b" ] && awk "BEGIN{exit !($cc_after<=$cc_before+0.01 && $e2b>=50)}"; } \
+  && ok "AC2b 健康无压力不涨:cc $cc_before→$cc_after(ewma=$e2b≥阈值50 但并发低 → 不爬,停在 min)" || no "AC2b cc $cc_before→$cc_after ewma=$e2b(需 ewma≥50 且 cc 不涨)"
+
+# AC2c 空闲缩(#1 补洞):压力 prime 到 max6 → 切快流细流(ewma健康但并发低)→ cc 往下缩,不卡在旧峰值
+expire; estab_seq $AC 10 40; load $AC 10 40 8   # cc→6
+cc_hi=$(acc $AC)
+for r in 1 2 3 4 5; do fire $AC 10 40 >/dev/null; sleep 2; done   # 快解码细流(ewma≥阈值)+并发~1 → conc<cc×slack → ×dec 缩
+cc_lo=$(acc $AC); e2c=$(ev $AC)
+{ [ -n "$cc_hi" ] && [ -n "$cc_lo" ] && [ -n "$e2c" ] && awk "BEGIN{exit !($cc_lo<$cc_hi && $e2c>=50)}"; } \
+  && ok "AC2c 空闲缩:cc $cc_hi→$cc_lo(ewma=$e2c≥阈值但并发低 → cc 跟着降,不卡峰值)" || no "AC2c cc $cc_hi→$cc_lo ewma=$e2c(应缩)"
 
 # AC3 不甩轻流 + 互斥:慢流把 cc 压到 2,单发(rt_sum=1<2)→ 200,且 body 不含 tps-429
 expire; estab_seq $AC 50 20; sleep 7            # cc→2,ewma<50
