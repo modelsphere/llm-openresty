@@ -297,20 +297,23 @@ sudo /usr/local/openresty/bin/openresty -T                 # 看完整运行配�
 - access：`/usr/local/openresty/nginx/logs/access.log`
 - error：`/usr/local/openresty/nginx/logs/error.log`
 
-Log format (`session_log`)：
+Log format (`session_log`，JSON,便于 Loki/Grafana `| json` 解析)：
 
-```
-$remote_addr - [$time_local] "$request" sid="$routed_session_id" src=$routed_source mode=$routed_mode peer=$routed_peer upstream="$upstream_addr" status=$status bytes=$body_bytes_sent rt=$request_time urt=$upstream_response_time uht=$upstream_header_time
+```json
+{"time":"...","remote_addr":"...","request":"POST /v1/chat/completions HTTP/1.1","method":"POST","rid":"...","sid":"...","src":"header","mode":"hash","peer":"10.0.0.1:8050","fwd":"10.0.0.1:8050","upstream":"10.0.0.1:8050","status":200,"reqlen":8421,"bytes":15332,"rt":12.503,"urt":"12.501","uht":"0.842"}
 ```
 
-过滤技巧：
+- `status/reqlen/bytes/rt` 是 JSON number；`urt/uht/upstream` 重试时多值 → 字符串。
+- gateway-host 的 access.log 会混 443 server 的 combined 行，用 `jq -R 'fromjson? // empty'` 跳过。
+
+过滤技巧（`jq` 解析 JSON）：
 
 ```bash
 # 按 peer 过滤
-sudo grep 'peer=10.0.0.1:8050' /usr/local/openresty/nginx/logs/access.log
+sudo grep '"peer":"10.0.0.1:8050"' /usr/local/openresty/nginx/logs/access.log
 
 # 长请求（rt > 60s）
-sudo awk -F'rt=' '{split($2,a," ");if(a[1]+0>60)print}' /usr/local/openresty/nginx/logs/access.log
+sudo jq -Rc 'fromjson? // empty | select(.rt > 60)' /usr/local/openresty/nginx/logs/access.log
 
 # error log 去掉 info 级别
 sudo grep -vE '\[info\]' /usr/local/openresty/nginx/logs/error.log | tail -50
