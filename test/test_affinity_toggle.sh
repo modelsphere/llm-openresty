@@ -57,7 +57,9 @@ http {
     location = /ron/inspect  { content_by_lua_block { _G.dbg_route_inspect(_G.__route_opts.ron)  } }
     location = /roff/inspect { content_by_lua_block { _G.dbg_route_inspect(_G.__route_opts.roff) } }
     location = /rinh/inspect { content_by_lua_block { _G.dbg_route_inspect(_G.__route_opts.rinh) } }
-    location = /rfon/inspect { content_by_lua_block { _G.dbg_route_inspect(_G.__route_opts.rfon) } } }
+    location = /rfon/inspect { content_by_lua_block { _G.dbg_route_inspect(_G.__route_opts.rfon) } }
+    location = /ron/debug    { content_by_lua_block { _G.dbg_route_debug(_G.__route_opts.ron)  } }
+    location = /rdef/debug   { content_by_lua_block { _G.dbg_route_debug(_G.__route_opts.rdef) } } }
 }
 EOF
 "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -t 2>&1 | tail -1 | grep -q successful || { echo "=== openresty -t FAILED ==="; "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -t; exit 1; }
@@ -74,6 +76,11 @@ insp(){ local r=$1 sid=$2 out
   echo "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('source'),'|',d.get('mode'))"; }
 chk(){ local desc=$1 route=$2 sid=$3 want=$4; local got; got=$(insp "$route" "$sid")
   if [ "$got" = "$want" ]; then ok "$desc  ($route sid=$sid → $got)"; else no "$desc  ($route sid=$sid → got[$got] want[$want])"; fi; }
+# dbg <route> <sid> → 打印 "natural有值|actual_mode|affinity字段"(验 _route_debug 的 natural-vs-actual 分叉)
+dbg(){ local r=$1 sid=$2; curl -s "$U/$r/debug?sid=$sid" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print(('nat' if d.get('natural_target') else 'nonat'),'|',d.get('actual_mode'),'|',d.get('session_affinity_enabled'))"; }
+chkd(){ local desc=$1 route=$2 sid=$3 want=$4; local got; got=$(dbg "$route" "$sid")
+  if [ "$got" = "$want" ]; then ok "$desc  ($route → $got)"; else no "$desc  ($route → got[$got] want[$want])"; fi; }
 
 echo "########## session 亲和性开关 ##########"
 chk "⓪ 不设 flag(继承出厂默认=关)+ sid → least_conn" rdef s0 "affinity_off | least_conn"
@@ -83,6 +90,9 @@ chk "③ 全局关+不设 flag + sid → 继承关"               rinh s3 "affin
 chk "④ 显式 true 覆盖全局关 + sid → hash"             rfon s4 "header.x-session-id | hash"
 chk "⑤ 无 sid(开的路由)→ none/least_conn 不变"        ron  -  "none | least_conn"
 chk "⑤ 无 sid(关的路由)→ none/least_conn 不变"        roff -  "none | least_conn"
+echo "########## _route_debug natural-vs-actual 分叉 ##########"
+chkd "⑥ 开:natural 有值 + actual=hash + affinity=True"          ron  z1 "nat | hash | True"
+chkd "⑦ 关:natural 仍有值(哈希数学)+ actual=least_conn + affinity=False" rdef z2 "nat | least_conn | False"
 
 echo "==== 结果: PASS=$P FAIL=$F ===="
 [ "$F" -eq 0 ] && echo "ALL GOOD" || echo "HAS FAILURES"
