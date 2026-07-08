@@ -44,7 +44,9 @@ http {
     local p2 = {{"127.0.0.1",28931,"m1",0,3},{"127.0.0.1",28932,"m2",0,3}}
     -- per-peer max=20 → 静态 max=40(派生 min = floor(40*0.1)=4)
     local p2big = {{"127.0.0.1",28931,"b1",0,20},{"127.0.0.1",28932,"b2",0,20}}
-    local base = {default_max=50,bodylog_default_enabled=false,health_check_interval=5,
+    -- adaptive_cc_abs=0:本套专测相对 dec/inc/pressure/slack 逻辑,关掉绝对头寸(小 scale max=6 与 ABS=5 默认冲突;
+    -- 绝对头寸+429信号单独由 test_adaptive_cc_abs.sh 覆盖)
+    local base = {default_max=50,bodylog_default_enabled=false,health_check_interval=5,adaptive_cc_abs=0,
                   tps_window=3,tps_ttl=8,tps_probe_window=3,tps_probe_per_window=5,tps_min_decode_s=0.3}
     local function R(x) local t={} for k,v in pairs(base) do t[k]=v end for k,v in pairs(x) do t[k]=v end return t end
     -- ac:自适应,显式 min=2,加速参数;rt_limit_factor=1(闸更紧,小并发即可触发)
