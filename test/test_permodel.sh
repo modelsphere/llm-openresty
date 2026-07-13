@@ -16,6 +16,8 @@ mkdir -p "$PREFIX/logs" "$PREFIX/temp"
 start=$(grep -n "^init_by_lua_block {" "$ENGINE"|head -1|cut -d: -f1)
 srv=$(grep -n "^server {" "$ENGINE"|head -1|cut -d: -f1); end=$(awk -v s="$srv" 'NR<s && /^}/{l=NR} END{print l}' "$ENGINE")
 sed -n "${start},${end}p" "$ENGINE" > "$PREFIX/initblock.conf"
+# lua-refactor: init_by_lua_block 现只 `require "router"`,需 lua_package_path 指向 openresty/lua/ 才能加载模块
+source "$HERE/lib_initblock.sh"; prepend_lua_path "$PREFIX/initblock.conf" "$HERE/../lua"
 cat > "$PREFIX/nginx.conf" <<'EOF'
 worker_processes 1; error_log logs/error.log warn; pid logs/nginx.pid;
 events { worker_connections 2048; }
@@ -61,6 +63,14 @@ burst(){ local m=$1; shift; local d="$PREFIX/b"; rm -f ${d}_*; for i in $(seq 1 
 expire(){ sleep 10; }
 tpv(){ curl -s "$U/_tps_status"|python3 -c "import sys,json;print(json.load(sys.stdin)['ewma_tps'].get('$1',''))"; }
 ttv(){ curl -s "$U/_ttft_status"|python3 -c "import sys,json;print(json.load(sys.stdin)['ewma_ms'].get('$1',''))"; }
+
+echo "########## PMV. peers_by_model 的 /v1/models 由 serve_models 直接列出 ##########"
+mc=$(curl -s -o /dev/null -w "%{http_code}" -H "$A" "$U/v1/models")
+[ "$mc" = "200" ] && ok "PMV /v1/models → 200(serve_models 列子池 model id,鉴权后早返、不进 resolve_pool)" || no "PMV /v1/models → $mc(期望 200)"
+ml=$(curl -s -H "$A" "$U/v1/models" | python3 -c "import sys,json;d=json.load(sys.stdin);print(sorted(m['id'] for m in d.get('data',[])))" 2>/dev/null)
+echo "$ml" | grep -q "kimi-k2.6" && echo "$ml" | grep -q "glm-5.1-fp8" && ok "PMV /v1/models 列出两个子池模型:$ml" || no "PMV models 列表异常:$ml"
+nc=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$A" -H "$H" -d '{"messages":[{"role":"user","content":"hi"}]}' "$U/v1/chat/completions")
+[ "$nc" = "400" ] && ok "PMV 缺 model 的 chat 请求 → 400(严格拒绝,未知/缺失 model 不 fallback)" || no "PMV chat 缺 model → $nc(期望 400)"
 
 echo "########## TPS per-model 在线 override(override > by_model)##########"
 # kimi/glm 同窗建 ewma(桶40);kimi by_model=50 → 限;glm by_model=10 → 不限

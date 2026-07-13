@@ -16,6 +16,8 @@ mkdir -p "$PREFIX/logs" "$PREFIX/temp"
 start=$(grep -n "^init_by_lua_block {" "$ENGINE"|head -1|cut -d: -f1)
 srv=$(grep -n "^server {" "$ENGINE"|head -1|cut -d: -f1); end=$(awk -v s="$srv" 'NR<s && /^}/{l=NR} END{print l}' "$ENGINE")
 sed -n "${start},${end}p" "$ENGINE" > "$PREFIX/initblock.conf"
+# lua-refactor: init_by_lua_block 现只 `require "router"`,需 lua_package_path 指向 openresty/lua/ 才能加载模块
+source "$HERE/lib_initblock.sh"; prepend_lua_path "$PREFIX/initblock.conf" "$HERE/../lua"
 cat > "$PREFIX/nginx.conf" <<'EOF'
 worker_processes 1; error_log logs/error.log warn; pid logs/nginx.pid;
 events { worker_connections 2048; }
