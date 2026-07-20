@@ -194,3 +194,12 @@
         deny  all;
         content_by_lua_block { _G.dbg_kimi_normalize_toggle(_G.__route_opts[ngx.var.route]) }
     }
+
+    # /_include_usage_toggle — 新格式 peers_by_model + stream 的 include_usage 注入开关
+    # (POST ?on=1 / on=0 / 不带参数查询)。默认开;承重转换,关了新格式 stream 拿不到 usage。
+    location = /_include_usage_toggle {
+        allow 127.0.0.1;
+        allow ::1;
+        deny  all;
+        content_by_lua_block { _G.dbg_include_usage_toggle(_G.__route_opts[ngx.var.route]) }
+    }
