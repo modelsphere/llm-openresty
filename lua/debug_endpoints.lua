@@ -280,20 +280,31 @@ function _G.dbg_429_status(opts)
         return
     end
     local args = ngx.req.get_uri_args()
+    -- 默认只统计【本端口对应 route】(opts.route_name);?all=1 → 全路由聚合(monitor 走这个)。
+    -- reject_stat 是全局 dict、key="<route>:<reason>",这里按 route 前缀过滤实现 per-route 视图。
+    local want = opts and opts.route_name
+    local show_all = (args.all == "1") or (not want)
     if args.reset == "1" then
         if ngx.var.remote_addr ~= "127.0.0.1" then
             ngx.status = 403
             ngx.say([[{"error":"reset allowed from 127.0.0.1 only"}]])
             return
         end
-        rj:flush_all()
-        ngx.say([[{"reset":true}]])
+        if show_all then
+            rj:flush_all()
+        else
+            for _, k in ipairs(rj:get_keys(0)) do        -- 只清本 route 的 key,不动别的路由
+                local route = k:match("^(.*):[^:]+$")
+                if route == want then rj:delete(k) end
+            end
+        end
+        ngx.say(cjson_dbg.encode({ reset = true, scope = show_all and "all" or want }))
         return
     end
     local by_route, by_reason, total = {}, {concurrency=0, ttft=0, tps=0}, 0
     for _, k in ipairs(rj:get_keys(0)) do
         local route, reason = k:match("^(.*):([^:]+)$")
-        if route and reason then
+        if route and reason and (show_all or route == want) then
             local v = rj:get(k) or 0
             by_route[route] = by_route[route] or {concurrency=0, ttft=0, tps=0}
             by_route[route][reason] = (by_route[route][reason] or 0) + v
@@ -302,10 +313,11 @@ function _G.dbg_429_status(opts)
         end
     end
     ngx.say(cjson_dbg.encode({
+        scope     = show_all and "all" or want,          -- "all"=全路由聚合 / "<route>"=仅本路由
         total     = total,
         by_reason = by_reason,
         by_route  = by_route,
-        note      = "counters since last reset or worker restart (survive reload)",
+        note      = "默认仅本 route;?all=1 全路由聚合。counters since last reset/worker restart (survive reload)",
         worker_id = ngx.worker.id(),
     }))
 end
@@ -537,7 +549,7 @@ function _G.dbg_cch_test(opts)
     end
     local bodylog_body = ngx.ctx.bodylog_req_body
     ngx.header["Content-Type"] = "application/json"
-    ngx.say(cjson_dbg.encode({
+    local out = {
         route              = opts.route_name,
         cch_stripped       = ngx.ctx.cch_stripped or false,
         session_id         = sid,
@@ -547,7 +559,12 @@ function _G.dbg_cch_test(opts)
         bodylog_len        = bodylog_body and #bodylog_body or 0,
         bodylog_md5        = bodylog_body and ngx.md5(bodylog_body) or "",
         bodylog_differs    = (bodylog_body ~= body_after),
-    }))
+    }
+    -- ?full=1 回显处理后的完整 body(仅调试:byte-preservation 精确断言用;默认不回显防泄露)
+    if ngx.var.arg_full == "1" then
+        out.body_after = body_after or ""
+    end
+    ngx.say(cjson_dbg.encode(out))
 end
 
 function _G.dbg_route_state(opts)
@@ -744,5 +761,39 @@ function _G.dbg_kimi_normalize_toggle(opts)
         enabled = en2 == 1,
         changes_total = ctl:get("kimi_normalize_changes_total") or 0,
         req_count     = ctl:get("kimi_normalize_req_count") or 0,
+    }))
+end
+
+-- include_usage 注入开关(POST ?on=1 / on=0 / 不带参数查询)。默认**开**(dict 缺省即开):
+-- 仅对 peers_by_model 路由的 stream 请求生效,补 stream_options.include_usage=true。
+-- 承重转换(关了新格式 stream 拿不到 usage),故无 per-route factory 默认位、只有全局默认开 + 紧急关。
+function _G.dbg_include_usage_toggle(opts)
+    if _G.opts_missing(opts) then return end
+    local args = ngx.req.get_uri_args()
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local changes = {}
+    if args.on ~= nil then
+        local v
+        if     args.on == "1" or args.on == "true"  then v = 1
+        elseif args.on == "0" or args.on == "false" then v = 0 end
+        if v ~= nil then
+            ctl:set("include_usage_enabled", v)
+            changes.enabled = (v == 1)
+        end
+    end
+    if args.reset == "1" then
+        ctl:set("include_usage_injected_total", 0)
+        changes.counters_reset = true
+    end
+    local en2 = ctl:get("include_usage_enabled")
+    if en2 == nil then en2 = 1 end   -- 默认开
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cjson_dbg.encode({
+        route          = opts.route_name,
+        ok             = true,
+        changes        = changes,
+        enabled        = en2 == 1,
+        injected_total = ctl:get("include_usage_injected_total") or 0,
+        note           = "仅 peers_by_model 路由的 stream 请求生效;默认开",
     }))
 end
