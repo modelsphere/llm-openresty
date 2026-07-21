@@ -130,6 +130,57 @@ worker 0 每 10s TCP connect + `GET /health`，失败 → ban 300s（自动续�
 - `proxy_next_upstream_timeout 60s`
 - peer 连接失败/超时 → 按 `active_conns` 升序选最空闲的 2 个 fallback peer 依次重试
 
+## 规则化请求拒绝（reject_rules）
+
+按**请求内容本身**匹配规则 → 直接拒绝，返回可配 HTTP status（默认 429）。区别于并发/TTFT/TPS 那三种**运行态**限流。**opt-in + 安全默认关**：只有路由 factory 里配了 `reject_rules` **且**显式开启才生效。实现见 `lua/reject_rules.lua`。
+
+### 配置（各 `session_route_<model>.conf` 的 factory `opts` 里）
+
+```lua
+_G.register_route("<name>", function() return {
+    peers = { ... },
+    -- 规则列表:任一顶层规则命中即拒绝(短路,首个命中)
+    reject_rules = {
+        -- 叶子规则:{ field, op, value }
+        { name = "small_max_tokens", field = "max_tokens",  op = "lt", value = 10 },   -- max_tokens<10 → 429
+        { name = "streaming",        field = "stream",      op = "eq", value = true },  -- stream=true → 429
+        { name = "too_long",         field = "input_bytes", op = "gt", value = 200000,
+          status = 413, message = "request body too large" },                          -- 每规则可覆盖 status/message
+        -- 组合规则:all=AND / any=OR,可嵌套
+        { name = "danger_hot", all = {
+            { field = "model", op = "eq", value = "danger" },
+            { field = "temperature", op = "gt", value = 1.5 },
+        } },
+    },
+    reject_rules_default_enabled = true,   -- ★ 必须显式开(全局默认关);或运行时 /_reject_rules_toggle?on=1
+    -- reject_rules_status = 429,          -- (可选)本路由默认 status;每规则自带的 status 优先
+} end)
+```
+
+- **安全默认关**：全局 `_G.REJECT_RULES_DEFAULT_ENABLED = false`。配了规则**也不自动生效**，须 factory `reject_rules_default_enabled = true`，或运行时 `POST /_reject_rules_toggle?on=1`（免 reload）。主集群路由目前均未配规则 → 零行为变化。
+- 非法规则（坏 field/op/value/组合结构、status 越界非 400-599）**启动时 log + 丢弃该条**，不崩路由。
+
+### 字段
+
+| 字段 | 含义 |
+|---|---|
+| `input_bytes` | 原始请求体字节数（O(1)，最省，按长度限流首选） |
+| `input_chars` | messages 文本 **UTF-8 字符数**（非字节；仅规则用到时才算，每请求缓存一次，FFI 实现） |
+| `messages_count` / `tools_count` | messages / tools 条数 |
+| 任意点路径 | `max_tokens` / `stream` / `temperature` / `a.b` …（取 body 里的参数；仅对象 key，不支持数组下标） |
+
+### 操作符
+
+`gt ge lt le eq ne`（数值比较两侧须均 number）、`in` / `nin`（value 须为列表）、`match`（Lua pattern）/ `contains` / `prefix`（字符串）、`exists` / `absent`。
+
+### 观测 / 热切（均仅 127.0.0.1）
+
+- `GET /_reject_rules_status` — 规则列表 + enabled 态 + 各规则命中数
+- `POST /_reject_rules_toggle?on=0|1[&reset=1]` — 热切总开关（写 cch_ctl，跨 reload 持久）/ `reset=1` 清命中计数
+- 命中并入 `GET /_429_status`（reason=`rule`）
+
+拒绝响应体：`{"error":{"type":"rejected_by_rule","rule":"<name>","message":"...","route":"<route>"}}`。测试 `test/{utest,test,bench}_reject_rules.*`，用例见 `cases.md §V`。
+
 ## 响应头（调试用）
 
 每个 `/v1/*` 响应都带：
