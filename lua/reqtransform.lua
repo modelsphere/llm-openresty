@@ -488,6 +488,13 @@ function prepare_request(opts)
     -- 零额外成本。do_route 在 prepare_request 之后据此选子池;老格式不读此字段。
     ngx.ctx.req_model = req.model
 
+    -- 供 reject_rules 规则引擎读取(do_route 在本函数返回后调用 _G.eval_reject_rules):
+    -- 存【原始 body 字符串】(此刻 body 尚未被下方 struct 路径就地改 req 表 / set_body_data 改线体污染),
+    -- eval 按需重新 decode → 恒看客户端原始请求,不受归一化路径(struct 改表 vs surgical 不改)影响。
+    -- req_body_len = 原始体字节数(input_bytes 规则用)。无 body 时上方已提前返回 → 保持 nil,eval 自动 no-op。
+    ngx.ctx.req_body_raw = body
+    ngx.ctx.req_body_len = #body
+
     -- 剥 cch（受 cch_ctl 开关控制，默认开；toggle endpoint 热切，无需 reload）
     local cch_ctl = ngx.shared[opts.cch_ctl_dict or "cch_ctl"]
     local cch_default = opts.cch_default_enabled

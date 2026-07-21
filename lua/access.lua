@@ -54,6 +54,12 @@ function _G.do_route(opts)
     ngx.ctx.session_id     = sid
     ngx.ctx.session_source = src or "none"
 
+    -- ── 规则化请求拒绝(reject_rules)──
+    -- 按请求内容(max_tokens/stream/input_bytes/...)匹配规则,命中即返回可配 status(默认 429)。
+    -- 放在池评估之前:规则拒绝不该消耗池评估。命中时 eval_reject_rules 内部 ngx.exit 直接结束请求;
+    -- 未配 reject_rules 的路由 no-op(零行为变化)。探测请求(/v1/models、/health)不评估。
+    if not is_probe then _G.eval_reject_rules(opts) end
+
     -- 新格式 peers_by_model：按 body.model 选子池，重绑 peers/peer_keys。
     -- 未知/缺失 model → 400 + supported 列表（严格拒绝，不 fallback）。
     -- 老格式（无 peers_by_model）跳过，peers 仍是 opts.peers，行为不变。

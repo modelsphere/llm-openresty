@@ -203,3 +203,21 @@
         deny  all;
         content_by_lua_block { _G.dbg_include_usage_toggle(_G.__route_opts[ngx.var.route]) }
     }
+
+    # /_reject_rules_status  — 查本路由规则化拒绝:规则列表 + enabled 态 + 各规则命中数
+    # /_reject_rules_toggle  — 热切规则总开关: POST ?on=1 / on=0[&reset=1] / 不带参数查询
+    # 两者都仅本机:reject_rules 是反滥用控制,规则阈值/模式不应对外暴露(否则可被探出后精准绕过);
+    # 聚合命中数走公开的 /_429_status(reason=rule)。规则本体配在各 conf 的 factory;实现 lua/reject_rules.lua。
+    location = /_reject_rules_status {
+        allow 127.0.0.1;
+        allow ::1;
+        deny  all;
+        content_by_lua_block { _G.dbg_reject_rules_status(_G.__route_opts[ngx.var.route]) }
+    }
+
+    location = /_reject_rules_toggle {
+        allow 127.0.0.1;
+        allow ::1;
+        deny  all;
+        content_by_lua_block { _G.dbg_reject_rules_toggle(_G.__route_opts[ngx.var.route]) }
+    }

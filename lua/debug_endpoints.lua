@@ -797,3 +797,88 @@ function _G.dbg_include_usage_toggle(opts)
         note           = "仅 peers_by_model 路由的 stream 请求生效;默认开",
     }))
 end
+
+-- ── reject_rules(规则化请求拒绝)status / toggle ──────────────────────────
+-- 规则本体配在各路由 factory 的 opts.reject_rules(见 lua/reject_rules.lua)。
+
+-- 把一个规则节点(叶子 / all / any)渲染成可读字符串,供 status 展示。
+local function _reject_rule_desc(node)
+    if type(node) ~= "table" then return "?" end
+    if node.all or node.any then
+        local subs, sep = node.all or node.any, node.all and " & " or " | "
+        local parts = {}
+        for _, s in ipairs(subs) do parts[#parts + 1] = _reject_rule_desc(s) end
+        return (node.all and "ALL(" or "ANY(") .. table.concat(parts, sep) .. ")"
+    end
+    local v = node.value
+    if type(v) == "table" then
+        local xs = {}
+        for _, x in ipairs(v) do xs[#xs + 1] = tostring(x) end
+        v = "[" .. table.concat(xs, ",") .. "]"
+    end
+    local vs = (node.op == "exists" or node.op == "absent") and "" or (" " .. tostring(v))
+    return tostring(node.field) .. " " .. tostring(node.op) .. vs
+end
+
+-- GET /_reject_rules_status → 列出本路由已配规则 + 当前 enabled 态 + 各规则命中数。
+function _G.dbg_reject_rules_status(opts)
+    if _G.opts_missing(opts) then return end
+    ngx.header["Content-Type"] = "application/json"
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local default_en = opts.reject_rules_default_enabled
+    local enabled = default_en
+    if ctl then
+        local raw = ctl:get("reject_rules_enabled")
+        if raw ~= nil then enabled = (raw == 1) end
+    end
+    local rules = {}
+    if opts.reject_rules then
+        for _, r in ipairs(opts.reject_rules) do
+            rules[#rules + 1] = {
+                name   = r.name,
+                status = r.status or opts.reject_rules_status,
+                cond   = _reject_rule_desc(r),
+                hits   = ctl and (ctl:get("reject_rule_hit:" .. (r.name or "?")) or 0) or 0,
+            }
+        end
+    end
+    ngx.say(cjson_dbg.encode({
+        route          = opts.route_name,
+        ok             = true,
+        enabled        = enabled,
+        default_status = opts.reject_rules_status,
+        rule_count     = #rules,
+        rules          = rules,
+    }))
+end
+
+-- POST /_reject_rules_toggle?on=0|1[&reset=1] → 热切本路由规则总开关 / 重置命中计数。
+-- 状态写 ngx.shared[opts.cch_ctl_dict] key "reject_rules_enabled"(复用 cch_ctl,跨 reload 持久)。
+function _G.dbg_reject_rules_toggle(opts)
+    if _G.opts_missing(opts) then return end
+    local args = ngx.req.get_uri_args()
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local default_en = opts.reject_rules_default_enabled
+    local changes = {}
+    if ctl and args.on ~= nil then
+        local v
+        if     args.on == "1" or args.on == "true"  then v = 1
+        elseif args.on == "0" or args.on == "false" then v = 0 end
+        if v ~= nil then ctl:set("reject_rules_enabled", v); changes.enabled = (v == 1) end
+    end
+    if ctl and args.reset == "1" then
+        for _, k in ipairs(ctl:get_keys(0)) do
+            if k:find("^reject_rule_hit:") then ctl:delete(k) end
+        end
+        changes.counters_reset = true
+    end
+    local en2 = ctl and ctl:get("reject_rules_enabled")
+    if en2 == nil then en2 = default_en and 1 or 0 end
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cjson_dbg.encode({
+        route   = opts.route_name,
+        ok      = true,
+        changes = changes,
+        enabled = en2 == 1,
+    }))
+end

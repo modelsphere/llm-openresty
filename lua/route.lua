@@ -147,6 +147,17 @@ function _G.register_route(name, opts_factory)
     opts.tps_window                = opts.tps_window                or _G.TPS_WINDOW
     opts.tps_min_tokens            = opts.tps_min_tokens            or 16
     opts.tps_min_decode_s          = opts.tps_min_decode_s          or 0.5
+    -- ── 规则化请求拒绝(reject_rules,按请求内容匹配 → 可配 status,默认 429)默认值 ──
+    -- opts.reject_rules 为 nil 时天然 opt-in(该路由不启用);配了则由 validate_reject_rules 校验+归一
+    --   (丢弃非法规则、补 name/status 默认),存回 opts.reject_rules。命中逻辑见 lua/reject_rules.lua。
+    -- 热切开关复用 cch_ctl_dict 的 "reject_rules_enabled"(见 eval_reject_rules / dbg_reject_rules_toggle)。
+    opts.reject_rules_status       = opts.reject_rules_status       or _G.REJECT_RULES_DEFAULT_STATUS or 429
+    if type(opts.reject_rules_status) ~= "number" or opts.reject_rules_status < 400 or opts.reject_rules_status > 599 then
+        ngx.log(ngx.ERR, "[", name, "] reject_rules_status=", tostring(opts.reject_rules_status), " 非法(需 400-599)— 回退 429")
+        opts.reject_rules_status = 429
+    end
+    if opts.reject_rules_default_enabled == nil then opts.reject_rules_default_enabled = _G.REJECT_RULES_DEFAULT_ENABLED end
+    opts.reject_rules              = _G.validate_reject_rules(name, opts.reject_rules)
     -- ── 自适应并发(AIMD;配 tps_limit_tps 默认开,与 TPS 硬熔断互斥)默认值 ──
     -- adaptive_cc=true 时:复用 TPS EWMA 当反馈信号,每 adaptive_cc_interval 调一次池并发上限——
     --   EWMA < 阈值(tps_limit_tps/by_model/override)→ ×dec(减);>= → ×inc(增);clamp 在 [min,静态max]。
