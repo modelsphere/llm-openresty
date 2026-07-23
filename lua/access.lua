@@ -1,7 +1,16 @@
 -- openresty/lua/access.lua
 -- do_route / do_log_release / do_balancer
+-- 三个入口(do_route/do_log_release/do_balancer)被 router_locations.inc 的 *_by_lua_block
+-- 直调 → 仍挂 _G。其余引擎函数从各模块 require 取(access 加载序在它们之后,无环)。
 
-local cjson = require "cjson.safe"
+local cjson        = require "cjson.safe"
+local util         = require "util"
+local route        = require "route"
+local reject_rules = require "reject_rules"
+local ttft         = require "ttft"
+local tps          = require "tps"
+local bodylog      = require "bodylog"
+local reqtransform = require "reqtransform"
 
 -- ══════════════════════════════════════════════════════════════════════
 -- _G.do_route(opts) — access_by_lua_block 主体（参数化路由选址）
@@ -9,7 +18,7 @@ local cjson = require "cjson.safe"
 
 function _G.do_route(opts)
     -- H1: nil opts 防御（register_route 失败 / set $route 名不匹配时返清晰 500，而非 nil index 崩）
-    if _G.opts_missing(opts) then
+    if util.opts_missing(opts) then
         ngx.log(ngx.ERR, "do_route: opts is nil — route not registered? check register_route factory / set $route")
         return ngx.exit(500)
     end
@@ -32,7 +41,7 @@ function _G.do_route(opts)
     -- 门控在 peers_by_model → 老格式(flat peers)不拦截,继续往下 proxy 到后端,
     -- /v1/models 行为完全不变。放在鉴权之后 → 自带鉴权。
     if opts.peers_by_model and ngx.var.uri == "/v1/models" then
-        return _G.serve_models(opts)
+        return route.serve_models(opts)
     end
 
     -- 探测类请求(健康探测 /v1/models、/health)不进限流:探测不是推理,不该被并发/TTFT/TPS
@@ -48,9 +57,9 @@ function _G.do_route(opts)
     local dict      = ngx.shared[opts.active_conns_dict]
 
     -- bodylog 必须在 prepare_request 之前抓 body
-    _G.bodylog_capture_request(opts)
-    local sid, src = prepare_request(opts)
-    sid, src = _G.affinity_gate(opts, sid, src)   -- 亲和性总开关:关则丢 sid → least_conn
+    bodylog.bodylog_capture_request(opts)
+    local sid, src = reqtransform.prepare_request(opts)
+    sid, src = route.affinity_gate(opts, sid, src)   -- 亲和性总开关:关则丢 sid → least_conn
     ngx.ctx.session_id     = sid
     ngx.ctx.session_source = src or "none"
 
@@ -58,15 +67,15 @@ function _G.do_route(opts)
     -- 按请求内容(max_tokens/stream/input_bytes/...)匹配规则,命中即返回可配 status(默认 429)。
     -- 放在池评估之前:规则拒绝不该消耗池评估。命中时 eval_reject_rules 内部 ngx.exit 直接结束请求;
     -- 未配 reject_rules 的路由 no-op(零行为变化)。探测请求(/v1/models、/health)不评估。
-    if not is_probe then _G.eval_reject_rules(opts) end
+    if not is_probe then reject_rules.eval_reject_rules(opts) end
 
     -- 新格式 peers_by_model：按 body.model 选子池，重绑 peers/peer_keys。
     -- 未知/缺失 model → 400 + supported 列表（严格拒绝，不 fallback）。
     -- 老格式（无 peers_by_model）跳过，peers 仍是 opts.peers，行为不变。
-    -- 注:GET /v1/models 已在上方(鉴权后)由 _G.serve_models 早返,不会到这里;故列模型不受此 400 影响。
+    -- 注:GET /v1/models 已在上方(鉴权后)由 route.serve_models 早返,不会到这里;故列模型不受此 400 影响。
     if opts.peers_by_model then
         local pk
-        peers, peer_keys, pk = _G.resolve_pool(opts, ngx.ctx.req_model)
+        peers, peer_keys, pk = route.resolve_pool(opts, ngx.ctx.req_model)
         if not peers then
             ngx.status = 400
             ngx.header["Content-Type"] = "application/json"
@@ -87,7 +96,7 @@ function _G.do_route(opts)
 
     -- 评估池(无锁;与 dbg 共用 assess_pool)。先判 503/429,过载时直接返回,
     -- 不进入带锁的 pick → least_conn 锁不会上过载路径。
-    local a = _G.assess_pool(opts, peers, peer_keys)
+    local a = route.assess_pool(opts, peers, peer_keys)
     -- 全部 banned → 503
     if a.empty then
         ngx.status = 503
@@ -108,7 +117,7 @@ function _G.do_route(opts)
     -- ⚠️ 仅当 tps 特性生效(a.tps_on)才套 min 起步:__off/_G.TPS_ENABLED 关时 tps_on=false →
     -- 保持 pool_limit(统一关掉 tps 限流 = 回满容量,不能反而掉到 min)。
     if opts.adaptive_cc and a.tps_on then
-        local mincc = _G.derive_mincc(opts, _G.compute_static_max_cc(opts,
+        local mincc = route.derive_mincc(opts, route.compute_static_max_cc(opts,
             opts.peers_by_model and ngx.ctx.req_model or nil))
         limit = math.min(a.adaptive_cc or mincc, pool_limit)
         -- 把已算好的实时并发 a.rt_sum(全 peer 含 banned 的真实在途,与下方 hit_rt 判 429 同一个值)存给 timer:
@@ -154,9 +163,9 @@ function _G.do_route(opts)
     -- ── TTFT 主限流(按路由 opt-in:ttft_limit_ms 未配则整段跳过,行为零变化)──
     -- EWMA 超阈值进入限流态,但走半开探测:本窗口探测名额内的请求放行(继续测 TTFT),
     -- 其余 429。后端恢复 → 探测样本拉低 EWMA → 自动解除。
-    local ttft_limit = _G.ttft_limit_for(opts)   -- 按模型解析(peers_by_model 可每模型不同)
+    local ttft_limit = ttft.ttft_limit_for(opts)   -- 按模型解析(peers_by_model 可每模型不同)
     local hit_ttft = ttft_limit and a.ttft_ewma and a.ttft_ewma >= ttft_limit
-    if hit_ttft and not is_probe and not _G.ttft_allow_probe(opts) then
+    if hit_ttft and not is_probe and not ttft.ttft_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":ttft",1,0) end end
         ngx.header["Content-Type"] = "application/json"
@@ -169,9 +178,9 @@ function _G.do_route(opts)
     -- ── TPS 主限流(opt-in:tps_limit_tps 未配 → tps_dict_if_on nil → a.tps_ewma nil → 跳过)──
     -- 方向与 TTFT 相反:EWMA <= 下限 进入限流态(解码速率太低=后端过载),半开探测机制同 TTFT。
     -- ⚠️ 与自适应并发互斥:adaptive_cc=true 时该 EWMA 已用于动态调 limit(上面并发 gate),这里跳过硬 429。
-    local tps_limit = (not opts.adaptive_cc) and _G.tps_limit_for(opts) or nil
+    local tps_limit = (not opts.adaptive_cc) and tps.tps_limit_for(opts) or nil
     local hit_tps = tps_limit and a.tps_ewma and a.tps_ewma <= tps_limit
-    if hit_tps and not is_probe and not _G.tps_allow_probe(opts) then
+    if hit_tps and not is_probe and not tps.tps_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":tps",1,0) end end
         ngx.header["Content-Type"] = "application/json"
@@ -182,7 +191,7 @@ function _G.do_route(opts)
         return ngx.exit(429)
     end
     -- 通过容量后才做带锁选址(与 dbg 共用 pick_from)
-    local chosen_hp, mode = _G.pick_from(opts, a, sid)
+    local chosen_hp, mode = route.pick_from(opts, a, sid)
     local peer_key  = chosen_hp[4] or (chosen_hp[1] .. ":" .. chosen_hp[2])
     dict:incr(peer_key, 1, 0)
 
@@ -242,14 +251,14 @@ function _G.do_log_release(opts)
     -- TTFT 入账(ttft_window 秒窗口直方图 → 每窗口 P80 折进 EWMA;总开关关 / dict 未声明则跳过=特性关)。
     -- 只采流式 + 2xx + 有首-chunk 计时的请求(含半开探测放行的请求)。
     -- 窗口边界 lazy 折叠;EWMA 带 TTL 做无流量自愈(流量停 → 过期 → assess_pool 读 nil → 放行)。
-    local td = _G.ttft_dict_if_on(opts)
+    local td = ttft.ttft_dict_if_on(opts)
     if td and ngx.ctx.ttft_is_stream and ngx.ctx.ttft_first_chunk_t
        and ngx.status and ngx.status >= 200 and ngx.status < 300 then
-        _G.ttft_record(opts, td, ngx.ctx.ttft_first_chunk_t * 1000)   -- 秒 → 毫秒
+        ttft.ttft_record(opts, td, ngx.ctx.ttft_first_chunk_t * 1000)   -- 秒 → 毫秒
     end
     -- TPS 入账:只采流式 + 2xx + 有首-chunk 计时。从尾缓冲 parse completion_tokens;
     -- 拿不到(no-usage)→ fail-open:不采样、不进 EWMA、绝不因此限流(只 incr nousage 计数做可观测)。
-    local tpd = _G.tps_dict_if_on(opts)
+    local tpd = tps.tps_dict_if_on(opts)
     if tpd and ngx.ctx.ttft_is_stream and ngx.ctx.ttft_first_chunk_t
        and ngx.status and ngx.status >= 200 and ngx.status < 300 then
         local ctok
@@ -265,13 +274,13 @@ function _G.do_log_release(opts)
             -- 解码时间下限:< tps_min_decode_s 的短快响应(如 16 token / 3ms → 5000 tok/s)解码速率
             -- 失真,不能代表稳态吞吐,直接跳过(不采样、不计 nousage)。配合 tps_min_tokens 双重滤噪。
             if decode >= opts.tps_min_decode_s then
-                _G.tps_record(opts, tpd, ctok / decode)   -- tokens / 解码秒数
+                tps.tps_record(opts, tpd, ctok / decode)   -- tokens / 解码秒数
             end
         elseif not ctok then
-            tpd:incr(_G.tps_key_prefix(opts) .. "nousage", 1, 0, opts.tps_ttl)  -- 可观测:无 usage 样本数
+            tpd:incr(tps.tps_key_prefix(opts) .. "nousage", 1, 0, opts.tps_ttl)  -- 可观测:无 usage 样本数
         end
     end
-    _G.bodylog_finalize(opts)
+    bodylog.bodylog_finalize(opts)
 end
 
 -- ══════════════════════════════════════════════════════════════════════

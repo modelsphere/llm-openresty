@@ -1,5 +1,9 @@
 -- openresty/lua/ttft.lua
 -- TTFT 限流(池级 EWMA + 窗口 P80 + 半开探测)
+-- 跨模块函数(dict_if_on/ewma_key/limit_for/record/allow_probe)挂 M;key_prefix/bucket_index/
+-- window_p80 仅内部用 → local。TTFT_ENABLED / TTFT_BUCKETS_MS 是 config data 仍留 _G。
+
+local M = {}
 
 -- ══════════════════════════════════════════════════════════════════════
 -- TTFT 限流辅助：EWMA key 派生 + 半开探测令牌窗口
@@ -10,7 +14,7 @@
 --   ② 路由没声明 ttft_stat dict(未 opt-in)
 --   ③ 运行时热关:ttft_dict 里 "__off" 被 /_ttft_toggle 置上(免 reload)
 
-function _G.ttft_dict_if_on(opts)
+function M.ttft_dict_if_on(opts)
     if not _G.TTFT_ENABLED then return nil end
     local td = ngx.shared[opts.ttft_dict]
     if not td then return nil end
@@ -20,7 +24,7 @@ end
 
 -- key 前缀:"<route>:" +(peers_by_model 时再加 "<model>:")。所有路由共用一份 ttft_stat dict,
 -- 故必须带 route 前缀防跨路由串;peers_by_model 再按 model 子池隔离。EWMA / 探测计数共用此前缀。
-function _G.ttft_key_prefix(opts)
+local function ttft_key_prefix(opts)
     local p = (opts.route_name or "?") .. ":"
     if opts.peers_by_model then
         p = p .. (ngx.ctx.req_model or "?") .. ":"
@@ -29,15 +33,15 @@ function _G.ttft_key_prefix(opts)
 end
 
 -- EWMA key:新格式 "<model>:ewma",老格式 "ewma"(do_log_release / assess_pool / dbg 共用)。
-function _G.ttft_ewma_key(opts)
-    return _G.ttft_key_prefix(opts) .. "ewma"
+function M.ttft_ewma_key(opts)
+    return ttft_key_prefix(opts) .. "ewma"
 end
 
 -- 解析本请求该用的 TTFT 阈值(ms):优先级
 --   ① peers_by_model 路由 + 配了 ttft_limit_by_model[<model>] → 该模型专属阈值
 --   ② opts.ttft_limit_ms(路由级默认;register_route 里已 fallback 到全局 _G.TTFT_LIMIT_MS)
 -- 这样同一 peers_by_model 路由内每个模型可配不同阈值(机型/模型基线不同)。
-function _G.ttft_limit_for(opts)
+function M.ttft_limit_for(opts)
     -- 在线 override(共享字典,跨 worker 一致,优先级最高;免 reload,见 /_ttft_limit)
     --   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)
     local td = ngx.shared[opts.ttft_dict]
@@ -58,14 +62,14 @@ function _G.ttft_limit_for(opts)
 end
 
 -- 样本 → 直方图桶号(1..#buckets+1,最后一个是 overflow)
-function _G.ttft_bucket_index(ms)
+local function ttft_bucket_index(ms)
     local b = _G.TTFT_BUCKETS_MS
     for i = 1, #b do if ms <= b[i] then return i end end
     return #b + 1
 end
 
 -- 从窗口 w 的直方图算 P80(累计越过 80% 的桶上界);空窗返 nil。
-function _G.ttft_window_p80(td, pre, w)
+local function ttft_window_p80(td, pre, w)
     local b = _G.TTFT_BUCKETS_MS
     local n = #b
     local counts, total = {}, 0
@@ -85,10 +89,10 @@ end
 -- TTFT 样本入账:每 ttft_window 秒一个窗口,窗口内只对预定义桶 incr(原子,无锁);
 -- 跨入新窗口时 lazy 折叠已完成窗口——取该窗口 P80 折进 EWMA(α·P80 + (1-α)·旧)。
 -- dict:add 原子占位保证每窗口只折一次(免锁);长空档直接跳过(那段无流量,ewma 靠 TTL 过期)。
-function _G.ttft_record(opts, td, sample_ms)
+function M.ttft_record(opts, td, sample_ms)
     local W   = opts.ttft_window
     local win = math.floor(ngx.now() / W)
-    local pre = _G.ttft_key_prefix(opts)
+    local pre = ttft_key_prefix(opts)
     local ttl = opts.ttft_ttl
     local lastk = pre .. "ewin"
     local last = td:get(lastk)
@@ -103,7 +107,7 @@ function _G.ttft_record(opts, td, sample_ms)
         if win - last > horizon then last = win - horizon end
         for w = last, win - 1 do
             if td:add(pre .. "fd:" .. w, 1, ttl) then -- 占位:本 worker 折窗口 w(锁活满折叠地平线=ttl)
-                local p80 = _G.ttft_window_p80(td, pre, w)
+                local p80 = ttft_window_p80(td, pre, w)
                 if p80 then
                     local old = td:get(pre .. "ewma")
                     local a   = opts.ttft_ewma_alpha
@@ -115,7 +119,7 @@ function _G.ttft_record(opts, td, sample_ms)
         td:set(lastk, win, ttl)
     end
     -- 第 4 参 init_ttl=ttl:给直方图桶设过期,ewin 空档过期/竞态漏折时孤儿桶自愈,不在共享字典里堆积
-    td:incr(pre .. "h:" .. win .. ":" .. _G.ttft_bucket_index(sample_ms), 1, 0, ttl)
+    td:incr(pre .. "h:" .. win .. ":" .. ttft_bucket_index(sample_ms), 1, 0, ttl)
 end
 
 -- 半开探测(circuit-breaker half-open)：限流态下不 100% 拒,每个时间窗口放行
@@ -125,11 +129,11 @@ end
 -- incr 原子计数,无锁。返回 true=放行探测,false=该 429。
 -- 配额 key 带 per-model 前缀:peers_by_model 路由下每个模型各有独立 N/窗口,
 -- 多模型同时过载时互不抢探测名额(与 EWMA 同样按子池隔离)。
-function _G.ttft_allow_probe(opts)
+function M.ttft_allow_probe(opts)
     local td = ngx.shared[opts.ttft_dict]
     if not td then return true end   -- dict 没声明(不该到这),稳妥放行
     local win = math.floor(ngx.now() / opts.ttft_probe_window)
-    local key = _G.ttft_key_prefix(opts) .. "probe:" .. win
+    local key = ttft_key_prefix(opts) .. "probe:" .. win
     local n = td:incr(key, 1, 0)
     -- dict 满/OOM 时 incr 返 nil：fail-open(放行)而不是 `nil <= N` 崩成 500。
     -- dict 满本身是病态(EWMA set 也会失败→TTL 过期→自动退出限流态),放行无害。
@@ -137,3 +141,5 @@ function _G.ttft_allow_probe(opts)
     if n == 1 then td:expire(key, opts.ttft_probe_window * 2) end  -- 旧窗口 key 自动回收
     return n <= opts.ttft_probe_per_window
 end
+
+return M

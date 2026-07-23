@@ -1,7 +1,15 @@
 -- openresty/lua/debug_endpoints.lua
 -- 全部 _G.dbg_*:调试 / 热开关 endpoint 实现
+-- dbg_* 由 router_locations.inc 的 content_by_lua_block 直调 → 仍挂 _G;
+-- 内部用到的引擎函数从各模块 require 取(debug 加载序最后,无环)。
 
-local cjson_dbg = require "cjson.safe"
+local cjson_dbg    = require "cjson.safe"
+local util         = require "util"
+local route        = require "route"
+local ttft         = require "ttft"
+local tps          = require "tps"
+local bodylog      = require "bodylog"
+local reqtransform = require "reqtransform"
 
 -- ══════════════════════════════════════════════════════════════════════
 -- _G.dbg_* — 调试 endpoint 实现（参数化，所有路由共享）
@@ -10,7 +18,7 @@ local cjson_dbg = require "cjson.safe"
 
 function _G.dbg_health_status(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     -- M1: peers={} 防御（K2.6 默认空 peers 时调试 endpoint 不崩）
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
@@ -33,7 +41,7 @@ end
 
 function _G.dbg_active_conns(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     -- M1: peers={} 防御（K2.6 默认空 peers 时调试 endpoint 不崩）
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
@@ -52,7 +60,7 @@ end
 
 function _G.dbg_cluster_avg(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     -- M1: peers={} 防御（K2.6 默认空 peers 时调试 endpoint 不崩）
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
@@ -70,7 +78,7 @@ function _G.dbg_cluster_avg(opts)
     for i = 0, 9 do
         buckets[tostring(i)] = ca:get(tostring(i))
     end
-    local _, samples, avg = _G.compute_cluster_avg(opts.cluster_avg_dict)
+    local _, samples, avg = route.compute_cluster_avg(opts.cluster_avg_dict)
     ngx.header["Content-Type"] = "application/json"
     ngx.say(cjson_dbg.encode({
         route          = opts.route_name,
@@ -86,7 +94,7 @@ end
 --   global_enabled=_G.TTFT_ENABLED;runtime_off=本路由热关;active=两开关都开且 dict 声明;
 --   enforcing=active 且配了 ttft_limit_ms。active=false 即完全旧逻辑。
 function _G.dbg_ttft_status(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.ttft_dict]   -- 原始 handle(用于展示,即便热关也能看 EWMA)
     local rp = (opts.route_name or "?") .. ":"   -- route 前缀(共享 dict)
@@ -98,7 +106,7 @@ function _G.dbg_ttft_status(opts)
             ewmas["_"] = td:get(rp .. "ewma")
         end
     end
-    local active = _G.ttft_dict_if_on(opts) and true or false
+    local active = ttft.ttft_dict_if_on(opts) and true or false
     local win = td and math.floor(ngx.now() / opts.ttft_probe_window) or 0
     ngx.say(cjson_dbg.encode({
         route                 = opts.route_name,
@@ -121,7 +129,7 @@ end
 -- POST /_ttft_toggle?on=0 → 关本路由 TTFT(写 ttft_dict 的 "__off",免 reload);
 --      on=1 → 开(删 "__off")。仅 127.0.0.1。全局 _G.TTFT_ENABLED=false 时此开关无意义(已全关)。
 function _G.dbg_ttft_toggle(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.ttft_dict]
     if not td then
@@ -143,7 +151,7 @@ function _G.dbg_ttft_toggle(opts)
         route = opts.route_name, ok = true,
         global_enabled = _G.TTFT_ENABLED and true or false,
         runtime_off    = td:get(offk) and true or false,
-        active         = _G.ttft_dict_if_on(opts) and true or false,
+        active         = ttft.ttft_dict_if_on(opts) and true or false,
     }))
 end
 
@@ -154,7 +162,7 @@ end
 -- GET  /_ttft_limit?ms=0 [&model=X]  → 清除 override(回落静态默认)
 -- 注意:override 存共享字典、无 TTL,会跨 reload 存活;改 conf 默认值要同时清 override 才生效。
 function _G.dbg_ttft_limit(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.ttft_dict]
     if not td then
@@ -187,7 +195,7 @@ end
 -- ── TPS 限流观测/管理端点(镜像 dbg_ttft_*)──
 -- GET /_tps_status:总开关 + 各池 EWMA(tokens/sec)+ 下限 + 本窗口探测名额 + nousage 漏采计数。
 function _G.dbg_tps_status(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.tps_dict]   -- 原始 handle(即便热关也能看 EWMA)
     local rp = (opts.route_name or "?") .. ":"
@@ -200,11 +208,11 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_conc, adaptive_cc_at_pressure, adaptive_cc_at_slack, adaptive_cc_rej = {}, {}, {}, {}
         local ABS = opts.adaptive_cc_abs or 0
         local function fill_cc(mkey, model)
-            local maxcc = _G.compute_static_max_cc(opts, model)
+            local maxcc = route.compute_static_max_cc(opts, model)
             adaptive_cc_max[mkey] = maxcc
             -- 生效 min:derive_mincc 统一派生(与 do_route/do_adaptive_cc_loop 同 base+钳到 max),报告==强制
-            adaptive_cc_min[mkey] = _G.derive_mincc(opts, maxcc)
-            local pfx = _G.tps_key_prefix(opts, model)            -- 统一走 helper
+            adaptive_cc_min[mkey] = route.derive_mincc(opts, maxcc)
+            local pfx = tps.tps_key_prefix(opts, model)            -- 统一走 helper
             local cc  = td and td:get(pfx .. "adaptive_cc") or nil
             local rts = td and td:get(pfx .. "rt_sum") or nil     -- timer 判压力用的实时并发(nil=无近期流量)
             adaptive_cc[mkey]      = cc
@@ -234,7 +242,7 @@ function _G.dbg_tps_status(opts)
             nousage["_"] = td:get(rp .. "nousage") or 0
         end
     end
-    local active = _G.tps_dict_if_on(opts) and true or false
+    local active = tps.tps_dict_if_on(opts) and true or false
     local win = td and math.floor(ngx.now() / opts.tps_probe_window) or 0
     ngx.say(cjson_dbg.encode({
         route                 = opts.route_name,
@@ -294,8 +302,8 @@ function _G.dbg_429_status(opts)
             rj:flush_all()
         else
             for _, k in ipairs(rj:get_keys(0)) do        -- 只清本 route 的 key,不动别的路由
-                local route = k:match("^(.*):[^:]+$")
-                if route == want then rj:delete(k) end
+                local rname = k:match("^(.*):[^:]+$")    -- 不叫 route:避免遮蔽顶层 route 模块 handle
+                if rname == want then rj:delete(k) end
             end
         end
         ngx.say(cjson_dbg.encode({ reset = true, scope = show_all and "all" or want }))
@@ -303,11 +311,11 @@ function _G.dbg_429_status(opts)
     end
     local by_route, by_reason, total = {}, {concurrency=0, ttft=0, tps=0}, 0
     for _, k in ipairs(rj:get_keys(0)) do
-        local route, reason = k:match("^(.*):([^:]+)$")
-        if route and reason and (show_all or route == want) then
+        local rname, reason = k:match("^(.*):([^:]+)$")
+        if rname and reason and (show_all or rname == want) then
             local v = rj:get(k) or 0
-            by_route[route] = by_route[route] or {concurrency=0, ttft=0, tps=0}
-            by_route[route][reason] = (by_route[route][reason] or 0) + v
+            by_route[rname] = by_route[rname] or {concurrency=0, ttft=0, tps=0}
+            by_route[rname][reason] = (by_route[rname][reason] or 0) + v
             by_reason[reason]       = (by_reason[reason] or 0) + v
             total = total + v
         end
@@ -324,7 +332,7 @@ end
 
 -- POST /_tps_toggle?on=0 → 关本路由 TPS(写 tps_dict 的 "__off",免 reload);on=1 → 开。仅 127.0.0.1。
 function _G.dbg_tps_toggle(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.tps_dict]
     if not td then
@@ -346,7 +354,7 @@ function _G.dbg_tps_toggle(opts)
         route = opts.route_name, ok = true,
         global_enabled = _G.TPS_ENABLED and true or false,
         runtime_off    = td:get(offk) and true or false,
-        active         = _G.tps_dict_if_on(opts) and true or false,
+        active         = tps.tps_dict_if_on(opts) and true or false,
     }))
 end
 
@@ -356,7 +364,7 @@ end
 -- GET /_tps_limit?tps=80&model=X   → 设某模型下限(仅 peers_by_model 路由)
 -- GET /_tps_limit?tps=0 [&model=X] → 清除 override(回落静态默认)
 function _G.dbg_tps_limit(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.tps_dict]
     if not td then
@@ -366,9 +374,9 @@ function _G.dbg_tps_limit(opts)
     end
     local model = ngx.var.arg_model
     local k = (opts.route_name or "?") .. ":" .. (model and (model .. ":") or "") .. "limit_override"
-    local tps = ngx.var.arg_tps
-    if tps then
-        local n = tonumber(tps)
+    local arg_tps = ngx.var.arg_tps   -- ⚠️ 不能命名 tps:会遮蔽顶层 `local tps = require "tps"`(下方 tps.tps_dict_if_on)
+    if arg_tps then
+        local n = tonumber(arg_tps)
         if not n or n < 0 then
             ngx.status = 400
             ngx.say(cjson_dbg.encode({ ok = false, error = "use ?tps=0 清除 | ?tps=<正数> 设下限 [&model=X]" }))
@@ -383,7 +391,7 @@ function _G.dbg_tps_limit(opts)
     ngx.say(cjson_dbg.encode({
         route              = opts.route_name, ok = true,
         model              = model or nil,
-        enforcing          = (opted_in and _G.tps_dict_if_on(opts)) and true or false,
+        enforcing          = (opted_in and tps.tps_dict_if_on(opts)) and true or false,
         warning            = (not opted_in)
             and "route NOT opted in — set static tps_limit_tps in factory + reload; this override alone does nothing"
             or nil,
@@ -396,7 +404,7 @@ end
 
 function _G.dbg_active_conns_set(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local args = ngx.req.get_uri_args()
     local dict = ngx.shared[opts.active_conns_dict]
     local resp = { ok = true, route = opts.route_name }
@@ -425,7 +433,7 @@ end
 
 function _G.dbg_route_debug(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     -- M1: peers={} 防御（K2.6 默认空 peers 时调试 endpoint 不崩）
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
@@ -435,7 +443,7 @@ function _G.dbg_route_debug(opts)
     end
     local sid = ngx.var.arg_sid or "default"
     -- 新格式 peers_by_model：用 ?model=<id> 选子池(与 do_route 共用 resolve_pool)
-    local peers, peer_keys, sup = _G.resolve_pool(opts, ngx.var.arg_model)
+    local peers, peer_keys, sup = route.resolve_pool(opts, ngx.var.arg_model)
     if not peers then
         ngx.header["Content-Type"] = "application/json"
         ngx.say(cjson_dbg.encode({ route = opts.route_name, error = "model_not_supported",
@@ -446,7 +454,7 @@ function _G.dbg_route_debug(opts)
     -- natural_target:rendezvous 在「全部 peer(含 banned)」上的理想目标(解释 hash 数学用)
     local full = {}
     for i, p in ipairs(peers) do full[i] = {p[1], p[2], i, peer_keys[i]} end
-    local natural_idx, natural_h = _G.pick_rendezvous(sid, full)
+    local natural_idx, natural_h = util.pick_rendezvous(sid, full)
     local natural_banned = false
     if peers[natural_idx] then
         natural_banned = bad:get(peer_keys[natural_idx]) and true or false
@@ -456,12 +464,12 @@ function _G.dbg_route_debug(opts)
     -- #5: 让 assess_pool 里的 ttft_ewma_key 能按 model 取对(dbg 用 ?model= 选池;
     -- 不设则 peers_by_model 路由的 EWMA 落到 "?:ewma" 显示 nil)
     ngx.ctx.req_model = ngx.var.arg_model
-    local a = _G.assess_pool(opts, peers, peer_keys)
+    local a = route.assess_pool(opts, peers, peer_keys)
     -- actual_pick 反映真实路由:亲和性关则丢 sid(natural_* 仍用原 sid 展示 hash 数学)
-    local actual_sid = _G.affinity_gate(opts, sid, nil)
+    local actual_sid = route.affinity_gate(opts, sid, nil)
     local actual_name, actual_mode, actual_h
     if not a.empty then
-        local chosen_hp, m, h = _G.pick_from(opts, a, actual_sid)
+        local chosen_hp, m, h = route.pick_from(opts, a, actual_sid)
         actual_name = chosen_hp and peers[chosen_hp[3]][3] or nil
         actual_mode, actual_h = m, h
     end
@@ -493,7 +501,7 @@ end
 
 function _G.dbg_route_inspect(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     -- M1: peers={} 防御（K2.6 默认空 peers 时调试 endpoint 不崩）
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
@@ -502,24 +510,24 @@ function _G.dbg_route_inspect(opts)
         return
     end
     ngx.ctx.route_opts = opts   -- 让 prepare_request 拿到本路由的 cch_ctl
-    local sid, src = prepare_request(opts)
-    sid, src = _G.affinity_gate(opts, sid, src)   -- 与 do_route 一致:亲和性关则丢 sid
+    local sid, src = reqtransform.prepare_request(opts)
+    sid, src = route.affinity_gate(opts, sid, src)   -- 与 do_route 一致:亲和性关则丢 sid
     -- 与 do_route 共用 resolve_pool + assess_pool + pick_from:dbg 看到的 pick 与真实路由一致
-    local peers, peer_keys, sup = _G.resolve_pool(opts, ngx.ctx.req_model)
+    local peers, peer_keys, sup = route.resolve_pool(opts, ngx.ctx.req_model)
     if not peers then
         ngx.header["Content-Type"] = "application/json"
         ngx.say(cjson_dbg.encode({ route = opts.route_name, session_id = sid, source = src or "none",
             error = "model_not_supported", model = ngx.ctx.req_model, supported_models = sup }))
         return
     end
-    local a = _G.assess_pool(opts, peers, peer_keys)
+    local a = route.assess_pool(opts, peers, peer_keys)
     if a.empty then
         ngx.status = 503
         ngx.header["Content-Type"] = "application/json"
         ngx.say(string.format([[{"error":"all peers banned, no healthy upstream","route":"%s"}]], opts.route_name))
         return
     end
-    local chosen_hp, mode, hash = _G.pick_from(opts, a, sid)
+    local chosen_hp, mode, hash = route.pick_from(opts, a, sid)
     local pick = chosen_hp and peers[chosen_hp[3]][3] or nil
     ngx.header["X-Routed-Active-Level"] = tostring(a.active_level)
     ngx.header["Content-Type"] = "application/json"
@@ -537,10 +545,10 @@ end
 
 function _G.dbg_cch_test(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.ctx.route_opts = opts
-    _G.bodylog_capture_request(opts)
-    local sid, src = prepare_request(opts)
+    bodylog.bodylog_capture_request(opts)
+    local sid, src = reqtransform.prepare_request(opts)
     ngx.req.read_body()
     local body_after = ngx.req.get_body_data()
     if not body_after then
@@ -569,7 +577,7 @@ end
 
 function _G.dbg_route_state(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     -- M1: peers={} 防御（K2.6 默认空 peers 时调试 endpoint 不崩）
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
@@ -620,7 +628,7 @@ end
 
 function _G.dbg_bodylog_status(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local logger = require "resty.logger.socket"
     local ctl = ngx.shared[opts.bodylog_ctl_dict]
     local default_en = opts.bodylog_default_enabled
@@ -646,7 +654,7 @@ end
 
 function _G.dbg_bodylog_toggle(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local args = ngx.req.get_uri_args()
     local ctl = ngx.shared[opts.bodylog_ctl_dict]
     local default_en = opts.bodylog_default_enabled
@@ -677,7 +685,7 @@ end
 
 function _G.dbg_cch_strip_status(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local default_en = opts.cch_default_enabled
     if default_en == nil then default_en = _G.CCH_STRIP_DEFAULT_ENABLED end
@@ -699,7 +707,7 @@ end
 
 function _G.dbg_cch_strip_toggle(opts)
     -- H1: nil opts 防御
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local args = ngx.req.get_uri_args()
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local default_en = opts.cch_default_enabled
@@ -729,7 +737,7 @@ end
 -- 切换 Kimi tool_call_id 规范化开关 + 重置计数器。
 -- 状态写入 ngx.shared[opts.cch_ctl_dict] 复用同一 dict，key=kimi_normalize_enabled。
 function _G.dbg_kimi_normalize_toggle(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local args = ngx.req.get_uri_args()
     local ctl = ngx.shared[opts.cch_ctl_dict]
     -- 默认态取 per-route（factory 可配 false 永久关），与 prepare_request 一致;缺省回落全局。
@@ -768,7 +776,7 @@ end
 -- 仅对 peers_by_model 路由的 stream 请求生效,补 stream_options.include_usage=true。
 -- 承重转换(关了新格式 stream 拿不到 usage),故无 per-route factory 默认位、只有全局默认开 + 紧急关。
 function _G.dbg_include_usage_toggle(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local args = ngx.req.get_uri_args()
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local changes = {}
@@ -822,7 +830,7 @@ end
 
 -- GET /_reject_rules_status → 列出本路由已配规则 + 当前 enabled 态 + 各规则命中数。
 function _G.dbg_reject_rules_status(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local default_en = opts.reject_rules_default_enabled
@@ -855,7 +863,7 @@ end
 -- POST /_reject_rules_toggle?on=0|1[&reset=1] → 热切本路由规则总开关 / 重置命中计数。
 -- 状态写 ngx.shared[opts.cch_ctl_dict] key "reject_rules_enabled"(复用 cch_ctl,跨 reload 持久)。
 function _G.dbg_reject_rules_toggle(opts)
-    if _G.opts_missing(opts) then return end
+    if util.opts_missing(opts) then return end
     local args = ngx.req.get_uri_args()
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local default_en = opts.reject_rules_default_enabled

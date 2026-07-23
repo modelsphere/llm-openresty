@@ -1,7 +1,18 @@
 -- openresty/lua/route.lua
 -- register_route + 池解析/评估 + pick_from + affinity_gate + cluster_avg
+-- 引擎函数收敛到返回的 M(register_route 仍挂 _G:被 per-model conf 的 set_by_lua 直调)。
+-- 依赖:util/reject_rules/ttft/tps 都无环(ttft/tps 是叶子,只反向出现在注释里)→ 顶层 require。
+-- 仅 timers 真反向 require 本模块(compute_static_max_cc/derive_mincc)且 register_route 又调 timers.do_*_loop
+-- → route↔timers 成环 → 只对 timers 用函数内 lazy require 破环(register_route 在 init 期调,全模块已载好)。
+
+local M = {}
 
 local cjson = require "cjson.safe"
+local util  = require "util"
+local reject_rules = require "reject_rules"
+local ttft  = require "ttft"
+local tps   = require "tps"
+local timers   -- route↔timers 真环:延后到 register_route 首次用时 lazy require
 
 -- 5min 滑动窗口 cluster_avg 聚合：返回 (sum, samples, avg)
 -- - sum     = 10 个 30s 桶累加（缺失桶按 0 计入和，n 不增）
@@ -11,7 +22,7 @@ local cjson = require "cjson.safe"
 -- model 非空时读 per-model bucket（"<model>:<idx>"），用于新格式 peers_by_model
 -- 各子池独立容量；为空时读 route-wide bucket（"<idx>"），老格式行为不变。
 
-function _G.compute_cluster_avg(dict_name, model)
+function M.compute_cluster_avg(dict_name, model)
     local ca = ngx.shared[dict_name or "cluster_avg"]
     local prefix = (model ~= nil and model ~= false) and (model .. ":") or ""
     local sum, n = 0, 0
@@ -157,7 +168,7 @@ function _G.register_route(name, opts_factory)
         opts.reject_rules_status = 429
     end
     if opts.reject_rules_default_enabled == nil then opts.reject_rules_default_enabled = _G.REJECT_RULES_DEFAULT_ENABLED end
-    opts.reject_rules              = _G.validate_reject_rules(name, opts.reject_rules)
+    opts.reject_rules              = reject_rules.validate_reject_rules(name, opts.reject_rules)
     -- ── 自适应并发(AIMD;配 tps_limit_tps 默认开,与 TPS 硬熔断互斥)默认值 ──
     -- adaptive_cc=true 时:复用 TPS EWMA 当反馈信号,每 adaptive_cc_interval 调一次池并发上限——
     --   EWMA < 阈值(tps_limit_tps/by_model/override)→ ×dec(减);>= → ×inc(增);clamp 在 [min,静态max]。
@@ -273,9 +284,10 @@ function _G.register_route(name, opts_factory)
                     ngx.timer.at(RENEW_SEC, renew)
                 end
                 ngx.timer.at(RENEW_SEC, renew)
-                _G.do_health_check_loop(opts)
-                _G.do_cluster_avg_loop(opts)
-                _G.do_adaptive_cc_loop(opts)   -- 内部按 opts.adaptive_cc 自门控(未 opt-in 立即 return)
+                timers = timers or require "timers"
+                timers.do_health_check_loop(opts)
+                timers.do_cluster_avg_loop(opts)
+                timers.do_adaptive_cc_loop(opts)   -- 内部按 opts.adaptive_cc 自门控(未 opt-in 立即 return)
             else
                 -- 锁被其他 worker 持有（含老 worker 续命）；周期检查 + 必要时抢锁
                 -- 这保证 reload 后老 timer 死亡 + key TTL 过期后，新 worker 能接管
@@ -300,11 +312,11 @@ function _G.register_route(name, opts_factory)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.serve_models(opts) — 新格式聚合路由的 GET /v1/models：openresty 直接列出
+-- M.serve_models(opts) — 新格式聚合路由的 GET /v1/models：openresty 直接列出
 -- 配置的 model id(vllm 兼容格式,只含 id)。仅 do_route 在 peers_by_model 路由 +
 -- uri==/v1/models 时调用(已在 do_route 鉴权之后,自带鉴权)。老格式不调此函数。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.serve_models(opts)
+function M.serve_models(opts)
     local ids = {}
     for k in pairs(opts.peers_by_model or {}) do ids[#ids + 1] = k end
     table.sort(ids)
@@ -317,13 +329,13 @@ function _G.serve_models(opts)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.resolve_pool(opts, model) — 解析有效 peer 池
+-- M.resolve_pool(opts, model) — 解析有效 peer 池
 --   新格式 peers_by_model：按 model 选子池;命中返 (peers, peer_keys);
 --     未知/缺失 model 返 (nil, nil, supported_list)
 --   老格式：返 (opts.peers, opts.peer_keys)
 -- do_route 和 dbg_* 共用,保证选池逻辑一致(改一处即可)。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.resolve_pool(opts, model)
+function M.resolve_pool(opts, model)
     if not opts.peers_by_model then
         return opts.peers, opts.peer_keys
     end
@@ -335,12 +347,12 @@ function _G.resolve_pool(opts, model)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.assess_pool(opts, peers, peer_keys) — 只读评估(无锁、无 pick、无副作用):
+-- M.assess_pool(opts, peers, peer_keys) — 只读评估(无锁、无 pick、无副作用):
 -- 算 healthy_all / 优先级活跃层 healthy_peers / 容量 limit,rt_sum,avg_5min。
 -- 全 banned 时返 {empty=true}。do_route 用它先做 503/429 判定(锁不上 429 路径);
 -- dbg 也用它。改一处即可,选址逻辑全共享。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.assess_pool(opts, peers, peer_keys)
+function M.assess_pool(opts, peers, peer_keys)
     local bad  = ngx.shared[opts.bad_peers_dict]
     local dict = ngx.shared[opts.active_conns_dict]
     local default_max = opts.default_max
@@ -379,21 +391,21 @@ function _G.assess_pool(opts, peers, peer_keys)
     -- 无 banned 时全 peer == healthy_all,与旧行为字节等价。
     local rt_sum = 0
     for _, k in ipairs(peer_keys) do rt_sum = rt_sum + (dict:get(k) or 0) end
-    local _, _, avg_5min = _G.compute_cluster_avg(opts.cluster_avg_dict,
+    local _, _, avg_5min = M.compute_cluster_avg(opts.cluster_avg_dict,
         opts.peers_by_model and ngx.ctx.req_model or nil)
 
     -- TTFT EWMA(池级,按 model 分 key;总开关关 / dict 未声明 = nil = 不参与判定)
     local ttft_ewma
-    local td = _G.ttft_dict_if_on(opts)
+    local td = ttft.ttft_dict_if_on(opts)
     if td then
-        ttft_ewma = td:get(_G.ttft_ewma_key(opts))
+        ttft_ewma = td:get(ttft.ttft_ewma_key(opts))
     end
 
     -- TPS EWMA(解码速率,opt-in;特性关/无数据 = nil = 不参与判定,fail-open)
     local tps_ewma
-    local tpd = _G.tps_dict_if_on(opts)
+    local tpd = tps.tps_dict_if_on(opts)
     if tpd then
-        tps_ewma = tpd:get(_G.tps_ewma_key(opts))
+        tps_ewma = tpd:get(tps.tps_ewma_key(opts))
     end
 
     -- 自适应并发上限(AIMD;do_adaptive_cc_loop 每 interval 写入,带 TTL)。经 tps_dict_if_on 读:
@@ -402,7 +414,7 @@ function _G.assess_pool(opts, peers, peer_keys)
     -- 无信号 TTL 过期)→ do_route 回退到 min 慢启动。两种 nil 由 tps_on 区分(见 do_route)。
     local adaptive_cc, tps_prefix
     if tpd and opts.adaptive_cc then
-        tps_prefix  = _G.tps_key_prefix(opts)           -- 算一次,do_route stash rt_sum 复用(免热路径重算)
+        tps_prefix  = tps.tps_key_prefix(opts)           -- 算一次,do_route stash rt_sum 复用(免热路径重算)
         adaptive_cc = tpd:get(tps_prefix .. "adaptive_cc")
     end
 
@@ -417,12 +429,12 @@ function _G.assess_pool(opts, peers, peer_keys)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.compute_static_max_cc(opts, model) — 池标称容量(=静态 max 上限,无 ban 感知)。
+-- M.compute_static_max_cc(opts, model) — 池标称容量(=静态 max 上限,无 ban 感知)。
 -- 镜像 assess_pool 的 limit 算法(按优先级层 sum per-peer max、取层间最大),但从 opts 静态
 -- peer 表算(不看 bad_peers)→ 供 do_adaptive_cc_loop 当 AIMD 的 max clamp。peers_by_model
 -- 时 model 指定子池(flat 路由传 nil/false 用 opts.peers)。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.compute_static_max_cc(opts, model)
+function M.compute_static_max_cc(opts, model)
     local peers
     if opts.peers_by_model then
         peers = model and opts.peers_by_model[model] or nil
@@ -442,24 +454,24 @@ function _G.compute_static_max_cc(opts, model)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.derive_mincc(opts, maxcc) — AIMD 下限(慢启动 floor + clamp band 下界)。
+-- M.derive_mincc(opts, maxcc) — AIMD 下限(慢启动 floor + clamp band 下界)。
 -- 显式配 adaptive_cc_min 优先,否则从**静态** maxcc 派生(×min_frac,≥1),再钳到 maxcc。
 -- 统一 3 处调用(do_route / do_adaptive_cc_loop / dbg_tps_status)同一 base(静态 maxcc),
 -- 保证「报告的 min」==「强制的 min」——do_route 拿到后再用 min(., pool_limit) 做 ban 感知封顶,
 -- 不在 base 里掺 ban(否则 dbg 报的 floor 与实际强制的 floor 在 peer-ban 下会分叉)。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.derive_mincc(opts, maxcc)
+function M.derive_mincc(opts, maxcc)
     local mn = opts.adaptive_cc_min or math.max(1, math.floor(maxcc * opts.adaptive_cc_min_frac))
     if mn > maxcc then mn = maxcc end     -- 配 min>max(或 frac>1 派生越界)→ 生效 min=max
     return mn
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.pick_from(opts, a, sid) — 在 assess_pool 结果 a 上做真正选址(带锁)。
+-- M.pick_from(opts, a, sid) — 在 assess_pool 结果 a 上做真正选址(带锁)。
 -- 仅在 caller 已确认不 503/429 后调用 → least_conn 锁不会上过载路径。
 -- 返回 (chosen_hp, mode, hash)。do_route 和 dbg 共用,选址算法逐字节一致。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.pick_from(opts, a, sid)
+function M.pick_from(opts, a, sid)
     local resty_lock = require "resty.lock"
     local dict = ngx.shared[opts.active_conns_dict]
     local healthy_peers = a.healthy_peers
@@ -482,8 +494,8 @@ function _G.pick_from(opts, a, sid)
         return min_hp
     end
 
-    if _G._nonblank(sid) then
-        local best_idx, h = _G.pick_rendezvous(sid, healthy_peers)
+    if util._nonblank(sid) then
+        local best_idx, h = util.pick_rendezvous(sid, healthy_peers)
         local best_hp = healthy_peers[best_idx]
         local hashed_active = dict:get(best_hp[4]) or 0
         if hashed_active < best_hp[6] then
@@ -500,9 +512,11 @@ end
 -- opts.session_affinity_enabled 已在 register_route 里回落好(nil→_G.SESSION_AFFINITY_ENABLED),
 -- 故这里只看 opts。返回 (sid, src);关闭且原本有 sid 时返回 (nil, "affinity_off") 便于日志观测。
 -- do_route 与两个 dbg endpoint 共用此裁决,保证真实路由与调试输出一致。
-function _G.affinity_gate(opts, sid, src)
+function M.affinity_gate(opts, sid, src)
     if sid and opts and opts.session_affinity_enabled == false then
         return nil, "affinity_off"
     end
     return sid, src
 end
+
+return M

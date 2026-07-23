@@ -4,7 +4,7 @@
 --   C 多个 input_chars(5 条)—— 靠 ctx._input_chars 缓存,utf8_len 仍只算 1 次(应≈B)
 -- rule 路由比无规则路由多的就是这一整段(feature 前不跑)。
 -- 用法: resty test/bench_reject_rules.lua [lua/reject_rules.lua]
-assert(loadfile(arg[1] or "lua/reject_rules.lua"))()
+local rr = assert(loadfile(arg[1] or "lua/reject_rules.lua"))()
 local cjson = require "cjson.safe"
 
 local SETS = {
@@ -49,12 +49,12 @@ end
 local function full_us(raw, rules, M)
     for _ = 1, 200 do
         local r = cjson.decode(raw); local ctx = { req = r, body_len = #raw }
-        for _, rule in ipairs(rules) do _G.reject_rules_node_matches(rule, ctx) end
+        for _, rule in ipairs(rules) do rr.reject_rules_node_matches(rule, ctx) end
     end
     local t0 = os.clock()
     for _ = 1, M do
         local r = cjson.decode(raw); local ctx = { req = r, body_len = #raw }
-        for _, rule in ipairs(rules) do _G.reject_rules_node_matches(rule, ctx) end
+        for _, rule in ipairs(rules) do rr.reject_rules_node_matches(rule, ctx) end
     end
     return (os.clock() - t0) / M * 1e6
 end

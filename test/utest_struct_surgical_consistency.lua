@@ -2,8 +2,8 @@
 -- (surgical_normalize,raw body 字符串替换)对同一请求产出【完全相同】的 tool_call id / tool_call_id。
 -- 两者共用 _kimi_id_map,理论必然一致;此测把它钉死(尤其 /v1/messages hoist 走 struct 路径)。
 -- 用法: resty test/utest_struct_surgical_consistency.lua [lua/reqtransform.lua]
-_G._nonblank = function(s) return type(s) == "string" and s:match("%S") ~= nil end
-assert(loadfile(arg[1] or "lua/reqtransform.lua"))()
+package.loaded.util = { _nonblank = function(s) return type(s) == "string" and s:match("%S") ~= nil end }
+local rt = assert(loadfile(arg[1] or "lua/reqtransform.lua"))()
 local cjson = require "cjson"
 local M = _G.KIMI_NORMALIZE_MODELS   -- reqtransform 加载时已设置
 
@@ -35,11 +35,11 @@ end
 local function consistency(name, body)
     -- struct:normalize_kimi_tool_ids 原地改 req 表
     local req_s = cjson.decode(body)
-    _G.normalize_kimi_tool_ids(req_s)
+    rt.normalize_kimi_tool_ids(req_s)
     local ids_struct = collect_ids(req_s)
     -- surgical:surgical_normalize 产出新 body 串,再 decode 读 id
     local req_g = cjson.decode(body)
-    local newbody = _G.surgical_normalize(body, req_g, M)
+    local newbody = rt.surgical_normalize(body, req_g, M)
     local ids_surg = collect_ids(cjson.decode(newbody))
     eq(name, ids_struct, ids_surg)
 end

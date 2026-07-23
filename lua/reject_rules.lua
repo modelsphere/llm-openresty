@@ -10,7 +10,10 @@
 --       组合   { all={<node>,...} }(AND) / { any={<node>,...} }(OR)
 --       顶层再带 name / status / message(动作)。
 --   * 规则列表任一顶层规则命中即拒绝(短路,首个命中)。
---   * 全部 _G.* 导出,遵循本仓无 `return M` 约定。
+--   * 引擎函数收敛在返回的 M 上(跨模块: route 调 validate、access 调 eval;单测直读 M.*);
+--     REJECT_RULES_OPS 是内部 data 表,仍留 _G。
+
+local M = {}
 
 local cjson = require "cjson.safe"
 local ffi   = require "ffi"
@@ -68,7 +71,7 @@ local function dotpath(req, path)
     return cur
 end
 
-function _G.reject_rules_field_value(field, ctx)
+function M.reject_rules_field_value(field, ctx)
     local req = ctx.req
     if field == "input_bytes" then
         return ctx.body_len
@@ -88,7 +91,7 @@ end
 -- 数值比较两侧须均 number,否则不命中(不崩)。eq/ne 通吃 bool/string/number。
 local function both_num(a, b) return type(a) == "number" and type(b) == "number" end
 
-function _G.reject_rules_apply_op(op, lhs, rhs)
+function M.reject_rules_apply_op(op, lhs, rhs)
     if     op == "gt" then return both_num(lhs, rhs) and lhs >  rhs
     elseif op == "ge" then return both_num(lhs, rhs) and lhs >= rhs
     elseif op == "lt" then return both_num(lhs, rhs) and lhs <  rhs
@@ -125,21 +128,21 @@ _G.REJECT_RULES_OPS = {
 }
 
 -- ── 节点匹配(递归 all/any/叶子)──────────────────────────────────────────
-function _G.reject_rules_node_matches(node, ctx)
+function M.reject_rules_node_matches(node, ctx)
     if type(node) ~= "table" then return false end
     if node.all then
         for _, sub in ipairs(node.all) do
-            if not _G.reject_rules_node_matches(sub, ctx) then return false end
+            if not M.reject_rules_node_matches(sub, ctx) then return false end
         end
         return true
     elseif node.any then
         for _, sub in ipairs(node.any) do
-            if _G.reject_rules_node_matches(sub, ctx) then return true end
+            if M.reject_rules_node_matches(sub, ctx) then return true end
         end
         return false
     else
-        local lhs = _G.reject_rules_field_value(node.field, ctx)
-        return _G.reject_rules_apply_op(node.op, lhs, node.value)
+        local lhs = M.reject_rules_field_value(node.field, ctx)
+        return M.reject_rules_apply_op(node.op, lhs, node.value)
     end
 end
 
@@ -164,7 +167,7 @@ local function valid_node(node)
     return true
 end
 
-function _G.validate_reject_rules(name, rules)
+function M.validate_reject_rules(name, rules)
     if rules == nil then return nil end
     if type(rules) ~= "table" then
         ngx.log(ngx.ERR, "[", name, "] reject_rules 非 table,忽略")
@@ -192,7 +195,7 @@ end
 -- 命中首个规则 → reject_stat "<route>:rule" 聚合计数 + cch_ctl "reject_rule_hit:<name>" 逐规则计数
 --   + ngx.status + json + ngx.exit(status)。无命中正常返回。
 -- 热切开关:ngx.shared[opts.cch_ctl_dict] key "reject_rules_enabled"(dict 值 > opts.reject_rules_default_enabled)。
-function _G.eval_reject_rules(opts)
+function M.eval_reject_rules(opts)
     local rules = opts.reject_rules
     if not rules or #rules == 0 then return end
     -- 热切开关(不 reload 关规则)
@@ -212,7 +215,7 @@ function _G.eval_reject_rules(opts)
     if type(req) ~= "table" then return end
     local ctx = { req = req, body_len = ngx.ctx.req_body_len or 0 }
     for _, rule in ipairs(rules) do
-        if _G.reject_rules_node_matches(rule, ctx) then
+        if M.reject_rules_node_matches(rule, ctx) then
             local status = rule.status or opts.reject_rules_status or 429
             if type(status) ~= "number" then status = 429 end
             ngx.status = status
@@ -232,3 +235,5 @@ function _G.eval_reject_rules(opts)
         end
     end
 end
+
+return M

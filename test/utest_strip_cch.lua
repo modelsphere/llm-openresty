@@ -1,7 +1,7 @@
 -- resty 单元测试:surgical_strip_cch(F1 [^;"]* + 位置无关 + 三段门控 + key 锚定)。
 -- 用法: resty test/utest_strip_cch.lua [lua/reqtransform.lua]
-_G._nonblank = function(s) return type(s) == "string" and s:match("%S") ~= nil end
-assert(loadfile(arg[1] or "lua/reqtransform.lua"))()
+package.loaded.util = { _nonblank = function(s) return type(s) == "string" and s:match("%S") ~= nil end }
+local rt = assert(loadfile(arg[1] or "lua/reqtransform.lua"))()
 
 local pass, fail = 0, 0
 local function eq(name, got, exp)
@@ -9,7 +9,7 @@ local function eq(name, got, exp)
     else fail = fail + 1; print("  ✗ "..name.."\n      got="..tostring(got).."\n      exp="..tostring(exp)) end
 end
 local function run(name, body, exp_out, exp_n)
-    local new, n = _G.surgical_strip_cch(body)
+    local new, n = rt.surgical_strip_cch(body)
     eq(name.." 输出", new, exp_out)
     eq(name.." n="..exp_n, n, exp_n)
 end
