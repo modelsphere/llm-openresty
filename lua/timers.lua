@@ -1,11 +1,19 @@
 -- openresty/lua/timers.lua
 -- worker0 后台 timer:health-check / cluster_avg / adaptive_cc(AIMD)
+-- 三个 do_*_loop 由 route.register_route 启动 → 收敛到 M。timers 加载序在 route/tps 之后
+-- (见 router.lua),故顶层 require 二者(route 已把对 timers 的 require 延后到 register_route
+--  调用期,不构成加载期环)。DEFAULT_HEALTH_PROBE_PATH 是 config data 仍留 _G。
+
+local M = {}
+
+local route = require "route"
+local tps   = require "tps"
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.do_health_check_loop(opts) — init_worker 调用，启动健康检查 timer
+-- M.do_health_check_loop(opts) — init_worker 调用，启动健康检查 timer
 -- ══════════════════════════════════════════════════════════════════════
 
-function _G.do_health_check_loop(opts)
+function M.do_health_check_loop(opts)
     -- 防御：若 opts 引用的 shared_dict 没声明（例如独立路由 conf 被删但 opts 注册过），
     -- 直接 skip 不启动 timer，避免 nil:set() 报错。
     if not ngx.shared[opts.bad_peers_dict] then
@@ -75,9 +83,9 @@ function _G.do_health_check_loop(opts)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.do_cluster_avg_loop(opts) — init_worker 调用，启动 cluster_avg 采样 timer
+-- M.do_cluster_avg_loop(opts) — init_worker 调用，启动 cluster_avg 采样 timer
 -- ══════════════════════════════════════════════════════════════════════
-function _G.do_cluster_avg_loop(opts)
+function M.do_cluster_avg_loop(opts)
     if not (ngx.shared[opts.active_conns_dict] and ngx.shared[opts.cluster_avg_dict]) then
         ngx.log(ngx.WARN, "[", opts.route_name, "] cluster_avg skipped: shared_dict missing (route conf may be deleted)")
         return
@@ -120,7 +128,7 @@ function _G.do_cluster_avg_loop(opts)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- _G.do_adaptive_cc_loop(opts) — AIMD 自适应并发 timer(按路由 opt-in)。
+-- M.do_adaptive_cc_loop(opts) — AIMD 自适应并发 timer(按路由 opt-in)。
 -- 复用 TPS EWMA 当反馈信号:每 interval 对每个子池(peers_by_model 逐 model / flat 单池)——
 --   EWMA < 阈值 → 并发上限 ×dec(减);EWMA >= 阈值 时**按并发压力双向跟随实际并发**:
 --   conc >= cc×pressure_frac(顶到边缘)→ ×inc 涨;conc < cc×slack_frac(余量太大/无流量)→ ×dec 缩;
@@ -130,7 +138,7 @@ end
 --   do_route 回退到 min 慢启动(不从满容量开始;健康则 ×inc 逐步爬回)。短暂信号缺口内(<TTL)仍保持
 --   当前值。阈值/max/min 在 timer 内解析,不读 ngx.ctx。
 -- ══════════════════════════════════════════════════════════════════════
-function _G.do_adaptive_cc_loop(opts)
+function M.do_adaptive_cc_loop(opts)
     if not opts.adaptive_cc then return end   -- 门控:未 opt-in 不启 timer
     local td = ngx.shared[opts.tps_dict]
     if not td then
@@ -159,12 +167,12 @@ function _G.do_adaptive_cc_loop(opts)
 
     -- 单子池一步 AIMD(model=false 表 flat 路由)。
     local function step_one(model)
-        local pre = _G.tps_key_prefix(opts, model)   -- 统一走 helper(flat: model=false → "route:")
+        local pre = tps.tps_key_prefix(opts, model)   -- 统一走 helper(flat: model=false → "route:")
         local ewma = td:get(pre .. "ewma")
         if not ewma then return end          -- 无信号 → 保持当前值不动(不写)
-        local maxcc = _G.compute_static_max_cc(opts, model)
+        local maxcc = route.compute_static_max_cc(opts, model)
         if maxcc <= 0 then return end
-        local mincc = _G.derive_mincc(opts, maxcc)
+        local mincc = route.derive_mincc(opts, maxcc)
         local thr = thr_for(model)
         local cur = td:get(pre .. "adaptive_cc") or mincc   -- 首次/过期 → 从 min 起步(慢启动,健康则 ×inc 爬升)
         -- 修复1:读+清零本区间被压抑需求(并发 429 数)。>0 = 需求超过 cc、被拒的量 rt_sum 看不到。
@@ -223,3 +231,5 @@ function _G.do_adaptive_cc_loop(opts)
     end
     ngx.timer.at(INTERVAL, loop)
 end
+
+return M

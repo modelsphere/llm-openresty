@@ -1,5 +1,9 @@
 -- openresty/lua/tps.lua
 -- TPS 解码速率限流(池级 EWMA + 窗口 P20 + 半开探测)
+-- 跨模块函数挂 M(dict_if_on/key_prefix/ewma_key/limit_for/record/allow_probe);
+-- bucket_index/window_p20 仅内部用 → local。TPS_ENABLED / TPS_BUCKETS 是 config data 仍留 _G。
+
+local M = {}
 
 -- ══════════════════════════════════════════════════════════════════════
 -- TPS 限流(解码速率)辅助:与 TTFT 同构,差三处——P20 低尾 / ewma<=下限 / opt-in。
@@ -9,7 +13,7 @@
 -- 关闭条件(任一):① _G.TPS_ENABLED=false;② 路由没配 tps_limit_tps(opt-in 闸门);
 --   ③ tps_dict 未声明;④ 运行时热关 <route>:__off(/_tps_toggle 置上)。
 
-function _G.tps_dict_if_on(opts)
+function M.tps_dict_if_on(opts)
     if not _G.TPS_ENABLED then return nil end
     if not opts.tps_limit_tps then return nil end   -- opt-in:没配下限 = 整特性对本路由关
     local td = ngx.shared[opts.tps_dict]
@@ -21,7 +25,7 @@ end
 -- key 前缀:"<route>:" +(peers_by_model 时再加 "<model>:")。同 TTFT。
 -- model 显式传(timer 逐 model,无 ngx.ctx)优先;不传(请求路径)回落 ngx.ctx.req_model。
 -- 唯一构造点 —— do_route/assess_pool/step_one/fill_cc 都走它,避免手搓前缀分叉。
-function _G.tps_key_prefix(opts, model)
+function M.tps_key_prefix(opts, model)
     local p = (opts.route_name or "?") .. ":"
     if opts.peers_by_model then
         local m = model
@@ -31,12 +35,12 @@ function _G.tps_key_prefix(opts, model)
     return p
 end
 
-function _G.tps_ewma_key(opts)
-    return _G.tps_key_prefix(opts) .. "ewma"
+function M.tps_ewma_key(opts)
+    return M.tps_key_prefix(opts) .. "ewma"
 end
 
 -- 解析本请求该用的 TPS 下限(tokens/sec):override > tps_limit_by_model[model] > opts.tps_limit_tps。
-function _G.tps_limit_for(opts)
+function M.tps_limit_for(opts)
     local td = ngx.shared[opts.tps_dict]
     if td then
         if opts.peers_by_model then
@@ -55,7 +59,7 @@ function _G.tps_limit_for(opts)
 end
 
 -- 样本(tokens/sec) → 直方图桶号(1..#buckets+1,最后一个是 overflow)。同 ttft_bucket_index。
-function _G.tps_bucket_index(tps)
+local function tps_bucket_index(tps)
     local b = _G.TPS_BUCKETS
     for i = 1, #b do if tps <= b[i] then return i end end
     return #b + 1
@@ -63,7 +67,7 @@ end
 
 -- 从窗口 w 的直方图算 P20(累计越过 20% 的桶上界,低尾代表值);空窗返 nil。
 -- 与 ttft_window_p80 唯一区别:target=total*0.2(抓慢解码的低尾,而非 TTFT 的高尾)。
-function _G.tps_window_p20(td, pre, w)
+local function tps_window_p20(td, pre, w)
     local b = _G.TPS_BUCKETS
     local n = #b
     local counts, total = {}, 0
@@ -81,10 +85,10 @@ function _G.tps_window_p20(td, pre, w)
 end
 
 -- TPS 样本入账:与 ttft_record 同构(每窗口直方图 → lazy 折叠 P20 折进 EWMA;fd 锁去重;TTL 自愈)。
-function _G.tps_record(opts, td, sample_tps)
+function M.tps_record(opts, td, sample_tps)
     local W   = opts.tps_window
     local win = math.floor(ngx.now() / W)
-    local pre = _G.tps_key_prefix(opts)
+    local pre = M.tps_key_prefix(opts)
     local ttl = opts.tps_ttl
     local lastk = pre .. "ewin"
     local last = td:get(lastk)
@@ -95,7 +99,7 @@ function _G.tps_record(opts, td, sample_tps)
         if win - last > horizon then last = win - horizon end
         for w = last, win - 1 do
             if td:add(pre .. "fd:" .. w, 1, ttl) then
-                local p20 = _G.tps_window_p20(td, pre, w)
+                local p20 = tps_window_p20(td, pre, w)
                 if p20 then
                     local old = td:get(pre .. "ewma")
                     local a   = opts.tps_ewma_alpha
@@ -106,17 +110,19 @@ function _G.tps_record(opts, td, sample_tps)
         end
         td:set(lastk, win, ttl)
     end
-    td:incr(pre .. "h:" .. win .. ":" .. _G.tps_bucket_index(sample_tps), 1, 0, ttl)
+    td:incr(pre .. "h:" .. win .. ":" .. tps_bucket_index(sample_tps), 1, 0, ttl)
 end
 
 -- 半开探测:逐字复制 ttft_allow_probe(机制方向无关)。限流态下每窗口放行至多 N 个探测继续测 TPS。
-function _G.tps_allow_probe(opts)
+function M.tps_allow_probe(opts)
     local td = ngx.shared[opts.tps_dict]
     if not td then return true end
     local win = math.floor(ngx.now() / opts.tps_probe_window)
-    local key = _G.tps_key_prefix(opts) .. "probe:" .. win
+    local key = M.tps_key_prefix(opts) .. "probe:" .. win
     local n = td:incr(key, 1, 0)
     if not n then return true end
     if n == 1 then td:expire(key, opts.tps_probe_window * 2) end
     return n <= opts.tps_probe_per_window
 end
+
+return M

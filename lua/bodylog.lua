@@ -1,7 +1,14 @@
 -- openresty/lua/bodylog.lua
 -- 请求/响应全量落盘(采样、抓取、SSE chunk 累积、二进制帧 finalize)
+-- bodylog_filter_chunk 是 body_filter 入口 → 仍挂 _G;capture_request/finalize 跨模块 → M;
+-- should_sample/is_utf8 仅内部 → local。BODYLOG_* 及 bodylog_max_*/strip_hdrs 是 config data 仍留 _G。
+-- ttft/tps 是叶子模块,filter_chunk 里用它们判 TTFT/TPS 开关 → 顶层 require(无环)。
+
+local M = {}
 
 local cjson = require "cjson.safe"
+local ttft  = require "ttft"
+local tps   = require "tps"
 
 -- ★ 默认配置（生产改这两行即可，master 重启后生效；toggle endpoint 仍可运行时覆盖）★
 -- toggle（/_bodylog_toggle）写入 ngx.shared.bodylog_ctl，跨 reload 持久;
@@ -34,7 +41,7 @@ _G.bodylog_strip_hdrs  = {
 -- 决策：本次请求是否被采样。
 -- 优先级：toggle endpoint 设过的 shared dict 值 > opts.bodylog_default_* > 全局常量 fallback。
 -- opts 可选；未传时取 ngx.ctx.route_opts 或默认 K2.5。
-function _G.bodylog_should_sample(opts)
+local function bodylog_should_sample(opts)
     opts = opts or ngx.ctx.route_opts or _G.__route_opts.k25
     local ctl = ngx.shared[opts.bodylog_ctl_dict or "bodylog_ctl"]
     local default_en = opts.bodylog_default_enabled
@@ -54,8 +61,8 @@ end
 -- 客户端原始 body（cch 还在）；prepare_request 之后会通过 set_body_data
 -- 改写 nginx 内部 buffer，但已经存进 ngx.ctx 的字符串引用不受影响。
 -- 落盘内容 = 客户端实际发送内容，可用于审计 / 排查 / replay。
-function _G.bodylog_capture_request(opts)
-    if not _G.bodylog_should_sample(opts) then return end
+function M.bodylog_capture_request(opts)
+    if not bodylog_should_sample(opts) then return end
     ngx.ctx.bodylog_active = true
     ngx.req.read_body()
     local body = ngx.req.get_body_data()
@@ -105,10 +112,10 @@ function _G.bodylog_filter_chunk()
     -- 缓存 TPS on/off 决策:body_filter 每 chunk 调一次,而 tps_dict_if_on 含 shared-dict get(__off),
     -- 长流(64K token / 数千 chunk)下会累积上千次无谓 dict 读。决策对单请求恒定,只在首次算一次。
     if _ro and ngx.ctx.tps_on == nil then
-        ngx.ctx.tps_on = (_G.tps_dict_if_on(_ro) and true) or false
+        ngx.ctx.tps_on = (tps.tps_dict_if_on(_ro) and true) or false
     end
     local _tps_on = ngx.ctx.tps_on
-    if _ro and not ngx.ctx.ttft_first_chunk_t and (_G.ttft_dict_if_on(_ro) or _tps_on) then
+    if _ro and not ngx.ctx.ttft_first_chunk_t and (ttft.ttft_dict_if_on(_ro) or _tps_on) then
         local c0 = ngx.arg[1]
         if c0 and #c0 > 0 then
             ngx.update_time()
@@ -177,7 +184,7 @@ function _G.bodylog_filter_chunk()
 end
 
 -- 工具：判断 string 是否合法 utf-8
-function _G.bodylog_is_utf8(s)
+local function bodylog_is_utf8(s)
     if not s or s == "" then return true end
     local i, n = 1, #s
     while i <= n do
@@ -214,7 +221,7 @@ local function _pack_u32(n)
         _bit.band(n, 0xff))
 end
 
-function _G.bodylog_finalize(opts)
+function M.bodylog_finalize(opts)
     if not ngx.ctx.bodylog_active then return end
     opts = opts or ngx.ctx.route_opts or _G.__route_opts.k25
     local ctl = ngx.shared[opts.bodylog_ctl_dict or "bodylog_ctl"]
@@ -225,7 +232,7 @@ function _G.bodylog_finalize(opts)
     local hdrs_out = {}
     for k, v in pairs(hdrs_in) do
         if not _G.bodylog_strip_hdrs[k:lower()] then
-            if type(v) == "string" and not _G.bodylog_is_utf8(v) then
+            if type(v) == "string" and not bodylog_is_utf8(v) then
                 hdrs_out[k] = "base64:" .. ngx.encode_base64(v)
             else
                 hdrs_out[k] = v
@@ -333,3 +340,5 @@ function _G.bodylog_finalize(opts)
         ngx.log(ngx.WARN, "bodylog timer.at failed: ", terr)
     end
 end
+
+return M

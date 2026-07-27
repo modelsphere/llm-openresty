@@ -1,13 +1,17 @@
 -- openresty/lua/router.lua
--- 引擎库入口:按序 require 各模块(副作用:填充 _G.* 函数表)。
--- session_route.conf 的 init_by_lua_block 只需 `require "router"`。
+-- 引擎库入口:按序 require 各模块。session_route.conf 的 init_by_lua_block 只需 `require "router"`。
 --
--- TODO(重构,@qiliguo MR review 提出):大部分 _G.* function 应收缩到 module scope
---   (内部 helper → local;跨模块调用 → `local x = require("mod")` 用 x.foo),不放 global ——
---   减少全局命名空间污染 + 消除 `_G write guard` warning + 降并发写风险。
---   边界:被 nginx.conf / router_locations.inc 的 *_by_lua_block 直接调的入口点
---   (do_route / do_balancer / do_log_release / bodylog_filter_chunk / register_route / dbg_*)
---   仍需保留全局或模块句柄。属整仓一次性 sweep(全模块 return M + require 化 + 同步测试),非 per-feature。
+-- 收敛现状(2026-07,@qiliguo MR review 提出的 sweep 已完成):
+--   * 各模块 `local M = {} … return M`;跨模块调用改 `local mod = require "mod"` 用 mod.foo。
+--   * 内部 helper 用 local;仅这些【入口点】仍挂 _G——被 nginx.conf / router_locations.inc 的
+--     *_by_lua_block(或 per-model conf 的 set_by_lua)直接按名调用,无 module 句柄可用:
+--       do_route / do_log_release / do_balancer(access)、bodylog_filter_chunk(bodylog)、
+--       register_route(route)、dbg_*(debug_endpoints)。
+--   * config 数据(PEERS / __route_opts / TTFT_* / TPS_* / ADAPTIVE_CC_* / KIMI_* / BODYLOG_* / …)
+--     仍留 _G:由 session_route.conf / 各 session_route_<model>.conf 的 lua block 直读直写(用户配置面)。
+--   * 循环依赖(route↔timers)用函数内 lazy `require`(见 route.lua assess_pool / register_route)破环。
+-- 本文件的显式 require 顺序仍必要:access/debug_endpoints/timers/bodylog/route 定义的入口点靠这里
+--   被 eager 加载(否则没人 require 它们 → _G 入口点不注册)。各模块自身的 require 负责按需拉依赖。
 
 require "util"
 require "reqtransform"

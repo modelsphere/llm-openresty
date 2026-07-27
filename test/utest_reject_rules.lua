@@ -1,7 +1,7 @@
 -- resty 单元测试:reject_rules 引擎(字段解析 / 操作符 / 递归 all-any 节点匹配 / validate)。
 -- 用法: resty test/utest_reject_rules.lua [lua/reject_rules.lua]
 -- 只测纯逻辑 + validate(validate 的 ngx.log 在 resty 下可用);eval_reject_rules 需真实请求周期,走 chat 集成测。
-assert(loadfile(arg[1] or "lua/reject_rules.lua"))()
+local rr = assert(loadfile(arg[1] or "lua/reject_rules.lua"))()
 
 local pass, fail = 0, 0
 local function eq(name, got, exp)
@@ -9,10 +9,10 @@ local function eq(name, got, exp)
     else fail = fail + 1; print("  ✗ " .. name .. "\n      got=" .. tostring(got) .. "\n      exp=" .. tostring(exp)) end
 end
 
-local OP = _G.reject_rules_apply_op
-local FV = _G.reject_rules_field_value
-local NM = _G.reject_rules_node_matches
-local VAL = _G.validate_reject_rules
+local OP = rr.reject_rules_apply_op
+local FV = rr.reject_rules_field_value
+local NM = rr.reject_rules_node_matches
+local VAL = rr.validate_reject_rules
 
 -- ══ 操作符 ══════════════════════════════════════════════════════════════
 print("== 操作符 ==")

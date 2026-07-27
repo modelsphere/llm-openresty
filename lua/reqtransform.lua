@@ -1,8 +1,12 @@
 -- openresty/lua/reqtransform.lua
 -- sid 提取 from_metadata + cch-strip + kimi tool_id 规范化 + hoist system
+-- 跨模块入口/单测面挂在返回的 M 上(prepare_request / surgical_* / normalize_kimi_tool_ids);
+-- 纯内部 helper 用 local。KIMI_* 是 config 数据仍留 _G(route/debug/tests 直读)。
+
+local M = {}
 
 local cjson = require "cjson.safe"
-local _nonblank = _G._nonblank
+local _nonblank = require("util")._nonblank
 
 local function from_metadata(md, keyname)
     if type(md) ~= "table" then return nil end
@@ -45,7 +49,7 @@ local function _strip_cch(s)
     return new, (n and n > 0)
 end
 
-function _G.strip_cch_in_req(req)
+local function strip_cch_in_req(req)
     local changed = false
     -- (a) Anthropic 原生：top-level system，可能是 string 或 [{type=text,text=...}]
     local sys = req.system
@@ -257,7 +261,7 @@ end
 -- 把 req 里的 tool_call id 规范化为 functions.<fn>:<idx>(编号见 _stable_toolid / _kimi_id_map),
 -- 同时同步 role=tool 的 tool_call_id 引用。返回改动条目数（≥0）。
 -- req=非 table 或非 Kimi 模型时直接返 0 不动。内部 pcall 兜底,异常返 0 不让上游整体挂掉。
-function _G.normalize_kimi_tool_ids(req)
+function M.normalize_kimi_tool_ids(req)
     if type(req) ~= "table" then return 0 end
     if not _G.KIMI_NORMALIZE_MODELS[req.model] then return 0 end
     local msgs = req.messages
@@ -308,7 +312,7 @@ end
 --    损坏请求(F1)。代价:cch 值内含转义引号 `\"` 时该段会 match 失败而漏剥;漏剥
 --    (原样透传)远好于吞 body,可接受。
 local _CCH_RAW = [[("(?:content|text)"\s*:\s*")x-anthropic-billing-header:\s*cc_version=[^;"]*;\s*cc_entrypoint=[^;"]*;\s*cch=[^;"]*;]]
-function _G.surgical_strip_cch(body)
+function M.surgical_strip_cch(body)
     local new, n = ngx.re.gsub(body, _CCH_RAW, "$1", "jo")
     if not new then return body, 0 end
     return new, (n or 0)
@@ -328,7 +332,7 @@ end
 --    gsub 的返回 cnt 含未改项,**不能拿它当替换数** → 用闭包 n_repl 只数真正改掉的(否则计数虚高)。
 --    [^"]*:tool_call id 从不含引号(call_x / functions.fn:N / toolu_…),与原 alternation 等价。
 local _ID_NORM_PAT = [[("(?:id|tool_call_id)"\s*:\s*")([^"]*)"]]
-function _G.surgical_normalize(body, req, models)
+function M.surgical_normalize(body, req, models)
     if type(req) ~= "table" then return body, 0 end
     if not models[req.model] then return body, 0 end
     local msgs = req.messages
@@ -360,7 +364,7 @@ end
 --   ③ include_usage 已存在但非 true(false/null/标量)→ **就地改值** true(F5-false;全 byte-preserving,
 --      不再回退 struct)。仅 include_usage 值是对象/数组等异常形态才跳过不注入。
 -- 返回 (new_body, injected_bool)。
-function _G.surgical_inject_usage(body, req)
+function M.surgical_inject_usage(body, req)
     local so = req.stream_options
     if type(so) ~= "table" then
         -- a. 就地替换 "stream_options":null → 对象(content 里的同串被 JSON 转义 \" 打断,不会误命中)
@@ -400,7 +404,7 @@ end
 -- (装 "Available agent types" 那段)。真 Anthropic API 会容忍并 merge 进 system,但 sglang 的
 -- anthropic-compat 端点严格校验 messages role 只能 user/assistant → 400。这里补上那步 merge。
 -- content 支持 string 或 blocks;顶层 system 支持 string / list;返回移动条数。pcall 由调用方兜底。
-function _G.hoist_system_msgs(req)
+local function hoist_system_msgs(req)
     local msgs = req.messages
     if type(msgs) ~= "table" then return 0 end
     local hoisted, kept, moved = {}, {}, 0
@@ -442,7 +446,7 @@ end
 -- 返回 (sid, src)；sid 提取失败返回 nil 走 least_conn。
 -- opts 可选：{ cch_ctl_dict, cch_default_enabled, disable_body_user_affinity }
 -- 未传时取 ngx.ctx.route_opts；再为空取 K2.5 默认值（保持向后兼容老调用）。
-function prepare_request(opts)
+function M.prepare_request(opts)
     opts = opts or ngx.ctx.route_opts or _G.__route_opts.k25
     local h = ngx.req.get_headers()
 
@@ -488,7 +492,7 @@ function prepare_request(opts)
     -- 零额外成本。do_route 在 prepare_request 之后据此选子池;老格式不读此字段。
     ngx.ctx.req_model = req.model
 
-    -- 供 reject_rules 规则引擎读取(do_route 在本函数返回后调用 _G.eval_reject_rules):
+    -- 供 reject_rules 规则引擎读取(do_route 在本函数返回后调用 reject_rules.eval_reject_rules):
     -- 存【原始 body 字符串】(此刻 body 尚未被下方 struct 路径就地改 req 表 / set_body_data 改线体污染),
     -- eval 按需重新 decode → 恒看客户端原始请求,不受归一化路径(struct 改表 vs surgical 不改)影响。
     -- req_body_len = 原始体字节数(input_bytes 规则用)。无 body 时上方已提前返回 → 保持 nil,eval 自动 no-op。
@@ -552,7 +556,7 @@ function prepare_request(opts)
         --    则顺带在本路径注入,反正已 encode)──
         local req_dirty = false
         if cch_enabled then
-            local ok_cch, did = pcall(_G.strip_cch_in_req, req)
+            local ok_cch, did = pcall(strip_cch_in_req, req)
             if not ok_cch then
                 ngx.log(ngx.ERR, "strip_cch_in_req pcall err: ", tostring(did))
             elseif did then
@@ -560,7 +564,7 @@ function prepare_request(opts)
             end
         end
         if kn_enabled then
-            local n = _G.normalize_kimi_tool_ids(req)   -- 内部已按 model 门控 + pcall 兜底
+            local n = M.normalize_kimi_tool_ids(req)   -- 内部已按 model 门控 + pcall 兜底
             if n and n > 0 then kimi_normalized_pending = n; req_dirty = true end
         end
         if usage_mode then   -- 仅 "surgical"+want_hoist 会落这(hoist 已 decode→encode,顺带注入不亏)
@@ -569,7 +573,7 @@ function prepare_request(opts)
             so.include_usage = true; req_dirty = true; usage_injected_pending = true
         end
         if want_hoist then
-            local ok_h, moved = pcall(_G.hoist_system_msgs, req)
+            local ok_h, moved = pcall(hoist_system_msgs, req)
             if ok_h and moved and moved > 0 then req_dirty = true end
         end
         if req_dirty then
@@ -586,17 +590,17 @@ function prepare_request(opts)
         -- 全部在 raw body 字符串上定点替换;req(已 decode)仅供 surgical_normalize 算 id_map。
         local newbody = body
         if cch_enabled then
-            local nb, ncch = _G.surgical_strip_cch(newbody)
+            local nb, ncch = M.surgical_strip_cch(newbody)
             newbody = nb
             if ncch and ncch > 0 then cch_stripped_pending = true end
         end
         if kn_model then
-            local nb, nid = _G.surgical_normalize(newbody, req, _G.KIMI_NORMALIZE_MODELS)
+            local nb, nid = M.surgical_normalize(newbody, req, _G.KIMI_NORMALIZE_MODELS)
             newbody = nb
             kimi_normalized_pending = kimi_normalized_pending + (nid or 0)
         end
         if usage_mode == "surgical" then
-            local nb, injected = _G.surgical_inject_usage(newbody, req)
+            local nb, injected = M.surgical_inject_usage(newbody, req)
             if injected then
                 newbody = nb; usage_injected_pending = true
             else
@@ -653,3 +657,5 @@ function prepare_request(opts)
 
     return nil
 end
+
+return M
