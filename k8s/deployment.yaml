@@ -1,0 +1,95 @@
+# openresty 全模型路由 —— Deployment(无状态,详见 k8s/README.md 的 Deployment vs StatefulSet)
+# 默认 replicas: 1;要抗压直接调大即可(一致性哈希路由,副本等价、无需持久卷/稳定身份)。
+#
+# 优雅停机三件套(和 README「优雅停机」一致):
+#   ① 镜像 STOPSIGNAL SIGQUIT     → k8s 停 pod 时 nginx 走优雅排空(等在途长流跑完),不是砍
+#   ② terminationGracePeriodSeconds → 唯一硬切刀,按最长流式响应设(见下)
+#   ③ preStop sleep               → 给上游 Service 端点摘除留传播时间,排空期间不再进新连接
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openresty
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openresty-router
+  namespace: openresty
+  labels: { app: openresty-router }
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # 先起新 pod ready 再排空老 pod,过程零不可用
+  selector:
+    matchLabels: { app: openresty-router }
+  template:
+    metadata:
+      labels: { app: openresty-router }
+    spec:
+      # ★★ 唯一硬切刀:到点 SIGKILL 强砍在途流。openresty proxy timeout 到 3600s、
+      #    LLM 64K 输出可能跑上千秒 → 按你能接受的「滚动更新时最长排空多久」设。
+      #    600s 是折中默认;要绝不切超长流就调到 ≥ 最长响应(代价:滚更时老 pod 可能 Terminating 很久)。
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: openresty
+        image: registry.example.com/llm/llm-openresty:0.1.0   # 已 push harbor(openresty 1.29.2.3,对齐生产)
+        imagePullPolicy: IfNotPresent
+        # 镜像已 STOPSIGNAL SIGQUIT → 优雅排空由 SIGQUIT 触发,这里 preStop 只负责「解端点摘除竞态」
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh","-c","sleep 5"]
+        ports:
+        - { name: http-main,     containerPort: 18080 }   # K2.5 主入口
+        - { name: k2-6,          containerPort: 18082 }
+        - { name: glm,           containerPort: 18083 }
+        - { name: glm-b300,      containerPort: 18084 }
+        - { name: k2-6-b300,     containerPort: 18085 }
+        - { name: model-service,    containerPort: 18086 }
+        - { name: fallback,      containerPort: 18087 }
+        - { name: canary,        containerPort: 18089 }
+        - { name: finch,         containerPort: 18090 }
+        - { name: vendor-gpu,      containerPort: 18091 }
+        env:
+        # bodylog 异步落盘的 listener 地址(镜像已把 nginx.conf 改成 env 透传)。
+        # 指向集群内 bodylog listener 的 Service;listener 未部署时留空即可 —— logger-socket
+        # 连不上会在 worker buffer 缓冲、满了才丢,非阻塞、不影响转发。
+        - { name: BODYLOG_LISTENER_HOST, value: "" }   # 例:bodylog-listener.openresty.svc.cluster.local
+        - { name: BODYLOG_LISTENER_PORT, value: "9999" }
+        readinessProbe:                                # 未就绪只摘端点、不重启
+          httpGet: { path: /_health_status, port: 18080 }
+          initialDelaySeconds: 3
+          periodSeconds: 10
+          timeoutSeconds: 3
+        livenessProbe:                                 # openresty 秒级启动,可放 liveness(和模型服务不同)
+          httpGet: { path: /_health_status, port: 18080 }
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests: { cpu: "2",  memory: 512Mi }
+          limits:   { cpu: "8",  memory: 2Gi }         # worker_processes=20;CPU 按实际压测调
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openresty-router
+  namespace: openresty
+  labels: { app: openresty-router }
+spec:
+  type: ClusterIP
+  selector: { app: openresty-router }
+  ports:
+  - { name: http-main,  port: 18080, targetPort: 18080 }
+  - { name: k2-6,       port: 18082, targetPort: 18082 }
+  - { name: glm,        port: 18083, targetPort: 18083 }
+  - { name: glm-b300,   port: 18084, targetPort: 18084 }
+  - { name: k2-6-b300,  port: 18085, targetPort: 18085 }
+  - { name: model-service, port: 18086, targetPort: 18086 }
+  - { name: fallback,   port: 18087, targetPort: 18087 }
+  - { name: canary,     port: 18089, targetPort: 18089 }
+  - { name: finch,      port: 18090, targetPort: 18090 }
+  - { name: vendor-gpu,   port: 18091, targetPort: 18091 }

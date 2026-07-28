@@ -1,0 +1,19 @@
+# 只 COPY 明确列出的配置/lua/vendor,其余一律排除,缩小构建上下文
+.git
+.gitignore
+k8s/
+test/
+bin/
+bodylog-listener-go/
+bodylog_listener.py
+bodylog-listener.service
+bodylog_http_token
+install_openresty.sh
+logrotate-openresty.conf
+push_conf_noreload.sh
+llm-gateway-1.example.com.conf
+*.md
+*.html
+__pycache__/
+*.pyc
+*.swp
