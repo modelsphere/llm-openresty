@@ -2,12 +2,13 @@
 #
 # 参考同组 chat-engine 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置 harbor 鉴权,
 # CI 里不需要 docker login、也不需要配任何 HARBOR_ 变量,直接 docker build + docker push。
+# (已在 feat/openresty-k8s-image 上实测跑通:build FROM harbor openresty-base + push harbor 成功。)
 #
-# 触发:打 git tag → push <tag> + latest。产物 registry.example.com/llm/llm-openresty:<tag>。
-# 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main)。
+# app 镜像 FROM harbor 的 openresty-base(见 Dockerfile / Dockerfile.base),纯 COPY 配置、不装东西,
+# 所以 public-buildx runner 够不到 docker.io/外网也能 build。
 #
-# ⚠️ 临时:下面第二条 rule 只为在 feat/openresty-k8s-image 分支上直接触发一次构建做验证
-#    (push citest-<sha>,不动 latest),验证通过后删掉这条 rule,恢复成纯 tag 触发。
+# 触发:仅打 git tag。产物 registry.example.com/llm/llm-openresty:<tag> (+ :latest)。
+# 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
 
 stages: [build]
 
@@ -18,11 +19,8 @@ build:image:
   stage: build
   tags: [public-buildx]            # org 共享构建 runner(在线;docker 已 login harbor)
   rules:
-    - if: '$CI_COMMIT_TAG'                                   # 正式:打 tag 触发
-      variables: { IMG_TAG: "$CI_COMMIT_TAG", PUSH_LATEST: "yes" }
-    - if: '$CI_COMMIT_BRANCH == "feat/openresty-k8s-image"'  # 临时:分支验证触发
-      variables: { IMG_TAG: "citest-$CI_COMMIT_SHORT_SHA", PUSH_LATEST: "no" }
+    - if: '$CI_COMMIT_TAG'         # 只在打 tag 时构建;其它 push 不触发
   script:
-    - docker build -t "$IMAGE:$IMG_TAG" .
-    - docker push "$IMAGE:$IMG_TAG"
-    - if [ "$PUSH_LATEST" = "yes" ]; then docker tag "$IMAGE:$IMG_TAG" "$IMAGE:latest"; docker push "$IMAGE:latest"; fi
+    - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
+    - docker push "$IMAGE:$CI_COMMIT_TAG"
+    - docker push "$IMAGE:latest"
