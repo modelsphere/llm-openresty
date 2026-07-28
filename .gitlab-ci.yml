@@ -1,0 +1,43 @@
+# 打 tag 自动 build openresty 镜像并 push 到 harbor
+#
+# 触发:仅在打 git tag 时(`git tag v0.2.0 && git push origin v0.2.0`)。
+# 产物:registry.example.com/llm/llm-openresty:<tag>  (+ :latest)
+#
+# ── 前置(必须先做,否则 pipeline 失败)──
+# 1) GitLab 项目 Settings → CI/CD → Variables 里加两个变量(Masked + Protected):
+#      HARBOR_USER  = llm          (建议改用 harbor robot 账号)
+#      HARBOR_PASS  = <harbor 密码 / robot token>
+# 2) runner 需能:
+#      ① 直连 registry.example.com(内网,push 不需要代理)—— 已确认
+#      ② 构建时拉基础镜像 ubuntu:22.04,并访问 ubuntu archive + openresty.org 装 openresty。
+#         若 runner air-gap 够不到外网,把 Dockerfile 的基础镜像/apt 源换成内网镜像(或改用离线 deb)。
+#      ③ 拉得到 kaniko 镜像(下方 image:)。gcr.io 拉不到就先把 kaniko mirror 进 harbor 再改这一行。
+#
+# 用 kaniko:k8s executor runner 上无需 docker daemon / privileged。
+
+stages: [build]
+
+variables:
+  IMAGE: registry.example.com/llm/llm-openresty
+
+build:image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug   # 拉不到就换成 harbor 里的 kaniko 镜像
+    entrypoint: [""]
+  rules:
+    - if: '$CI_COMMIT_TAG'          # 只在打 tag 时构建;其它 push 不触发
+  script:
+    # 写 harbor 鉴权到 kaniko 的 docker config
+    - mkdir -p /kaniko/.docker
+    - |
+      cat > /kaniko/.docker/config.json <<JSON
+      {"auths":{"registry.example.com":{"auth":"$(printf '%s:%s' "$HARBOR_USER" "$HARBOR_PASS" | base64 | tr -d '\n')"}}}
+      JSON
+    # 构建 + 双 tag 推送(<tag> 与 latest);Dockerfile 已 pin openresty 1.29.2.3
+    - >-
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+      --destination "$IMAGE:$CI_COMMIT_TAG"
+      --destination "$IMAGE:latest"
