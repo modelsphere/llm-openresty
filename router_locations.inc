@@ -277,7 +277,11 @@
                         ngx.ctx.bodylog_total_bytes = #rb
                         ngx.ctx.bodylog_chunk_count = 1
                         ngx.ctx.routed_peer = pk
-                        ngx.ctx.routed_mode = "4xx_to_501(orig="
+                        -- mode = "<原选址方式>|4xx_to_501(orig=<原状态码>)":
+                        -- $routed_mode 是 nginx var 跨 error_page 跳转存活(hash/least_conn),
+                        -- 原始上游状态码取 $upstream_status;原响应体 nginx 截获时已丢,存不到
+                        ngx.ctx.routed_mode = tostring(ngx.var.routed_mode or "-")
+                            .. "|4xx_to_501(orig="
                             .. tostring(ngx.var.upstream_status or "?") .. ")"
                         pcall(bodylog.bodylog_finalize, opts)
                     end
