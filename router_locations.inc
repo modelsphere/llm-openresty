@@ -236,6 +236,10 @@
         # /v1/ 的 log_by_lua(do_log_release)不会跑;且 ngx.ctx 被跳转清空,只能用跨跳转
         # 保留的 nginx var($routed_peer/$route)反查。漏掉的话每个被改写的 4xx 泄漏 1 个
         # 计数,泄满 max_concurrency 就全 429(2026-07-29 glm_vendor-gpu 上线当天实测踩中)。
+        # 另:bodylog 状态也随 ctx 丢失(正常路径 4xx 是会进 bodylog 的),这里手工重建后走
+        # 正常 finalize 补录 —— status=501,原始上游状态码存 mode 字段("4xx_to_501(orig=400)"),
+        # 响应体=下面 return 的固定 JSON(改 return 内容时同步改这里的 rb),请求体从 nginx
+        # buffer 重取。采样门控(enabled/pct)与主路径同源(ctl dict > opts 默认 > 全局默认)。
         log_by_lua_block {
             local opts = _G.__route_opts[ngx.var.route]
             local pk = ngx.var.routed_peer
@@ -244,6 +248,39 @@
                 if d then
                     local v = d:incr(pk, -1, 0)
                     if v and v < 0 then d:set(pk, 0) end
+                end
+            end
+            if opts then
+                local okm, bodylog = pcall(require, "bodylog")
+                if okm and bodylog and bodylog.bodylog_finalize then
+                    local ctl = ngx.shared[opts.bodylog_ctl_dict or "bodylog_ctl"]
+                    local den = opts.bodylog_default_enabled
+                    if den == nil then den = _G.BODYLOG_DEFAULT_ENABLED end
+                    local en = ctl and ctl:get("enabled")
+                    if en == nil then en = den and 1 or 0 end
+                    local pct = (ctl and ctl:get("sample_pct")) or opts.bodylog_default_pct
+                                or _G.BODYLOG_DEFAULT_PCT or 100
+                    if en == 1 and (pct >= 100 or math.random(100) <= pct) then
+                        ngx.ctx.route_opts = opts
+                        ngx.ctx.bodylog_active = true
+                        local body
+                        pcall(function() body = ngx.req.get_body_data() end)
+                        if body and #body > _G.bodylog_max_req then
+                            ngx.ctx.bodylog_req_body = body:sub(1, _G.bodylog_max_req)
+                            ngx.ctx.bodylog_req_truncated = true
+                        else
+                            ngx.ctx.bodylog_req_body = body or ""
+                            ngx.ctx.bodylog_req_truncated = false
+                        end
+                        local rb = '{"error": {"message": "Not Implemented", "type": "not_implemented", "code": 501}}'
+                        ngx.ctx.bodylog_chunks      = { rb }
+                        ngx.ctx.bodylog_total_bytes = #rb
+                        ngx.ctx.bodylog_chunk_count = 1
+                        ngx.ctx.routed_peer = pk
+                        ngx.ctx.routed_mode = "4xx_to_501(orig="
+                            .. tostring(ngx.var.upstream_status or "?") .. ")"
+                        pcall(bodylog.bodylog_finalize, opts)
+                    end
                 end
             end
         }
