@@ -221,3 +221,30 @@
         deny  all;
         content_by_lua_block { _G.dbg_reject_rules_toggle(_G.__route_opts[ngx.var.route]) }
     }
+
+    # ── @return_501: 上游 4xx 统一改写成 501(per-route opt-in,2026-07-29 首用 glm_vendor-gpu)──
+    # 启用方法:路由 server 块(include 本文件之前)加两行:
+    #     proxy_intercept_errors on;
+    #     error_page 400 401 403 404 422 = @return_501;   # 状态码列表按需增减
+    # 未启用的路由不引用本 location(named location 不被 error_page 指到就是死配置,零影响)。
+    # 注意:error_page 截获后上游原响应体丢弃,客户端只见统一 501;lua 自产 4xx(鉴权 401/
+    # 限流 429 等,ngx.say 后响应已提交)不受影响,原样返回。
+    location @return_501 {
+        default_type application/json;
+        return 501 '{"error": {"message": "Not Implemented", "type": "not_implemented", "code": 501}}';
+        # 必须在这里释放 active_conns 计数:请求经 error_page 内部跳转后在本 location 结束,
+        # /v1/ 的 log_by_lua(do_log_release)不会跑;且 ngx.ctx 被跳转清空,只能用跨跳转
+        # 保留的 nginx var($routed_peer/$route)反查。漏掉的话每个被改写的 4xx 泄漏 1 个
+        # 计数,泄满 max_concurrency 就全 429(2026-07-29 glm_vendor-gpu 上线当天实测踩中)。
+        log_by_lua_block {
+            local opts = _G.__route_opts[ngx.var.route]
+            local pk = ngx.var.routed_peer
+            if opts and pk and pk ~= "-" and pk ~= "" then
+                local d = ngx.shared[opts.active_conns_dict]
+                if d then
+                    local v = d:incr(pk, -1, 0)
+                    if v and v < 0 then d:set(pk, 0) end
+                end
+            end
+        }
+    }
