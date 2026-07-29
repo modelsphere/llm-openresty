@@ -251,8 +251,14 @@
                 end
             end
             if opts then
+                -- 双代兼容:新引擎 bodylog_finalize 在模块 M 上(require "bodylog");
+                -- 旧引擎(如 ts24 2026-07-22 部署的那代)挂 _G,且模块文件不 return M →
+                -- require 返回 boolean true,必须先 type 判断再取字段(直接索引会
+                -- "attempt to index a boolean value",ts24 上线时连踩两坑:先静默跳过后索引炸)
                 local okm, bodylog = pcall(require, "bodylog")
-                if okm and bodylog and bodylog.bodylog_finalize then
+                local _finalize = (okm and type(bodylog) == "table" and bodylog.bodylog_finalize)
+                                  or _G.bodylog_finalize
+                if _finalize then
                     local ctl = ngx.shared[opts.bodylog_ctl_dict or "bodylog_ctl"]
                     local den = opts.bodylog_default_enabled
                     if den == nil then den = _G.BODYLOG_DEFAULT_ENABLED end
@@ -283,7 +289,7 @@
                         ngx.ctx.routed_mode = tostring(ngx.var.routed_mode or "-")
                             .. "|4xx_to_501(orig="
                             .. tostring(ngx.var.upstream_status or "?") .. ")"
-                        pcall(bodylog.bodylog_finalize, opts)
+                        pcall(_finalize, opts)
                     end
                 end
             end
