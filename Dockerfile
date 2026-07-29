@@ -12,17 +12,20 @@ ARG OR=/usr/local/openresty
 
 # 1) 主配置
 COPY nginx.conf ${OR}/nginx/conf/nginx.conf
-# 2) 路由 conf(*.conf 自动 include)+ 共享 location 片段(.inc 被各 server 显式 include)
-COPY session_route.conf session_route_*.conf _glm_vendor-gpu.conf router_locations.inc ${OR}/nginx/conf/conf.d/
+# 2) 框架基座 session_base.conf(dicts + upstream + init 框架 + 全局默认)+ 共享 location 片段(.inc);
+#    per-model 路由(session_route_<model>.conf)不 bake —— 由 autoconfig 生成、挂 ConfigMap 到 conf.d/routes/。
+COPY session_base.conf router_locations.inc ${OR}/nginx/conf/conf.d/
+RUN mkdir -p ${OR}/nginx/conf/conf.d/routes
 # 3) 引擎 lua 模块
 COPY lua/ ${OR}/nginx/conf/conf.d/lua/
 
 RUN set -eux; \
     # bodylog listener 地址改成从容器 env 透传(仓库里硬编码 10.0.0.1),不设则 lua 回落默认
     sed -ri 's|^(\s*env\s+BODYLOG_LISTENER_HOST)\s*=[^;]*;|\1;|' ${OR}/nginx/conf/nginx.conf; \
-    sed -ri 's|^(\s*env\s+BODYLOG_LISTENER_PORT)\s*=[^;]*;|\1;|' ${OR}/nginx/conf/nginx.conf; \
-    # 构建期语法自检:校验 nginx.conf + 全部 conf.d + lua require 能加载
-    ${OR}/bin/openresty -t
+    sed -ri 's|^(\s*env\s+BODYLOG_LISTENER_PORT)\s*=[^;]*;|\1;|' ${OR}/nginx/conf/nginx.conf
+# 注:不在 build 期跑 openresty -t —— 本镜像只 bake 基座、conf.d/routes/ 为空,
+# router_locations.inc 引用的 $routed_session_id 由 per-model server(运行时 autoconfig 填入 routes/)声明,
+# 空 routes/ 下 -t 会假报 "unknown routed_session_id"(良性)。-t 在部署后 routes/ 有 conf 时才有意义。
 
 # 路由端口:18080 主(K2.5)+ 各 per-model;STOPSIGNAL/CMD 继承自基础镜像
 EXPOSE 18080 18082 18083 18084 18085 18086 18087 18089 18090 18091
