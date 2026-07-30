@@ -486,9 +486,19 @@ function M.pick_from(opts, a, sid)
         end
         local min_ratio = math.huge
         local min_hp = healthy_peers[1]
+        -- 平局随机化(蓄水池抽样 size=1):严格 `<` 会让并列最小者恒选列表第一个 ——
+        -- 低并发/冷启动下所有 peer 活跃连接≈0、ratio 全并列 → least-conn 退化成永远指向
+        -- healthy_peers[1](A、B 请求都落同一后端,其余空转)。改为遇到第 k 个并列者以 1/tie_count
+        -- 概率顶替 → 每个并列 peer 被选中概率均为 1/tie_count(均匀),单趟 O(1) 打散热点。
+        local tie_count = 0
         for _, hp in ipairs(healthy_peers) do
             local ratio = (dict:get(hp[4]) or 0) / hp[6]
-            if ratio < min_ratio then min_ratio = ratio; min_hp = hp end
+            if ratio < min_ratio then
+                min_ratio = ratio; min_hp = hp; tie_count = 1
+            elseif ratio == min_ratio then
+                tie_count = tie_count + 1
+                if math.random() < 1 / tie_count then min_hp = hp end
+            end
         end
         if locked then lock:unlock() end
         return min_hp
