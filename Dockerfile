@@ -16,6 +16,9 @@ COPY nginx.conf ${OR}/nginx/conf/nginx.conf
 #    per-model 路由(session_route_<model>.conf)不 bake —— 由 autoconfig 生成、挂 ConfigMap 到 conf.d/routes/。
 COPY session_base.conf router_locations.inc ${OR}/nginx/conf/conf.d/
 RUN mkdir -p ${OR}/nginx/conf/conf.d/routes
+# 路径路由 dispatch 的 unix socket 目录(session_base.conf 里 listen/proxy_pass 用绝对路径 <prefix>/sock);
+# 非 tmpfs、随镜像层持久,容器起来就在,per-model server bind socket 前目录已存在。
+RUN mkdir -p ${OR}/nginx/sock
 # 3) 引擎 lua 模块
 COPY lua/ ${OR}/nginx/conf/conf.d/lua/
 
@@ -27,5 +30,6 @@ RUN set -eux; \
 # router_locations.inc 引用的 $routed_session_id 由 per-model server(运行时 autoconfig 填入 routes/)声明,
 # 空 routes/ 下 -t 会假报 "unknown routed_session_id"(良性)。-t 在部署后 routes/ 有 conf 时才有意义。
 
-# 路由端口:18080 主(K2.5)+ 各 per-model;STOPSIGNAL/CMD 继承自基础镜像
-EXPOSE 18080 18082 18083 18084 18085 18086 18087 18089 18090 18091
+# 端口:8080 路径路由 dispatch(单外部口,新)+ 8090 health/probe + 18080/各 per-model(过渡期共存);
+# STOPSIGNAL/CMD 继承自基础镜像
+EXPOSE 8080 8090 18080 18082 18083 18084 18085 18086 18087 18088 18089 18090 18091
