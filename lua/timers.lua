@@ -165,11 +165,35 @@ function M.do_adaptive_cc_loop(opts)
         return opts.tps_limit_tps
     end
 
+    -- TTFT 过载信号(方案②):后端首 token 慢(TTFT EWMA 超阈值)也算过载 → 让 cc 收。
+    -- 只对开了 TTFT 限流的路由生效(TTFT_ENABLED + ttft_dict + 未热关 + 有 limit),否则返 false →
+    -- 行为与纯 TPS adaptive_cc 完全一致(向后兼容)。timer 无 ngx.ctx,用显式 model 构造 key/阈值,
+    -- 与 ttft.lua 的 ttft_key_prefix / ttft_limit_for 同构(override > by_model > opts.ttft_limit_ms)。
+    -- per-route opts.adaptive_cc_use_ttft=false 可关(缺省 nil=开)。
+    local function ttft_overloaded(model)
+        if opts.adaptive_cc_use_ttft == false then return false end
+        if not _G.TTFT_ENABLED then return false end
+        local ttd = ngx.shared[opts.ttft_dict]
+        if not ttd or ttd:get(rname .. ":__off") then return false end
+        local pre = rname .. ":" .. (model and (model .. ":") or "")   -- 与 ttft_key_prefix 同构
+        local ew = ttd:get(pre .. "ewma")
+        if not ew then return false end
+        local lim = (model and ttd:get(rname .. ":" .. model .. ":limit_override"))
+                 or ttd:get(rname .. ":limit_override")
+                 or (opts.ttft_limit_by_model and model and opts.ttft_limit_by_model[model])
+                 or opts.ttft_limit_ms
+        return lim ~= nil and ew > lim
+    end
+
     -- 单子池一步 AIMD(model=false 表 flat 路由)。
     local function step_one(model)
         local pre = tps.tps_key_prefix(opts, model)   -- 统一走 helper(flat: model=false → "route:")
         local ewma = td:get(pre .. "ewma")
-        if not ewma then return end          -- 无信号 → 保持当前值不动(不写)
+        -- TPS EWMA 是**活性信号**:nil = 无近期解码样本(lull / 无流量)→ 保持当前值不动(不写 → cc 按 CC_TTL
+        -- 自然老化到 min)。TTFT 收缩只在**有 TPS 活性**时叠加,不能靠 TTFT 单独驱动 —— 否则 TTFT 尖峰后
+        -- 流量归零、TPS EWMA 已过期而 TTFT EWMA 仍 stale-high(可存活 ttft_ttl),会每 tick 把空闲池的 cc 拽到 min。
+        if not ewma then return end
+        local ttft_over = ttft_overloaded(model)   -- 首token慢也当过载信号(方案②),与 ewma<thr 同级叠加(仅有 TPS 活性时)
         local maxcc = route.compute_static_max_cc(opts, model)
         if maxcc <= 0 then return end
         local mincc = route.derive_mincc(opts, maxcc)
@@ -184,8 +208,13 @@ function M.do_adaptive_cc_loop(opts)
             local ABS  = opts.adaptive_cc_abs or 0
             -- 目标 cc:相对(conc/mid≈1.25×)与绝对(conc+ABS)取大 → 任何并发下都留够 ABS 绝对头寸。
             local desired = math.max(conc / mid, conc + ABS)
-            if ewma < thr then
-                cur = cur * DEC                              -- 解码慢(过载)→ 缩,最高优先,照常保护后端
+            if ewma < thr or ttft_over then
+                -- 过载 → 缩,最高优先(压过下面「并发429→涨」)。两类过载(均需 TPS 有活性信号):
+                --   ① 解码慢:TPS EWMA < 阈值(照旧,保护后端 decode 争用);
+                --   ② 首token慢:TTFT EWMA > 阈值(方案②新增)。TTFT-bound 过载时(decode 尚可但
+                --      prefill 队列深)也主动降 cc,与独立的 TTFT-429 半开限流同向——cc↓→admit↓→
+                --      prefill 队列短→TTFT↓,不再像旧逻辑那样被「并发429→×INC」往过载后端灌。
+                cur = cur * DEC
             elseif rej > 0 then
                 -- 有并发 429 = 需求 > cc。被拒的量 rt_sum 看不到 → **不能用 conc 封顶**(会低估、把 cc 锁死),
                 -- 但也**不跳变**:按 ×INC 保守增量爬(与正常压力同速率),到 maxcc 由下方 clamp 兜。

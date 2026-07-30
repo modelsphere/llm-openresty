@@ -130,6 +130,10 @@
         allow 127.0.0.1; deny all;
         content_by_lua_block { _G.dbg_ttft_limit(_G.__route_opts[ngx.var.route]) }
     }
+    location = /_ttft_429_toggle {
+        allow 127.0.0.1; deny all;
+        content_by_lua_block { _G.dbg_ttft_429_toggle(_G.__route_opts[ngx.var.route]) }
+    }
     location = /_tps_status {
         content_by_lua_block { _G.dbg_tps_status(_G.__route_opts[ngx.var.route]) }
     }

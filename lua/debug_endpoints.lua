@@ -115,6 +115,7 @@ function _G.dbg_ttft_status(opts)
         runtime_off           = (td and td:get(rp .. "__off")) and true or false,
         active                = active,
         enforcing             = (active and opts.ttft_limit_ms) and true or false,
+        ttft_429_enabled      = not ttft.ttft_429_disabled(opts),   -- 硬 429 独立开关(false=只软控/cc收缩,不硬拒)
         ttft_limit_ms         = opts.ttft_limit_ms or nil,          -- 路由级默认阈值
         ttft_limit_by_model   = opts.ttft_limit_by_model or nil,    -- 每模型覆盖(peers_by_model)
         ewma_ms               = ewmas,
@@ -152,6 +153,34 @@ function _G.dbg_ttft_toggle(opts)
         global_enabled = _G.TTFT_ENABLED and true or false,
         runtime_off    = td:get(offk) and true or false,
         active         = ttft.ttft_dict_if_on(opts) and true or false,
+    }))
+end
+
+-- POST /_ttft_429_toggle?on=0 → 只关本路由的 TTFT **硬 429**(写 ttft_dict 的 "__429off",免 reload,跨 reload 持久);
+--      on=1 → 恢复(删 "__429off")。与 /_ttft_toggle 不同:这里 EWMA 测量 + cc 收缩(ttft_overloaded)照常,
+--      只是 TTFT 高时不再硬拒新请求(软控保留)。全局 _G.TTFT_ENABLED=false 或 __off 时此开关无意义(TTFT 已全关)。
+function _G.dbg_ttft_429_toggle(opts)
+    if util.opts_missing(opts) then return end
+    ngx.header["Content-Type"] = "application/json"
+    local td = ngx.shared[opts.ttft_dict]
+    if not td then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false, error = "ttft_dict not declared" }))
+        return
+    end
+    local offk = (opts.route_name or "?") .. ":__429off"
+    local on = ngx.var.arg_on
+    if on == "0" then td:set(offk, 1)            -- on=0 → 关硬 429(override)
+    elseif on == "1" then td:set(offk, 0)         -- on=1 → 开硬 429(override,压过 factory default-off;用 0 而非删 key)
+    else
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ ok = false, error = "use ?on=0 (关硬429,保留软控) | ?on=1 (恢复硬429)" }))
+        return
+    end
+    ngx.say(cjson_dbg.encode({
+        route            = opts.route_name, ok = true,
+        ttft_429_enabled = not ttft.ttft_429_disabled(opts),   -- 硬 429 当前是否开
+        note             = "关掉后 EWMA/cc-shrink 仍在,只是不再硬拒",
     }))
 end
 

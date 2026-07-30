@@ -52,6 +52,7 @@ http {
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.s) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.s) } }
     location = /_ttft_status { content_by_lua_block { _G.dbg_ttft_status(_G.__route_opts.s) } }
     location = /_ttft_toggle { content_by_lua_block { _G.dbg_ttft_toggle(_G.__route_opts.s) } }
+    location = /_ttft_429_toggle { content_by_lua_block { _G.dbg_ttft_429_toggle(_G.__route_opts.s) } }
     location = /_ttft_limit { content_by_lua_block { _G.dbg_ttft_limit(_G.__route_opts.s) } } }
   server { listen 19091; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.pm) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.pm) } }
@@ -152,6 +153,25 @@ oc=$(curl -s "$S/_ttft_limit?ms=0" | grep -o '"limit_override_ms":[0-9]*')      
 estab $S "100 100 100 100" 100; bc=$(burst $S 8 100)                  # 200 < 400 → 全 200
 [ "$d0" = "200" ] && [ "${ov:-0}" = "100" ] && echo "$bl" | grep -q 429 && [ -z "$oc" ] && ! echo "$bc" | grep -q 429 \
   && ok "T14 在线阈值:默认放行 / override100→限流($bl) / 清除→放行($bc)" || no "T14 d0=$d0 ov=$ov bl=$bl oc=$oc bc=$bc"
+
+# T15 独立 429 开关(/_ttft_429_toggle:只关硬 429,EWMA 测量 + cc 软控保留;区别于 master /_ttft_toggle)
+expire; estab $S "800 800 800 800 800 800" 800   # 建过载态(EWMA 高)
+bb=$(burst $S 10 800); echo "$bb"|grep -q 429 && ok "T15 前置:429 开时有 429($bb)" || no "T15 前置 burst=$bb"
+curl -s "$S/_ttft_429_toggle?on=0" >/dev/null      # 只关硬 429
+st=$(curl -s $S/_ttft_status); b1=$(burst $S 10 800)
+{ echo "$st"|grep -q '"active":true' && echo "$st"|grep -q '"ttft_429_enabled":false' && ! echo "$b1"|grep -q 429; } \
+  && ok "T15a 关硬429:TTFT 仍 active=true + 全放行无 429($b1)" \
+  || no "T15a active=$(echo "$st"|grep -o '"active":[a-z]*') 429en=$(echo "$st"|grep -o '"ttft_429_enabled":[a-z]*') b1=$b1"
+[ "$(ewj $S)" != '"ewma_ms":{}' ] && ok "T15b 关硬429后 EWMA 仍在测(与 master toggle 关全部不同)" || no "T15b ewma 空=$(ewj $S)"
+curl -s "$S/_ttft_429_toggle?on=1" >/dev/null      # 恢复硬 429
+b2=$(burst $S 10 800); echo "$b2"|grep -q 429 && ok "T15c 恢复硬 429($b2)" || no "T15c b2=$b2"
+
+# T16 master off(/_ttft_toggle __off)→ EWMA 停止测量(对照 T15b:__429off 保留测量)。自包含:建EWMA→master off→打流量→验空→恢复。
+expire; estab $S "800 800 800 800" 800             # 先有 EWMA(master on)
+curl -s "$S/_ttft_toggle?on=0" >/dev/null          # master off
+expire; for i in 1 2 3 4 5 6; do ( fire $S 800 >/dev/null ) & done; wait; sleep 4; fire $S 100 >/dev/null; sleep 1
+[ "$(ewj $S)" = '"ewma_ms":{}' ] && ok "T16 master off → EWMA 停测(off 期打流量 ewma_ms 仍空)" || no "T16 ewma=$(ewj $S)"
+curl -s "$S/_ttft_toggle?on=1" >/dev/null          # 恢复 master
 
 echo
 echo "================ TTFT 套件: PASS=$P FAIL=$F ================"

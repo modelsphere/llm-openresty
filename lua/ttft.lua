@@ -142,4 +142,20 @@ function M.ttft_allow_probe(opts)
     return n <= opts.ttft_probe_per_window
 end
 
+-- TTFT 硬 429 限流的**独立**开关(与 EWMA 测量 / cc 收缩解耦):返回 true = 本路由关掉 TTFT-429,
+-- 但 EWMA 照记(do_log_release)、assess_pool 照读、ttft_overloaded 照收 cc(软控保留),只是不再硬拒新请求。
+-- 用于「只要软控(TTFT 拉低并发上限)、不要硬拒」的场景。优先级:
+--   ① 运行时热关 <route>:__429off(/_ttft_429_toggle?on=0 置上,跨 reload 持久)
+--   ② factory opts.ttft_429_default_enabled == false(永久关)
+-- 缺省(无 override 且 factory 未显式关)= 429 开启,行为与今天完全一致(向后兼容)。
+-- ⚠️ 运行时 override 是**三态**:__429off = 1(关)/ 0(开,压过 factory-off)/ nil(不 override,看 factory)。
+-- 用 0 而非删 key 表示「运行时开」,否则 factory ttft_429_default_enabled=false 的路由 on=1 删 key 后仍回落 factory-false、恢复不了。
+function M.ttft_429_disabled(opts)
+    local td = ngx.shared[opts.ttft_dict]
+    local ovr = td and td:get((opts.route_name or "?") .. ":__429off")
+    if ovr ~= nil then return ovr == 1 end                          -- 运行时 override 优先(1=关/0=开)
+    if opts.ttft_429_default_enabled == false then return true end  -- 无 override → 看 factory 默认
+    return false
+end
+
 return M

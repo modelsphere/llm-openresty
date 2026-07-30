@@ -165,7 +165,8 @@ function _G.do_route(opts)
     -- 其余 429。后端恢复 → 探测样本拉低 EWMA → 自动解除。
     local ttft_limit = ttft.ttft_limit_for(opts)   -- 按模型解析(peers_by_model 可每模型不同)
     local hit_ttft = ttft_limit and a.ttft_ewma and a.ttft_ewma >= ttft_limit
-    if hit_ttft and not is_probe and not ttft.ttft_allow_probe(opts) then
+    -- ttft_429_disabled:独立开关关掉硬 429(EWMA 测量 + cc 收缩仍在),TTFT 高只软控不硬拒。
+    if hit_ttft and not is_probe and not ttft.ttft_429_disabled(opts) and not ttft.ttft_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":ttft",1,0) end end
         ngx.header["Content-Type"] = "application/json"
