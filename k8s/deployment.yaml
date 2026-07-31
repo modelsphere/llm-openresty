@@ -39,8 +39,8 @@ spec:
       labels: { app: openresty-router }
     spec:
       # ★ 唯一硬切刀:到点 SIGKILL 强砍在途流。openresty proxy timeout 到 3600s、LLM 64K 输出可能上千秒
-      #   → 按你能接受的「滚更时最长排空多久」设。要绝不切超长流就调到 ≥ 最长响应(代价:老 pod Terminating 更久)。
-      terminationGracePeriodSeconds: 600
+      #   → 3600 = 对齐 proxy_read_timeout(排空到最长流生命周期,基本不切超长流;代价:老 pod Terminating 可能很久)。
+      terminationGracePeriodSeconds: 3600
       containers:
       - name: openresty
         image: registry.example.com/llm/llm-openresty:0.3.4-dispatch   # 路径路由(8080 dispatch)镜像

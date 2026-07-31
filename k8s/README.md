@@ -9,7 +9,7 @@ conf(`session_route_<route>.conf`)不烤镜像** —— 挂 ConfigMap 到 `conf.
 
 | 方式 | 何时用 | 路由来源 | HA / 热更 |
 |---|---|---|---|
-| **Helm chart(`helm/openresty`,推荐)** | 生产 | autoconfig 从 ModelRoute 动态写 `conf.d/routes` | 主备 HA(hagate)+ reload sidecar 热更 + 优雅停机 |
+| **Helm chart(`k8s/helm/openresty`,推荐)** | 生产 | autoconfig 从 ModelRoute 动态写 `conf.d/routes` | 主备 HA(hagate)+ reload sidecar 热更 + 优雅停机 |
 | **`k8s/deployment.yaml`(standalone)** | 快速起个参考 pod | 自己填 `openresty-routes` ConfigMap | 单副本、无 sidecar(改配置 = 手动 reload / 重部) |
 
 ```bash
@@ -18,7 +18,7 @@ docker build -t registry.example.com/llm/llm-openresty:<tag> .
 docker push registry.example.com/llm/llm-openresty:<tag>
 
 # A) Helm(生产:主备 + autoconfig 动态路由 + 热更)
-helm -n openresty upgrade --install openresty helm/openresty --create-namespace \
+helm -n openresty upgrade --install openresty k8s/helm/openresty --create-namespace \
   --set image.tag=<tag>
 
 # B) standalone 参考(单副本、路由自己填 openresty-routes ConfigMap)
@@ -45,7 +45,7 @@ kubectl -n openresty rollout status deploy/openresty-router
 nginx 信号是反的:**SIGTERM=快速停机(砍在途)**、**SIGQUIT=优雅排空**。k8s 停 pod 默认发 SIGTERM,三件套解决:
 
 1. **镜像 `STOPSIGNAL SIGQUIT`** → k8s 停 pod 时实际发 SIGQUIT,nginx 优雅排空(停 accept、等在途长流跑完再退)。
-2. **`terminationGracePeriodSeconds`**(默认 **600**)→ 唯一硬切刀,到点 SIGKILL。按最长流式响应设(proxy timeout
+2. **`terminationGracePeriodSeconds`**(默认 **3600**)→ 唯一硬切刀,到点 SIGKILL。按最长流式响应设(proxy timeout
    3600s、64K 输出可能上千秒;调大代价是滚更时老 pod Terminating 更久)。Helm:`terminationGracePeriodSeconds` value。
 3. **`preStop: sleep 5`** → pod 进 Terminating 后要几秒才从 Service 端点摘除完(传播到各节点 kube-proxy),先睡住
    让摘除传播完再关 listener → 排空期不再进新连接被拒。Helm:`preStop.sleepSeconds` value(设 0 = 不注入)。

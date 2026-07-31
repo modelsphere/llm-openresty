@@ -29,7 +29,8 @@ podDisruptionBudget:
 # → k8s 停 pod 实际发 SIGQUIT,nginx 停 accept、等在途长流跑完再退。配合下面两项:
 # terminationGracePeriodSeconds:唯一硬切刀,到点 SIGKILL 强砍在途流。LLM 64K 输出可能跑上千秒,
 #   按「滚更时最长排空多久」设;调大代价 = 老 pod Terminating 更久。0/空 = 用 k8s 默认 30s(不建议,会砍长流)。
-terminationGracePeriodSeconds: 600
+#   3600 = 对齐 proxy_read_timeout 3600s(排空到最长流生命周期,基本不切超长流)。
+terminationGracePeriodSeconds: 3600
 # preStop:pod 进 Terminating 后要几秒才从 Service 端点摘除完(传播到各节点 kube-proxy);
 #   先 sleep 住、让摘除传播完再关 nginx listener → 排空期间不再进新连接被拒(消「摘除竞态」)。
 #   sleepSeconds: 0 = 不注入 preStop(接受滚更瞬间偶发可重试的连接 reset)。
