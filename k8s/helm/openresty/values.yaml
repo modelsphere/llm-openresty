@@ -61,9 +61,9 @@ service:
     - { name: dispatch, port: 8080 }   # ← 外部入口:客户端/llm-gateway 打 8080/<route>/v1/…(加模型不用改这里)
     - { name: health,   port: 8090 }
 
-resources:
-  requests: { cpu: 100m, memory: 128Mi }
-  limits: { cpu: "2", memory: 1Gi }
+resources:                              # worker_processes=20 的生产 openresty:上限 20c/32Gi
+  requests: { cpu: "2",  memory: 2Gi }  # 请求给中档保调度;要 Guaranteed QoS 就把 requests 提到 = limits
+  limits:   { cpu: "20", memory: 32Gi }
 
 podAnnotations: {}
 nodeSelector: {}

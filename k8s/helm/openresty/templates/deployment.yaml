@@ -42,9 +42,8 @@ spec:
           {{- end }}
           ports:
             {{- range .Values.service.ports }}
-            - containerPort: {{ .port }}
+            - containerPort: {{ .port }}   # dispatch 8080 + health/admin 8090(service.ports 已含 adminPort,不再单列)
             {{- end }}
-            - containerPort: {{ .Values.adminPort }}   # 固定 admin/health 口(baked)
           volumeMounts:
             - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes

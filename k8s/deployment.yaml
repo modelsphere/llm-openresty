@@ -58,6 +58,10 @@ spec:
         volumeMounts:
         - { name: routes, mountPath: /usr/local/openresty/nginx/conf/conf.d/routes }   # per-model 路由 conf(整卷挂)
         - { name: sock,   mountPath: /usr/local/openresty/nginx/sock }                 # dispatch ↔ per-model 的 unix socket
+        startupProbe:                                  # 慢启动预算:/healthz 起来前不判 live/ready(最多 ~60s),不误杀
+          httpGet: { path: /healthz, port: 8090 }
+          periodSeconds: 2
+          failureThreshold: 30
         readinessProbe:                                # 打固定 admin 口 /healthz(不随动态路由端口变);未就绪只摘端点、不重启
           httpGet: { path: /healthz, port: 8090 }
           initialDelaySeconds: 3
