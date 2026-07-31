@@ -10,6 +10,13 @@
 #    (自 2026-05-18 关、vllm_retry_static 早 down);连带删 do_log_release_retry_byvar 与 routed_dict。
     access_log  logs/access.log  session_log;
 
+    # 路径路由 D″:per-model server 只监听 unix socket → $remote_addr 为空 → `allow 127.0.0.1` 的 admin/调参
+    # 端点(_tps_limit / _ttft_limit / toggle 等)会 403。信任 dispatch 经 unix socket 转来的 X-Real-IP
+    # (dispatch 设成打 8080 的真实客户端 IP)还原 $remote_addr → 只有从 127.0.0.1 打 dispatch(in-pod 本地)
+    # 才过 allow;外部经 8080 打来真实 IP 非 127 仍被 deny(安全不降)。老 TCP 端口(共存期)不经 socket、不受影响。
+    set_real_ip_from unix:;
+    real_ip_header    X-Real-IP;
+
     # allow up to 1m JSON body fully in memory (get_body_data works up to this size)
     client_body_buffer_size 2m;
     client_max_body_size    50m;
