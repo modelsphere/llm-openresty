@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 · D″ 收口:验证「per-model server 只把 listen 改成 unix socket(其余不动:真 lua factory +
+# dispatch+socket 探针:验证「per-model server 只把 listen 改成 unix socket(其余不动:真 lua factory +
 # router_locations),前面一个 dispatch server 从路径捕获 route、proxy 到 /<route>.sock」全链路。
 # 证:① /<route>/v1/ 经 dispatch → socket → 真 do_route → mock 后端拿到真回答 ② SSE 流式过双跳
 # ③ /<route>/_tps_status 等 debug 也通 ④ 未知 route 优雅报错(不崩)⑤ Host 头原样透传(不被魔改)。
@@ -32,7 +32,7 @@ http {
   init_worker_by_lua_block {
     math.randomseed(ngx.now()*1000 + ngx.worker.pid())
     _G.TPS_BUCKETS = {5,10,20,40,80,150,300}; _G.TTFT_BUCKETS_MS = {50,100,200,300,500,800,1200}
-    -- D″ 里注册照旧靠 per-model server 的 set_by_lua;这里图省事直接 init_worker 注册 glm(注册机制无关本次验证)
+    -- 路径路由 里注册照旧靠 per-model server 的 set_by_lua;这里图省事直接 init_worker 注册 glm(注册机制无关本次验证)
     _G.register_route("glm", function() return {
       peers = {{"127.0.0.1",28941,"g1"},{"127.0.0.1",28942,"g2"}},
       default_max=50, bodylog_default_enabled=false, health_check_interval=9999, adaptive_cc=false } end)
@@ -61,7 +61,7 @@ http {
     location ~ ^/(?<droute>[a-z0-9._-]+)(?<rest>/.*)\$ {
       proxy_pass http://unix:$PREFIX/routes/\$droute.sock:\$rest;
       proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s;
-      proxy_set_header Host \$host;   # 原样透传客户端 Host(D″ 用不着占 Host 做路由 → 能保留它)
+      proxy_set_header Host \$host;   # 原样透传客户端 Host(路径路由 用不着占 Host 做路由 → 能保留它)
     }
     location = /_up { return 200 "dispatch up\n"; }
   }
@@ -99,9 +99,9 @@ echo "  未知 route code=$UC"
 [ "$UC" = 502 ] || [ "$UC" = 404 ] || [ "$UC" = 503 ] && ok "未知 route → $UC(优雅错误,进程没崩)" || no "未知 route 行为异常($UC)"
 curl -s -o /dev/null -w "%{http_code}" "$D/_up" | grep -q 200 && ok "dispatch 进程仍健康(未知 route 后)" || no "dispatch 崩了"
 
-echo "=== ⑤ Host 头原样透传(D″ 不魔改 Host)==="
+echo "=== ⑤ Host 头原样透传(路径路由 不魔改 Host)==="
 HH=$(curl -s -H "Host: myhost.example" "$D/glm/_echo_host")
 echo "  $HH"
 echo "$HH"|grep -q 'host=myhost.example' && ok "Host 原样透传(route 从路径来,不占 Host)" || no "Host 被改了: $HH"
 
-echo ""; echo "================ D″ dispatch+socket: PASS=$P FAIL=$F ================"; [ "$F" = 0 ] && echo "D2 PROBE PASS ✅" || echo "D2 PROBE FAIL ❌"
+echo ""; echo "================ 路径路由 dispatch+socket: PASS=$P FAIL=$F ================"; [ "$F" = 0 ] && echo "PROBE PASS ✅" || echo "PROBE FAIL ❌"
