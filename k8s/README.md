@@ -1,18 +1,28 @@
 # openresty 路由器上 k8s
 
-把 `openresty/` 这套全模型 session-affinity 路由(K2.5/K2.6/GLM/b300/... 一套 conf)
-容器化 + k8s 部署。配置 = 本仓库权威副本,烤进镜像。
+把 `openresty/` 这套全模型 session-affinity 路由(K2.5/K2.6/GLM/b300/... 一套引擎)容器化 + k8s 部署。
+**路径路由**:外部只打一个口 **8080**,dispatch 按请求路径首段 `/<route>/` 派生到 per-model server 的
+unix socket。**框架基座**(dicts + 8080 dispatch + 8090 admin + lua 引擎)烤进镜像;**per-model 路由
+conf(`session_route_<route>.conf`)不烤镜像** —— 挂 ConfigMap 到 `conf.d/routes/`(手填,或由 autoconfig 动态写入)。
 
-## 构建 & 部署
+## 两种部署方式
 
-底座 = `ubuntu:22.04` + 从 openresty.org apt 装 openresty(**对齐现有 harbor 镜像 `llm/llm-openresty`**;不是 docker.io/openresty,内网拉不到)。已在 chat 实测 build 通过、`openresty -t` 全模型配置校验成功(openresty 1.29.2.3(对齐生产),镜像 193MB)。
+| 方式 | 何时用 | 路由来源 | HA / 热更 |
+|---|---|---|---|
+| **Helm chart(`helm/openresty`,推荐)** | 生产 | autoconfig 从 ModelRoute 动态写 `conf.d/routes` | 主备 HA(hagate)+ reload sidecar 热更 + 优雅停机 |
+| **`k8s/deployment.yaml`(standalone)** | 快速起个参考 pod | 自己填 `openresty-routes` ConfigMap | 单副本、无 sidecar(改配置 = 手动 reload / 重部) |
 
 ```bash
-# 在 openresty/ 目录下(Dockerfile 用相对 COPY)
-docker build -t registry.example.com/llm/llm-openresty:0.1.0 .
-docker push registry.example.com/llm/llm-openresty:0.1.0
+# 构建镜像(在 openresty/ 目录下;Dockerfile FROM harbor openresty-base,纯 COPY 配置)
+docker build -t registry.example.com/llm/llm-openresty:<tag> .
+docker push registry.example.com/llm/llm-openresty:<tag>
 
-kubectl apply -f k8s/deployment.yaml                 # Namespace + Deployment(replicas:1) + Service
+# A) Helm(生产:主备 + autoconfig 动态路由 + 热更)
+helm -n openresty upgrade --install openresty helm/openresty --create-namespace \
+  --set image.tag=<tag>
+
+# B) standalone 参考(单副本、路由自己填 openresty-routes ConfigMap)
+kubectl apply -f k8s/deployment.yaml
 kubectl -n openresty rollout status deploy/openresty-router
 ```
 
@@ -23,41 +33,45 @@ kubectl -n openresty rollout status deploy/openresty-router
 | StatefulSet 提供 | 这里需要吗 |
 |---|---|
 | 稳定 pod 身份 / 稳定 DNS | ❌ 藏在 Service 后,客户端不寻址单 pod |
-| 每 pod 独立持久卷(PVC) | ❌ 配置在镜像;`lua_shared_dict`(active_conns/ban 列表/限流计数)是每 pod 内存态、重启重建,不持久 |
+| 每 pod 独立持久卷(PVC) | ❌ 路由 conf 走 ConfigMap;`lua_shared_dict`(active_conns/ban 列表/限流计数)是每 pod 内存态、重启重建,不持久 |
 | 有序启停 | ❌ 副本完全等价 |
 
 路由是 **crc32 一致性哈希(按 sid)**:各副本 PEERS 一致 → 同 sid 必落同后端,换 pod 不破坏会话亲和。
-→ **Deployment**,`replicas:1` 起步,抗压直接水平扩。
+→ **Deployment**。注意:openresty 的路由态是**每 pod 内存**,所以 Helm chart 用 **主备(master-standby)**
+只让 leader 收流量(不能 active-active),而非简单水平扩多活。
 
-## 优雅停机(和主 README「优雅停机」一致)
+## 优雅停机(三件套,`k8s/deployment.yaml` 与 Helm chart 一致)
 
-nginx 信号是反的:**SIGTERM=快速停机(砍在途)**,**SIGQUIT=优雅排空**。而 k8s 停 pod 默认发 SIGTERM。
-三件套解决:
+nginx 信号是反的:**SIGTERM=快速停机(砍在途)**、**SIGQUIT=优雅排空**。k8s 停 pod 默认发 SIGTERM,三件套解决:
 
-1. **镜像 `STOPSIGNAL SIGQUIT`** → k8s 停 pod 时实际发 SIGQUIT,nginx 走优雅排空(停止 accept、等在途长流跑完再退)。
-2. **`terminationGracePeriodSeconds`**(deployment.yaml 默认 600)→ 唯一硬切刀,到点 SIGKILL。按最长流式响应设(64K 输出可能上千秒;调大代价是滚更时老 pod Terminating 更久)。
-3. **`preStop: sleep 5`** → pod 进 Terminating 后要几秒才从上游 Service 端点摘除,睡一下保证排空期间不再进新连接。
+1. **镜像 `STOPSIGNAL SIGQUIT`** → k8s 停 pod 时实际发 SIGQUIT,nginx 优雅排空(停 accept、等在途长流跑完再退)。
+2. **`terminationGracePeriodSeconds`**(默认 **600**)→ 唯一硬切刀,到点 SIGKILL。按最长流式响应设(proxy timeout
+   3600s、64K 输出可能上千秒;调大代价是滚更时老 pod Terminating 更久)。Helm:`terminationGracePeriodSeconds` value。
+3. **`preStop: sleep 5`** → pod 进 Terminating 后要几秒才从 Service 端点摘除完(传播到各节点 kube-proxy),先睡住
+   让摘除传播完再关 listener → 排空期不再进新连接被拒。Helm:`preStop.sleepSeconds` value(设 0 = 不注入)。
 
-配置变更**优先 SIGHUP reload、别重建 pod**(见下),reload 不断长流。
+滚动策略 `maxSurge:1 / maxUnavailable:0`(先起新 pod ready 再排空老 pod,零不可用);Helm:`updateStrategy` value。
+配置变更**优先 SIGHUP reload(reload sidecar 干这个)、别重建 pod** —— reload 不断长流。
 
-## ⚠️ 上集群前必调两项
+## per-model 路由从哪来(不烤镜像)
 
-1. **PEERS 要重指向集群内地址**:`session_route*.conf` 里的 `_G.PEERS` 现在是生产裸机 IP(`10.0.0.1` 等)。
-   集群内若路由不到这些 IP,得把 PEERS 改成 in-cluster **Service 地址**(每个模型/每组一个 ClusterIP Service,
-   见主 README「多副本 LWS 路由」一节)。这是让路由真正生效的关键,镜像只是把当前 conf 烤进去。
-2. **bodylog listener**(可选):openresty 把 body-log 异步发到 `BODYLOG_LISTENER_HOST:PORT`。
-   deployment.yaml 里默认留空 → logger-socket 连不上会 buffer/drop、非阻塞,**不影响转发**。
-   要收集就单独部一个 listener(Go 二进制,源码 `openresty/bodylog-listener-go/`)+ Service,把 env 指过去。
+镜像只烤**框架基座**(`session_base.conf` 的 8080 dispatch + 8090 admin + dicts + `lua/`),**零具体路由**。
+运行时 `conf.d/routes/` 由 ConfigMap 提供:
 
-## 配置热更(不重建镜像)——可选
+- **Helm + autoconfig(推荐)**:autoconfig 从 `ModelRoute` CRD 发现后端 → 写 `session_route_<route>.conf`
+  进 `openresty-conf` ConfigMap → reload sidecar SIGHUP 生效。**peers = 后端 pod IP,由 autoconfig 事件驱动跟随**
+  (扩缩/重启自动更新),无需手工维护 PEERS。
+- **standalone**:自己往 `openresty-routes` ConfigMap 填 `session_route_<route>.conf`,改完 `openresty -s reload`。
 
-当前是「配置烤进镜像」:改配置 = 重建镜像 + 滚动更新(有 STOPSIGNAL+grace 兜底,滚更也优雅)。
-若要不重建就热更:把 `conf.d/`(含 lua)改成 **ConfigMap 挂载** + 一个 **reloader sidecar**
-(watch ConfigMap 变化 → `openresty -s reload`,SIGHUP 优雅不断连接)。代价是 ConfigMap 有 1MiB 上限、
-10+ 个 lua 模块要拆多个 ConfigMap,取舍看是否需要频繁热更。
+## bodylog listener(可选)
+
+openresty 把 body-log 异步发到 `BODYLOG_LISTENER_HOST:PORT`(镜像已把 nginx.conf 改成 env 透传)。
+默认留空 → logger-socket 连不上会 buffer/drop、**非阻塞、不影响转发**。要收集就单独部一个 listener
+(Go 二进制,源码 `openresty/bodylog-listener-go/`)+ Service,把 env 指过去。
 
 ## 端口
 
-18080 主(K2.5)| 18082 k2.6 | 18083 glm | 18084 glm-b300 | 18085 k2.6-b300 |
-18086 model-service | 18087 fallback | 18089 canary | 18090 finch | 18091 vendor-gpu
-(443 域名 `llm-gateway-1.example.com.conf` 是 gateway-host 专属、需 SSL,不进通用镜像)
+- **8080** = dispatch(唯一外部入口;客户端/llm-gateway 打 `8080/<route>/v1/…`,加模型不用改端口)。
+- **8090** = admin/health(baked,`/healthz`;k8s 探针 + hagate 都盯它,不随动态路由变)。
+- per-model 不再占 TCP 端口(只监听 `conf.d/routes` 里的 unix socket)。443 域名
+  `llm-gateway-1.example.com.conf` 是 gateway-host 专属、需 SSL,不进通用镜像。
