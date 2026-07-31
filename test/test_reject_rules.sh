@@ -4,7 +4,7 @@
 # 自建一个 route "r"(peers=mock)配 reject_rules,真实走 do_route → 验证 429/自定义 status + endpoint + 热切。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/rejectrules_suite}"; KEY=REDACTED-API-KEY

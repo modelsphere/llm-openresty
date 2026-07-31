@@ -10,7 +10,6 @@
 ```bash
 # 在 openresty/ 目录下(Dockerfile 用相对 COPY)
 docker build -t registry.example.com/llm/llm-openresty:0.1.0 .
-docker login registry.example.com -u llm          # 密码见本机 ~/.ssh/harbor-pass 第 3 段
 docker push registry.example.com/llm/llm-openresty:0.1.0
 
 kubectl apply -f k8s/deployment.yaml                 # Namespace + Deployment(replicas:1) + Service

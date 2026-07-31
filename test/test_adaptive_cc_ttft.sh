@@ -12,7 +12,7 @@
 #   T3  r  TTFT 恢复到 100(<limit)后,rej>0 → cc 重新 ×INC 回涨  ← 只有 TTFT 在压 cc,恢复即松
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PREFIX="${PREFIX:-/tmp/ccttfttest}"; KEY=REDACTED-API-KEY
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1

@@ -4,7 +4,7 @@
 # 证明:① 小并发下绝对头寸把 cc 抬离 1.25×conc;② 缩不破 conc+ABS 绝对底;③ 429 计入 rej 信号。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"; PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/abstest}"; KEY=REDACTED-API-KEY
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1
