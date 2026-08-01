@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bodylog.fullname" . }}
+  labels: {{- include "bodylog.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  strategy:
+    type: {{ .Values.strategy }}   # Recreate:单实例独占 RWO PVC,不能两 pod 并存
+  selector:
+    matchLabels: {{- include "bodylog.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "bodylog.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bodylog
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: BODYLOG_HOST,      value: "0.0.0.0" }
+            - { name: BODYLOG_PORT,      value: "{{ .Values.ports.frame }}" }
+            - { name: BODYLOG_HTTP_HOST, value: "0.0.0.0" }
+            - { name: BODYLOG_HTTP_PORT, value: "{{ .Values.ports.http }}" }
+            - { name: BODYLOG_DIR,       value: "{{ .Values.dataDir }}" }
+            - name: BODYLOG_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ include "bodylog.secretName" . }}, key: BODYLOG_HTTP_TOKEN }
+          ports:
+            - { name: frame, containerPort: {{ .Values.ports.frame }} }   # openresty 帧接入(TCP)
+            - { name: http,  containerPort: {{ .Values.ports.http }} }    # /summary /metrics /healthz
+          {{- if .Values.probes.enabled }}
+          startupProbe:                    # 起来前不判 live/ready(慢启动预算)
+            httpGet: { path: /healthz, port: {{ .Values.ports.http }} }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.ports.http }} }
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:                  # /healthz 始终开放(不鉴权),就绪即可被 Service 路由
+            httpGet: { path: /healthz, port: {{ .Values.ports.http }} }
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- end }}
+          {{- with .Values.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: data, mountPath: {{ .Values.dataDir }} }
+      volumes:
+        - name: data
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim: { claimName: {{ include "bodylog.pvcName" . }} }
+        {{- else }}
+          emptyDir: {}          # 非持久:Pod 重启丢历史 bodylog(仅测试)
+        {{- end }}

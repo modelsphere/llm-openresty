@@ -1,0 +1,30 @@
+# bodylog-listener 镜像(k8s)。多阶段:golang 编 CGO 二进制 → glibc runtime。
+# ⚠️ CGO_ENABLED=1(内嵌 go-duckdb):不是纯静态,链 glibc+libstdc++,必须 glibc runtime(非 alpine)。
+# 构建上下文 = openresty 仓库根(才能访问 bodylog-listener-go/)。
+#   docker build -f Dockerfile.bodylog -t registry.example.com/llm/bodylog-listener:<tag> .
+# 离线 CI:go module 从内网源拉 → --build-arg GOPROXY=<内网 goproxy>;bases 换 harbor 内网 glibc 镜像。
+# 备选(彻底离线,不 build):仓库已有预编译产物 bodylog-listener-go/bodylog-listener(linux/amd64),
+#   可改成单阶段 `FROM <glibc base>` + `COPY bodylog-listener-go/bodylog-listener /usr/local/bin/`。
+ARG GO_BASE=golang:1.24-bookworm
+ARG RUNTIME_BASE=debian:bookworm-slim
+ARG GOPROXY=https://proxy.golang.org,direct
+
+FROM ${GO_BASE} AS builder
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY} CGO_ENABLED=1 GOOS=linux GOARCH=amd64
+WORKDIR /src
+COPY bodylog-listener-go/go.mod bodylog-listener-go/go.sum ./
+RUN go mod download
+COPY bodylog-listener-go/ ./
+RUN go build -ldflags="-s -w" -o /bodylog-listener .
+
+FROM ${RUNTIME_BASE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /bodylog-listener /usr/local/bin/bodylog-listener
+ENV BODYLOG_HOST=0.0.0.0 BODYLOG_PORT=9999 \
+    BODYLOG_HTTP_HOST=0.0.0.0 BODYLOG_HTTP_PORT=9998 \
+    BODYLOG_DIR=/data/bodylog
+EXPOSE 9999 9998
+ENTRYPOINT ["/usr/local/bin/bodylog-listener"]
