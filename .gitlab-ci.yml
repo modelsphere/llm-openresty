@@ -14,6 +14,8 @@ stages: [build]
 
 variables:
   IMAGE: registry.example.com/llm/llm-openresty
+  BODYLOG_IMAGE: registry.example.com/llm/bodylog-listener
+  DOCKER_BUILDKIT: "0"             # 出简单 v2 manifest,containerd 直接拉(buildkit attestation manifest-list 拉取会卡)
 
 build:image:
   stage: build
@@ -24,3 +26,17 @@ build:image:
     - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
     - docker push "$IMAGE:$CI_COMMIT_TAG"
     - docker push "$IMAGE:latest"
+
+# bodylog-listener 镜像:多阶段 FROM harbor golang:1.24 编 CGO(go-duckdb)→ harbor debian:12-slim。
+# 与 openresty 不同,bodylog 要真编译:go module 从阿里云 goproxy 拉(runner 需能到 mirrors.aliyun.com);
+# 若 runner 彻底离线,改 `go mod vendor` 入库 + Dockerfile 加 -mod=vendor。base(golang/debian)都在 harbor。
+# 实测:gpu-node 上多阶段 build 通过、镜像 duckdb 正常加载。
+build:bodylog:
+  stage: build
+  tags: [public-buildx]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$CI_COMMIT_TAG" -t "$BODYLOG_IMAGE:latest" .
+    - docker push "$BODYLOG_IMAGE:$CI_COMMIT_TAG"
+    - docker push "$BODYLOG_IMAGE:latest"
