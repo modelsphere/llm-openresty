@@ -1,6 +1,6 @@
 image:
   repository: registry.example.com/llm/llm-openresty
-  tag: "0.3.4-dispatch"     # 路径路由就绪:8080 dispatch + per-model unix socket(含 query 透传 + unix-socket real_ip 修复)
+  tag: "0.3.5-health"       # per-peer 健康探针(cart→/health,修 /v1/models 缓存骗过探针)
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)
