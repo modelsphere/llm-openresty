@@ -1,6 +1,6 @@
 image:
   repository: registry.example.com/llm/llm-openresty
-  tag: "0.3.5-health"       # per-peer 健康探针(cart→/health,修 /v1/models 缓存骗过探针)
+  tag: "0.3.6-resolver"     # + resolver local=on(cosocket 解析 k8s Service 名,修 bodylog 发帧)
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)
