@@ -74,5 +74,5 @@ fullnameOverride: ""
 
 # bodylog-listener 地址(openresty 发帧目标)。host 空=用镜像默认(生产 gateway-host);集群内填 bodylog Service DNS。
 bodylog:
-  host: ""              # 如 "bodylog"(同 ns)或 "bodylog.<ns>.svc.cluster.local"
+  host: ""              # ⚠️ 集群内必须用 FQDN(nginx resolver 不套 search 域):bodylog.<ns>.svc.cluster.local。空=用镜像默认(生产 IP)
   port: 9999
