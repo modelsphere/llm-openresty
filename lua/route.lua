@@ -89,10 +89,16 @@ function _G.register_route(name, opts_factory)
     -- 下游 do_route/dbg/balancer 的 ipairs(peers) 会崩(ipairs nil → 500)。置空表后
     -- 退化成优雅的 503 "all peers banned"(与 peers={} 一致)。
     opts.peers = opts.peers or {}
-    -- 自动构建 peer_keys
+    -- 自动构建 peer_keys + per-peer 健康探测路径映射(peer 的命名字段 probe = 探测路径,可选)。
+    -- 用途:cache_aware_router 的 /v1/models 是缓存端点(worker 全挂也返 200,不能当健康信号),
+    -- 故 cart peer 配 probe="/health"(worker-aware,0 healthy→503);后端 peer 不配 → 回落 health_probe_path。
+    -- 用命名字段(非第 6 位)以免和位置元组 {ip,port,name,priority,max} 冲突、也不需填满前置位。
     opts.peer_keys = {}
+    opts.probe_path_by_key = {}
     for _, p in ipairs(opts.peers) do
-        opts.peer_keys[#opts.peer_keys + 1] = p[1] .. ":" .. p[2]
+        local key = p[1] .. ":" .. p[2]
+        opts.peer_keys[#opts.peer_keys + 1] = key
+        if p.probe then opts.probe_path_by_key[key] = p.probe end
     end
     -- dict 名约定：<base>_<route_name>（必须跟 conf 顶部 lua_shared_dict 声明一致）
     -- factory 可显式覆盖（如 api_keys_dict 跨路由共用 "api_keys"）。

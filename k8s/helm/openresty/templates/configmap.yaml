@@ -1,0 +1,11 @@
+# 路由 ConfigMap:chart 建初值(initialRoutes),autoconfig 更新(3-way merge 不覆盖其加的 key)。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMapName }}
+  labels: {{- include "openresty.labels" . | nindent 4 }}
+data:
+{{- range $f, $c := .Values.initialRoutes }}
+  {{ $f }}: |
+{{ $c | indent 4 }}
+{{- end }}

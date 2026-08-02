@@ -24,10 +24,12 @@ function M.do_health_check_loop(opts)
     local HEALTH_INTERVAL = opts.health_check_interval or 10
     local BAN_TTL         = opts.health_ban_ttl or 300
     local PROBE_PATH      = opts.health_probe_path or _G.DEFAULT_HEALTH_PROBE_PATH   -- per-route 可配探针路径
+    local PROBE_BY_KEY    = opts.probe_path_by_key or {}                             -- per-peer 覆盖(route.lua 从 peer 第6位构建)
     local function check_all_peers()
         local bad = ngx.shared[opts.bad_peers_dict]
         for _, pk in ipairs(opts.peer_keys) do
             local host, port = pk:match("^(.+):(%d+)$")
+            local probe_path = PROBE_BY_KEY[pk] or PROBE_PATH   -- cart 层探 /health,后端层探 /v1/models
             local sock = ngx.socket.tcp()
             sock:settimeout(10000)
             local ok, err = sock:connect(host, tonumber(port))
@@ -39,7 +41,7 @@ function M.do_health_check_loop(opts)
                 bad:set(pk, true, BAN_TTL)
                 sock:close()
             else
-                sock:send("GET " .. PROBE_PATH .. " HTTP/1.0\r\nHost: " .. host .. "\r\n\r\n")
+                sock:send("GET " .. probe_path .. " HTTP/1.0\r\nHost: " .. host .. "\r\n\r\n")
                 local line, rerr = sock:receive("*l")
                 sock:close()
                 if line and line:find("200") then

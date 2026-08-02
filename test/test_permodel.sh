@@ -4,7 +4,7 @@
 # 隔离 openresty + mock,自清理,不碰生产。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"; PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/pmtest}"; KEY=REDACTED-API-KEY
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1

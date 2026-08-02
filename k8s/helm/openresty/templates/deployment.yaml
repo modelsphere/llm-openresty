@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openresty.fullname" . }}
+  labels: {{- include "openresty.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  {{- with .Values.updateStrategy }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .maxSurge }}
+      maxUnavailable: {{ .maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "openresty.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "openresty.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}   # 硬切刀;镜像 STOPSIGNAL=SIGQUIT 优雅排空在途长流
+      {{- end }}
+      {{- if .Values.ha.enabled }}
+      serviceAccountName: {{ include "openresty.fullname" . }}   # ha-gate 用它管 Lease
+      {{- end }}
+      {{- if .Values.reload.enabled }}
+      shareProcessNamespace: true   # reload sidecar 靠此给 nginx master 发 SIGHUP
+      {{- end }}
+      containers:
+        - name: openresty
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if gt (int .Values.preStop.sleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              # 睡到 Service 端点摘除传播完再关 nginx listener,排空期不再进新连接(消摘除竞态)
+              exec: { command: ["/bin/sh", "-c", "sleep {{ .Values.preStop.sleepSeconds }}"] }
+          {{- end }}
+          ports:
+            {{- range .Values.service.ports }}
+            - containerPort: {{ .port }}   # dispatch 8080 + health/admin 8090(service.ports 已含 adminPort,不再单列)
+            {{- end }}
+          volumeMounts:
+            - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
+              mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
+            - name: route-sock                                                # 路径路由 dispatch 的 unix socket(与 reload 共享,供清孤儿)
+              mountPath: /usr/local/openresty/nginx/sock
+          {{- if .Values.probes.enabled }}
+          startupProbe:                     # 慢启动预算:admin 口 /healthz 起来前不判 live/ready(最多 ~60s)
+            httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:                    # startup 过后才生效 → 可 snappy、无 initialDelay(不会启动期误杀);快抓假死
+            httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:                   # startup 过后 admin 口在 → 秒 Ready;谁收流量另由 ha-gate active 标签决定
+            httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
+            periodSeconds: 2
+            failureThreshold: 2
+          {{- end }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.reload.enabled }}
+        - name: reload
+          image: {{ .Values.reload.image }}
+          # --sock-dir:reload 前清「无 conf 引用的孤儿 <name>.sock」(路径路由;删模型后残留 socket)
+          args: ["--watch", "/watch", "--process", {{ .Values.reload.process | quote }}, "--sock-dir", "/usr/local/openresty/nginx/sock"]
+          volumeMounts:
+            - name: routes
+              mountPath: /watch
+            - name: route-sock                                                # 与 openresty 共享 socket 目录
+              mountPath: /usr/local/openresty/nginx/sock
+        {{- end }}
+        {{- if .Values.ha.enabled }}
+        - name: hagate                       # master-standby:只有 leader 给自己打 ha-active 标签 → 只有它进 Service
+          image: {{ .Values.ha.image }}
+          args: ["--lease", "{{ include "openresty.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}, "--label-key", "{{ include "openresty.name" . }}-active"]
+          env:
+            - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+        {{- end }}
+      volumes:
+        - name: routes
+          configMap:
+            name: {{ .Values.configMapName }}
+        - name: route-sock                     # 路径路由 dispatch unix socket(emptyDir,per-pod;openresty 建、reload 清孤儿)
+          emptyDir: {}
+      {{- if or .Values.affinity .Values.ha.enabled }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:                     # 主备尽量分散到不同节点(软约束,单节点也能起)
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "openresty.selectorLabels" . | nindent 20 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}

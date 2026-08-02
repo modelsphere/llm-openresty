@@ -5,7 +5,7 @@
 # 加速尺度:interval=2、dec=0.5、inc=2.0、tps_window=3、tps_ttl=8、per-peer max=3。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/accbnd}"; KEY=REDACTED-API-KEY

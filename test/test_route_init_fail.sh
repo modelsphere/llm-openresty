@@ -4,7 +4,7 @@
 # 而非每请求 1 条)。隔离 scratch openresty(listen 19570),自清理,不碰生产/LIVE。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PREFIX="${PREFIX:-/tmp/rifail}"
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1

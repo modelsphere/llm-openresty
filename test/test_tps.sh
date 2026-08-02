@@ -11,7 +11,7 @@
 #   gmatch末匹配(fix#3 decoy) / opt-in未配不限流+warning。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/tpstest_suite}"; KEY=REDACTED-API-KEY

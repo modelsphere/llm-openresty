@@ -5,7 +5,7 @@
 # 场景 B(冷启+不健康):cc nil → 落地 min(3),不从 max 起(证明 seed=min,非旧的 seed=max)。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/sstest}"; KEY=REDACTED-API-KEY

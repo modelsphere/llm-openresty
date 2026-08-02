@@ -1,0 +1,22 @@
+bodylog-listener 已部署:{{ include "bodylog.fullname" . }}(ns {{ .Release.Namespace }})
+
+接线:
+  1) openresty → 推帧:把 openresty 的 _G.BODYLOG_LISTENER_HOST / _G.BODYLOG_LISTENER_PORT 指向
+       {{ include "bodylog.fullname" . }}.{{ .Release.Namespace }}  端口 {{ .Values.ports.frame }}
+  2) monitor → 拉 TPM/TTFT:设 monitor 的
+       BODYLOG_SUMMARY_URL = http://{{ include "bodylog.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.ports.http }}/summary
+       BODYLOG_HTTP_TOKEN  = <与本 chart secret.token 同值>
+
+自检:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "bodylog.fullname" . }} -- \
+    wget -qO- http://127.0.0.1:{{ .Values.ports.http }}/healthz
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "bodylog.fullname" . }} -- \
+    wget -qO- 'http://127.0.0.1:{{ .Values.ports.http }}/summary?minutes=5'
+{{- if not .Values.persistence.enabled }}
+
+⚠️ persistence.enabled=false:落盘用 emptyDir,Pod 重启会丢历史 bodylog。生产请开 persistence。
+{{- end }}
+{{- if and .Values.secret.create (not .Values.secret.token) }}
+
+⚠️ secret.token 为空 = /summary /metrics 不鉴权。生产请 --set-string secret.token=<真值> 且与 monitor 一致。
+{{- end }}

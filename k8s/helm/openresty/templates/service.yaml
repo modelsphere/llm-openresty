@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openresty.fullname" . }}
+  labels: {{- include "openresty.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "openresty.selectorLabels" . | nindent 4 }}
+    {{- if .Values.ha.enabled }}
+    {{ include "openresty.name" . }}-active: "true"   # 只选 ha-gate 打了 active 标签的 leader pod
+    {{- end }}
+  ports:
+    {{- range .Values.service.ports }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      targetPort: {{ .port }}
+    {{- end }}

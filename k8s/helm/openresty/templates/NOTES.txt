@@ -1,0 +1,13 @@
+openresty 已部署({{ include "openresty.fullname" . }})。
+
+镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}(框架基座 baked)
+路由 ConfigMap:{{ .Values.configMapName }}(本 chart 建初值,挂到 conf.d/routes/)
+{{- if .Values.reload.enabled }}
+reload: sidecar autoconfig-reload watch → SIGHUP nginx master(热更)
+{{- end }}
+
+配置更新两种方式(不冲突):
+  - autoconfig(可选):有 ModelRoute(openresty.outputConfigMap={{ .Values.configMapName }})时自动写/更新路由;
+  - 手动:直接 kubectl edit cm {{ .Values.configMapName }} 增删 session_route_<route>.conf。
+  Helm upgrade 三方合并不会覆盖 autoconfig/手动加的 key;ConfigMap 挂载 kubelet 传播 ~1min。
+验证: kubectl exec deploy/{{ include "openresty.fullname" . }} -c openresty -- /usr/local/openresty/bin/openresty -t

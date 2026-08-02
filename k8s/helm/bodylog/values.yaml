@@ -1,0 +1,49 @@
+image:
+  repository: registry.example.com/llm/bodylog-listener
+  tag: ""                       # 缺省用 Chart.appVersion
+  pullPolicy: IfNotPresent
+
+# 单实例:有状态(独占 PVC)+ 聚合全量帧,不能多副本。Recreate:滚更时先停旧再起新(独占 PVC)。
+replicas: 1
+
+# 端口:frame=openresty 帧接入(TCP);http=/summary /metrics /healthz(monitor 拉 + 探针)。
+ports:
+  frame: 9999
+  http: 9998
+
+# 落盘目录(挂 PVC)。按天分目录、按小时切文件,跨日 tar.gz 归档。
+dataDir: /data/bodylog
+
+# 持久化:落盘卷。生产必开(关了 Pod 重启丢历史 bodylog)。
+persistence:
+  enabled: true
+  storageClassName: ""          # 空=用集群默认 SC(如 ceph-block)
+  accessMode: ReadWriteOnce
+  size: 50Gi
+  # existingClaim: ""           # 复用已有 PVC 时填
+
+# /summary /metrics 鉴权 token(BODYLOG_HTTP_TOKEN)。**必须与 monitor 侧一致**,否则 monitor 拉 401 断采。
+# secret.create=true 时用下面 token 建 Secret;false 时引用 existingSecret(键 BODYLOG_HTTP_TOKEN)。
+# 空 token = 不鉴权(向后兼容,仅测试用)。
+secret:
+  create: true
+  existingSecret: ""
+  token: ""                     # 部署时 --set-string secret.token=<真值>;权威源 openresty/bodylog_http_token
+
+service:
+  type: ClusterIP               # frame 口给集群内 openresty 连;http 口给 monitor 拉。跨集群另配。
+
+resources:
+  requests: { cpu: "250m", memory: "512Mi" }
+  limits:   { cpu: "2",    memory: "4Gi" }   # duckdb /metrics 查询 + 归档吃内存
+
+probes:
+  enabled: true                 # /healthz(9998,始终开放)做 liveness/readiness
+
+# 单实例 + 独占 PVC → Recreate(不能 RollingUpdate,两 pod 抢 RWO 卷)
+strategy: Recreate
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

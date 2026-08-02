@@ -7,7 +7,7 @@
 #       非流式不喂 / 错误不喂 / 运行时开关 / 窗口边界折叠 / 空窗口保持+TTL过期 / 正常放行。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="${ENGINE:-$HERE/../session_route.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
+ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PY="${PY:-python3}"
 PREFIX="${PREFIX:-/tmp/ttfttest_suite}"; KEY=REDACTED-API-KEY

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bodylog.fullname" . }}
+  labels: {{- include "bodylog.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "bodylog.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: frame                 # openresty 连它推帧(lua _G.BODYLOG_LISTENER_HOST/PORT 指本 Service)
+      port: {{ .Values.ports.frame }}
+      targetPort: frame
+    - name: http                  # monitor 拉 /summary(BODYLOG_SUMMARY_URL 指 http://<svc>:<http>/summary)
+      port: {{ .Values.ports.http }}
+      targetPort: http
