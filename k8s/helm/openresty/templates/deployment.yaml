@@ -34,6 +34,11 @@ spec:
         - name: openresty
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.bodylog.host }}
+          env:                                  # bodylog-listener 地址(openresty 发帧目标);空则用镜像默认(生产 gateway-host)
+            - { name: BODYLOG_LISTENER_HOST, value: {{ .Values.bodylog.host | quote }} }
+            - { name: BODYLOG_LISTENER_PORT, value: {{ .Values.bodylog.port | quote }} }
+          {{- end }}
           {{- if gt (int .Values.preStop.sleepSeconds) 0 }}
           lifecycle:
             preStop:

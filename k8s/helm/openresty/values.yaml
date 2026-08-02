@@ -71,3 +71,8 @@ tolerations: []
 affinity: {}
 nameOverride: ""
 fullnameOverride: ""
+
+# bodylog-listener 地址(openresty 发帧目标)。host 空=用镜像默认(生产 gateway-host);集群内填 bodylog Service DNS。
+bodylog:
+  host: ""              # 如 "bodylog"(同 ns)或 "bodylog.<ns>.svc.cluster.local"
+  port: 9999
