@@ -9,7 +9,7 @@
 # ⚠️ CI runner 若彻底离线(连阿里云 goproxy 都不通),需先 `go mod vendor` 入库并加 -mod=vendor。
 ARG GO_BASE=registry.example.com/llm/golang:1.24-bookworm
 ARG RUNTIME_BASE=registry.example.com/llm/debian:12-slim
-ARG GOPROXY=https://mirrors.aliyun.com/goproxy/,direct
+ARG GOPROXY=https://mirrors.tencent.com/go/,direct
 
 FROM ${GO_BASE} AS builder
 ARG GOPROXY
@@ -21,8 +21,8 @@ COPY bodylog-listener-go/ ./
 RUN go build -ldflags="-s -w" -o /bodylog-listener .
 
 FROM ${RUNTIME_BASE}
-# vim:方便 exec 进 pod 排查/临时编辑(bash 已在 debian:12-slim 自带)。
-RUN apt-get update && apt-get install -y --no-install-recommends vim && rm -rf /var/lib/apt/lists/*
+# 注:bash 已在 debian:12-slim 自带。曾在此 apt 装 vim,但 CI runner 出网被拦、debian 源 GPG NO_PUBKEY
+# → apt-get 失败。要 vim 请把它 bake 进 RUNTIME_BASE(联网机器上做,类比 openresty-base),别在 CI 里 apt。
 COPY --from=builder /bodylog-listener /usr/local/bin/bodylog-listener
 ENV BODYLOG_HOST=0.0.0.0 BODYLOG_PORT=9999 \
     BODYLOG_HTTP_HOST=0.0.0.0 BODYLOG_HTTP_PORT=9998 \
