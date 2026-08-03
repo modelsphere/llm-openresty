@@ -21,6 +21,8 @@ COPY bodylog-listener-go/ ./
 RUN go build -ldflags="-s -w" -o /bodylog-listener .
 
 FROM ${RUNTIME_BASE}
+# vim:方便 exec 进 pod 排查/临时编辑(bash 已在 debian:12-slim 自带)。
+RUN apt-get update && apt-get install -y --no-install-recommends vim && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /bodylog-listener /usr/local/bin/bodylog-listener
 ENV BODYLOG_HOST=0.0.0.0 BODYLOG_PORT=9999 \
     BODYLOG_HTTP_HOST=0.0.0.0 BODYLOG_HTTP_PORT=9998 \
