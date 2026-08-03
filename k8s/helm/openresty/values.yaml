@@ -11,7 +11,7 @@ adminPort: 8090                # baked 的固定 admin/health 口(session_base.c
 # openresty 的路由态(active_conns/adaptive-cc/health-timer)是 pod 内共享内存,不能 active-active。
 ha:
   enabled: true
-  image: registry.example.com/llm/autoconfig-hagate:0.3.24
+  image: registry.example.com/llm/autoconfig-hagate:0.3.25
   port: 8081
   # appTcp 盯固定 admin 口(不随动态路由端口变);nginx 一起 8090 就在 → 探得到才是真活着
   appTcp: "127.0.0.1:8090"
@@ -52,7 +52,7 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: registry.example.com/llm/autoconfig-reload:0.3.24
+  image: registry.example.com/llm/autoconfig-reload:0.3.25
   process: "nginx: master"
 
 service:
