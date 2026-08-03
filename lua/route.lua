@@ -131,6 +131,21 @@ function _G.register_route(name, opts_factory)
     opts.health_ban_ttl            = opts.health_ban_ttl            or 300
     opts.health_probe_path         = opts.health_probe_path         or _G.DEFAULT_HEALTH_PROBE_PATH  -- 健康探针 GET 的路径,per-route 可配(后端探测接口不同的路由可覆盖)
     opts.cluster_avg_interval      = opts.cluster_avg_interval      or 30
+    -- ── 跨层单请求 fallback(默认关)──
+    -- cross_tier_fallback:开时高优层 5xx/连接失败即刻兜到低优层代表(不等 health-timer ban)。
+    --   bool 化:任何 truthy → true、缺省/false/nil → false,避免 factory 传字符串 "false" 被当真。
+    opts.cross_tier_fallback = opts.cross_tier_fallback and true or false
+    -- max_more_tries:balancer.set_more_tries 的重试预算上限(需正整数;非法回退 2)。
+    local mmt = tonumber(opts.max_more_tries)
+    if mmt == nil then
+        opts.max_more_tries = 2
+    elseif mmt < 1 or mmt ~= math.floor(mmt) then
+        ngx.log(ngx.ERR, "[", name, "] max_more_tries=", tostring(opts.max_more_tries),
+                " 非法(需 >=1 整数)— 回退 2")
+        opts.max_more_tries = 2
+    else
+        opts.max_more_tries = mmt
+    end
     -- ── TTFT 限流（按路由灰度）默认值 ──
     -- TTFT 限流默认值。dict 默认指 session_route.conf 里统一声明的共享 "ttft_stat"(所有路由共用,key 带
     -- <route>[:<model>] 前缀);阈值默认用全局 _G.TTFT_LIMIT_MS。两者都可在 factory 覆盖。
