@@ -35,6 +35,8 @@ spec:
             - { name: BODYLOG_HTTP_HOST, value: "0.0.0.0" }
             - { name: BODYLOG_HTTP_PORT, value: "{{ .Values.ports.http }}" }
             - { name: BODYLOG_DIR,       value: "{{ .Values.dataDir }}" }
+            - { name: BODYLOG_KEEP_DAYS,         value: "{{ .Values.retention.keepDays }}" }
+            - { name: BODYLOG_DETAILS_KEEP_DAYS, value: "{{ .Values.retention.detailsKeepDays }}" }
             - name: BODYLOG_HTTP_TOKEN
               valueFrom:
                 secretKeyRef: { name: {{ include "bodylog.secretName" . }}, key: BODYLOG_HTTP_TOKEN }

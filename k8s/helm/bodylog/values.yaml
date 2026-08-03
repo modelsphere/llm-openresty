@@ -19,8 +19,14 @@ persistence:
   enabled: true
   storageClassName: ""          # 空=用集群默认 SC(如 ceph-block)
   accessMode: ReadWriteOnce
-  size: 50Gi
+  size: 2Ti                    # 生产量级:ts34 90天≈2.3T,配合 keepDays=60 稳进(ceph-block 3.3TiB 池)
   # existingClaim: ""           # 复用已有 PVC 时填
+
+# 保留天数(bodylog 按【时间】清理,不按大小)。历史 .tar.gz 归档留 keepDays 天;metrics 明细 parquet 留 detailsKeepDays 天。
+# ts34 生产实测 ~25G/天压缩,90 天≈2.3T > 2Ti → keepDays 压到 60(≈1.5T)稳进 2Ti 盘。
+retention:
+  keepDays: 60          # BODYLOG_KEEP_DAYS(默认 90)
+  detailsKeepDays: 365  # BODYLOG_DETAILS_KEEP_DAYS(默认 365)
 
 # /summary /metrics 鉴权 token(BODYLOG_HTTP_TOKEN)。**必须与 monitor 侧一致**,否则 monitor 拉 401 断采。
 # secret.create=true 时用下面 token 建 Secret;false 时引用 existingSecret(键 BODYLOG_HTTP_TOKEN)。
