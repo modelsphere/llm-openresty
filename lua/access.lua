@@ -204,22 +204,37 @@ function _G.do_route(opts)
     ngx.var.routed_mode = mode
     ngx.var.routed_peer = peer_key
 
-    -- fallback peers（仅同活跃层，active 升序）：跨层 fallback 已废，
-    -- router 饱和/连接失败不再溢出到低优层（低优层只在高优全 banned、active_level 降级时才接管）
+    -- fallback peers（active 升序）。默认仅同活跃层;opts.cross_tier_fallback 开时含【低优层】
+    -- (高优层 5xx/连接失败 → proxy_next_upstream 单请求即刻兜到低优 VIP,不必等 health-timer ban，
+    --  省掉 ~30s 空窗)。靠谱前提:高优层要能【快失败】——cart 已加短 connect_timeout,否则请求会
+    --  先干等高优层挂 ~30s 再兜底、更糟(当初就是因此把跨层 fallback shelve 掉、等 cart 短超时)。
     local fallback = {}
     local rest = {}
-    for _, hp in ipairs(a.healthy_peers) do
+    local fb_pool = opts.cross_tier_fallback and healthy_all or a.healthy_peers
+    for _, hp in ipairs(fb_pool) do
         local k = hp[4]
         if k ~= peer_key then
             rest[#rest + 1] = {{hp[1], hp[2]}, dict:get(k) or 0, hp[5]}
         end
     end
     table.sort(rest, function(a, b)
-        if a[3] ~= b[3] then return a[3] > b[3] end
-        return a[2] < b[2]
+        if a[3] ~= b[3] then return a[3] > b[3] end   -- priority(层)降序
+        return a[2] < b[2]                            -- 同层内 load 升序
     end)
+    -- 组装 fallback:同活跃层兄弟【全保留】(正常 pod-to-pod failover);跨层时每个【低优层】只取
+    -- 一个代表(load 最小)。为什么低优层不逐个试:兜底层通常是 Service VIP(kube-proxy 已对整层
+    -- 做 LB),逐个试同层死 pod 只会把 max_more_tries 预算耗光、够不到最后一层 VIP 安全网
+    -- (2026-08-03:多 pod-IP 层 + max_more_tries=3 时,retry 全耗在第二层死 pod、到不了第三层 VIP)。
+    -- cross_tier 关时 fb_pool=同活跃层 → 全 prio==active_level → 等价旧行为(全保留),无副作用。
+    local seen_lower = {}
     for _, r in ipairs(rest) do
-        fallback[#fallback + 1] = r[1]
+        local prio = r[3]
+        if prio == active_level then
+            fallback[#fallback + 1] = r[1]            -- 同活跃层:全保留
+        elseif not seen_lower[prio] then              -- 低优层:每层一个代表
+            seen_lower[prio] = true
+            fallback[#fallback + 1] = r[1]
+        end
     end
     ngx.ctx.fallback_peers = fallback
 
@@ -303,7 +318,7 @@ function _G.do_balancer()
         end
         local fb = ngx.ctx.fallback_peers
         if fb and #fb > 0 then
-            balancer.set_more_tries(math.min(2, #fb))
+            balancer.set_more_tries(math.min(tonumber(opts and opts.max_more_tries) or 2, #fb))
         end
         local ok, err = balancer.set_current_peer(host, port)
         if not ok then
