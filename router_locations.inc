@@ -58,7 +58,7 @@
         # 客户端会泄露内部 IP。$upstream_http_x_routed_peer 在 access_log / bodylog
         # 里仍可读到，proxy_hide_header 只影响发给下游客户端的响应头。
         proxy_hide_header X-Routed-Peer;
-        proxy_connect_timeout 10s;         # 10s 连不上就判定挂了（原 30s 太慢，会耗完重试窗口）
+        proxy_connect_timeout 2s;          # 死后端 2s 快失败(和 cart connect_timeout 对齐);健康后端 intra-cluster 连接 <100ms 无感。原 10s→跨层重试首击慢
         proxy_send_timeout   3600s;
         proxy_read_timeout   3600s;   # long generation (64k tokens) may take many minutes
 
