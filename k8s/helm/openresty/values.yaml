@@ -72,7 +72,9 @@ affinity: {}
 nameOverride: ""
 fullnameOverride: ""
 
-# bodylog-listener 地址(openresty 发帧目标)。host 空=用镜像默认(生产 gateway-host);集群内填 bodylog Service DNS。
+# bodylog-listener 地址(openresty 发帧目标)。默认固化到 ts31(10.0.0.1)专用 bodylog-listener,
+# 替代原集群内 bodylog Service(已下线)。host 空=用镜像默认(session_base.conf 的 os.getenv or "10.0.0.1" 主集群生产)。
+# 若某集群要自建 bodylog,填该集群 Service FQDN(bodylog.<ns>.svc.cluster.local,nginx resolver 不套 search 域故必须 FQDN)。
 bodylog:
-  host: ""              # ⚠️ 集群内必须用 FQDN(nginx resolver 不套 search 域):bodylog.<ns>.svc.cluster.local。空=用镜像默认(生产 IP)
+  host: "10.0.0.1"  # ts31 专用 bodylog-listener(docker,9999/9998);IP 直连不需 resolver
   port: 9999
