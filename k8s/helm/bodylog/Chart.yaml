@@ -2,6 +2,6 @@ apiVersion: v2
 name: bodylog
 description: OpenResty body-log listener(k8s)——收 openresty 帧(TCP 9999)按天/小时落盘,暴露 /summary /metrics(HTTP 9998)供 monitor 拉 TPM/TTFT。单实例有状态 + PVC。
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "1.0.0"
 keywords: [bodylog, openresty, tpm, observability]
