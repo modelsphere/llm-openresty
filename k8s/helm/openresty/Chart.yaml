@@ -3,5 +3,5 @@ name: openresty
 description: openresty session-router(k8s)——框架基座 baked 进镜像,per-model 路由由 autoconfig 写进 conf.d/routes,reload sidecar 热更;主备 HA + 优雅停机
 type: application
 version: 0.1.1          # 对齐 llm-openresty 仓 git tag 线(0.1.x);与同仓 bodylog chart 一致
-appVersion: "0.3.4-dispatch"
+appVersion: "0.1.1"     # = 发版 tag = 镜像 tag(values.image.tag="" 回落它);CI 打 tag 时 sed 成 $CI_COMMIT_TAG
 keywords: [openresty, routing, autoconfig]

@@ -1,6 +1,6 @@
 image:
   repository: registry.example.com/llm/llm-openresty
-  tag: "0.1.1"     # 0.1.1:含 MR!17(跨层 fallback 默认关 + register_route 校验 + connect_timeout 2s)+ bodylog.host 固化 ts31 + llm-gateway 回退
+  tag: ""          # 缺省用 Chart.appVersion(= 发版 tag;CI 打 tag 时 sed appVersion=tag)——与 monitor/autoconfig/cart/bodylog 一致
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)

@@ -55,9 +55,8 @@ build:chart:
   variables:
     REGISTRY_PROJECT: llm
   script:
-    # openresty chart(image.tag 硬钉 → 三处都改成 tag)
+    # openresty chart(image.tag="" 回落 appVersion → 只改 chart version/appVersion,和其余 chart 一致)
     - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" k8s/helm/openresty/Chart.yaml'
-    - 'sed -i -E "s/^  tag:.*/  tag: \"${CI_COMMIT_TAG}\"/" k8s/helm/openresty/values.yaml'
     - export MODULE_NAME=openresty CHART_FOLDER=k8s/helm/openresty
     - push-chart
     # bodylog chart(image.tag="" 回落 appVersion → 只改 chart version/appVersion)
