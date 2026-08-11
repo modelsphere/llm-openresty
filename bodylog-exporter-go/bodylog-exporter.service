@@ -1,0 +1,31 @@
+# 裸机部署:与 bodylog-listener 同机跑,tail 它的 metrics/details 目录。
+#   cp bodylog-exporter /usr/local/bin/ ; cp bodylog-exporter.service /etc/systemd/system/
+#   编辑下面 Environment(尤其 BODYLOG_DETAILS_DIR / BODYLOG_URL / TOKEN)
+#   systemctl daemon-reload && systemctl enable --now bodylog-exporter
+# Prometheus 侧:抓 <这台机 IP>:9110/metrics(k8s 用无 selector Service+Endpoints / additionalScrapeConfigs)。
+[Unit]
+Description=bodylog Prometheus exporter (tail details jsonl, zero-loss)
+Documentation=plans/bodylog-exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ⚠️ 按本机改:指向 bodylog 的 <BODYLOG_DIR>/metrics/details
+Environment=BODYLOG_DETAILS_DIR=/root/bodylog/metrics/details
+Environment=EXPORTER_LISTEN=:9110
+Environment=CHECKPOINT_PATH=/var/lib/bodylog-exporter/checkpoint.json
+# 跨天缺口 HTTP 补读(bodylog 本机 HTTP);bodylog 设了 token 才需 BODYLOG_HTTP_TOKEN
+Environment=BODYLOG_URL=http://127.0.0.1:9998
+#Environment=BODYLOG_HTTP_TOKEN=
+# 文件按天命名的时区,必须与 bodylog 一致(默认北京;无 tzdata 时回退固定 +08:00,中国无 DST 正好正确)。
+#Environment=DATE_TZ=Asia/Shanghai
+ExecStart=/usr/local/bin/bodylog-exporter
+Restart=always
+RestartSec=3
+StateDirectory=bodylog-exporter
+# 只读 bodylog 目录足够;按需收紧
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
