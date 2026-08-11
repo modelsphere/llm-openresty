@@ -46,6 +46,9 @@ spec:
   namespaceSelector: { matchNames: [ monitoring ] }
   selector:
     matchLabels: { app: bodylog-exporter, target: ts31 }   # 选中上面的 Service
+  # protobuf 优先:exporter 的【指数 native histogram】只在 protobuf 里传,文本格式抓不到
+  # (只要 NHCB/经典可去掉这行,但那样精度=经典自定义桶)。需 Prometheus 侧 scrapeNativeHistograms: true。
+  scrapeProtocols: [ PrometheusProto, OpenMetricsText1.0.0, PrometheusText0.0.4 ]
   endpoints:
     - port: metrics          # = Service/Endpoints 里的端口名
       path: /metrics

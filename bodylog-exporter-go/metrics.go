@@ -55,7 +55,13 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	}
 	hist := func(name, help string, buckets []float64, labels []string) *prometheus.HistogramVec {
-		return prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels)
+		return prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: name, Help: help,
+			Buckets:                         buckets, // 经典桶:双发,保留兼容/回退(Prometheus 关 native 时仍能用)
+			NativeHistogramBucketFactor:     1.1,     // 指数 native:每桶 ~10% 宽,高分辨率 → p95/p99 更准
+			NativeHistogramMaxBucketNumber:  160,     // 桶数上限,防高基数/异常值撑爆
+			NativeHistogramMinResetDuration: time.Hour,
+		}, labels)
 	}
 	m := &metrics{
 		requests:      ctr("bodylog_requests_total", "请求数", []string{"backend", "model", "status_class", "stream"}),
