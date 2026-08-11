@@ -257,11 +257,13 @@ end
 -- _G.do_emit_peer_header(opts) — header_filter_by_lua_block: 可选回显后端标识
 -- ──────────────────────────────────────────────────────────────────────
 -- 默认【关】(opts.expose_routed_peer 不为 true 即关):与 2026-07 删除 X-Routed-*
--- 那批 header 的安全取向一致——不向外泄露内部 peer。开启后回显:
---     X-Routed-Peer: <ip:port>[/<GPU型号>]
+-- 那批 header 的安全取向一致——不向外泄露内部 peer。开启后回显【固定三段、| 分隔】:
+--     X-Routed-Peer: <ip:port>|<GPU型号>|<peer名>
+-- 例:10.0.0.1:8050|H100|gpu-node   取不到的段留空(如 10.1.0.1:8050||)——
+-- 段数恒为 3,下游按 | split 取下标即可,不必判断有没有该段。
 -- peer 取值优先用上游(CART)回报的【真实后端】($upstream_http_x_routed_peer);
--- 走直连兜底时上游没这个头,退回本层选中的 peer。GPU 型号取该 peer 的 gpu 字段
--- (autoconfig 从节点 GFD label 逐 peer 渲染进 conf),取不到就只回 ip:port。
+-- 走直连兜底时上游没这个头,退回本层选中的 peer。GPU 型号与 peer 名取该 peer 的
+-- gpu / 第 3 位字段(autoconfig 逐 peer 渲染进 conf:型号来自节点 GFD label,名为节点名)。
 -- ⚠️ router_locations.inc 里的 proxy_hide_header 只挡【上游】那份,本函数写的是
 -- 本层自己的响应头,两者不冲突:先挡掉上游的,再按开关决定要不要回显。
 -- ══════════════════════════════════════════════════════════════════════
@@ -272,13 +274,14 @@ function _G.do_emit_peer_header(opts)
     if upstream_peer == "" then upstream_peer = nil end
     local peer = upstream_peer or ngx.ctx.routed_peer
     if not peer or peer == "" then return end
-    -- GPU 型号:本层 peer 直接用已记的;CART 报的真实后端去 gpu_by_key 查
-    -- (真实 vllm 通常也在本层 peer 表里作低优兜底 → 能查到;查不到就不带型号)
-    local gpu = ngx.ctx.routed_gpu
+    -- GPU 型号 / peer 名:本层 peer 直接用已记的;CART 报的真实后端去表里查
+    -- (真实 vllm 通常也在本层 peer 表里作低优兜底 → 能查到;查不到该段留空)
+    local gpu  = ngx.ctx.routed_gpu
+    local name = opts.name_by_key and opts.name_by_key[peer] or nil
     if upstream_peer then
         gpu = opts.gpu_by_key and opts.gpu_by_key[upstream_peer] or nil
     end
-    ngx.header["X-Routed-Peer"] = gpu and (peer .. "/" .. gpu) or peer
+    ngx.header["X-Routed-Peer"] = peer .. "|" .. (gpu or "") .. "|" .. (name or "")
 end
 
 -- ══════════════════════════════════════════════════════════════════════
