@@ -93,12 +93,17 @@ function _G.register_route(name, opts_factory)
     -- 用途:cache_aware_router 的 /v1/models 是缓存端点(worker 全挂也返 200,不能当健康信号),
     -- 故 cart peer 配 probe="/health"(worker-aware,0 healthy→503);后端 peer 不配 → 回落 health_probe_path。
     -- 用命名字段(非第 6 位)以免和位置元组 {ip,port,name,priority,max} 冲突、也不需填满前置位。
+    -- gpu_by_key:peer 的命名字段 gpu = "<型号短名>"(H100/H800/A100/H200/B300…,autoconfig 从
+    -- 节点 GFD label nvidia.com/gpu.product 逐 peer 推导后渲染进 conf;裸机 conf 可手写)。
+    -- 可选,没配的 peer 不进表。用途:bodylog 记录请求实际落到哪种卡,供按型号聚合统计。
     opts.peer_keys = {}
     opts.probe_path_by_key = {}
+    opts.gpu_by_key = {}
     for _, p in ipairs(opts.peers) do
         local key = p[1] .. ":" .. p[2]
         opts.peer_keys[#opts.peer_keys + 1] = key
         if p.probe then opts.probe_path_by_key[key] = p.probe end
+        if p.gpu   then opts.gpu_by_key[key]        = p.gpu   end
     end
     -- dict 名约定：<base>_<route_name>（必须跟 conf 顶部 lua_shared_dict 声明一致）
     -- factory 可显式覆盖（如 api_keys_dict 跨路由共用 "api_keys"）。
@@ -108,6 +113,9 @@ function _G.register_route(name, opts_factory)
     opts.cluster_avg_dict          = opts.cluster_avg_dict          or ("cluster_avg_"  .. name)
     opts.cch_ctl_dict              = opts.cch_ctl_dict              or ("cch_ctl_"      .. name)
     opts.bodylog_ctl_dict          = opts.bodylog_ctl_dict          or ("bodylog_ctl_"  .. name)
+    -- expose_routed_peer:是否把 <ip:port>[/GPU型号] 回显进响应头 X-Routed-Peer。
+    -- 默认 false(不外泄内部 peer);仅显式配 true 才开。非布尔值一律按 false 处理。
+    opts.expose_routed_peer        = (opts.expose_routed_peer == true)
     opts.api_keys_dict             = opts.api_keys_dict             or "api_keys"
     opts.api_keys                  = opts.api_keys                  or { ["REDACTED-API-KEY"] = "admin" }
     opts.default_max               = opts.default_max               or _G.MAX_CONCURRENCY_PER_PEER

@@ -287,6 +287,9 @@ function M.bodylog_finalize(opts)
         req_headers   = hdrs_out,
         req_body_truncated  = ngx.ctx.bodylog_req_truncated or false,
         peer          = ngx.ctx.routed_peer,
+        -- 该 peer 所在节点的 GPU 型号(如 H100/H800/A100/B300)。peer 未配 gpu 字段时为 nil、
+        -- 字段不出现。用于按卡型聚合分析(不同型号的 TTFT/吞吐对比)。
+        peer_gpu      = ngx.ctx.routed_gpu,
         -- 如果 upstream 是 router（自身也是反代），它在响应里回 X-Routed-Peer
         -- 标识真实后端 vllm。透传到 bodylog，让 monitor 能按真实 vllm 聚合 TPM。
         -- 普通 vllm 不会回这个 header，字段会是 nil/missing。

@@ -200,6 +200,9 @@ function _G.do_route(opts)
     ngx.ctx.chosen_port      = chosen_hp[2]
     ngx.ctx.peer_counter_key = peer_key
     ngx.ctx.routed_peer      = peer_key
+    -- 该 peer 所在节点的 GPU 型号(peer 命名字段 gpu,可选)。写进 bodylog 供按卡型聚合;
+    -- 没配的 peer 为 nil,bodylog 字段缺失,不影响任何路由逻辑。
+    ngx.ctx.routed_gpu       = opts.gpu_by_key and opts.gpu_by_key[peer_key] or nil
     ngx.ctx.routed_mode      = mode
     ngx.var.routed_mode = mode
     ngx.var.routed_peer = peer_key
@@ -248,6 +251,34 @@ function _G.do_route(opts)
             " banned=", banned_count,
             " fallbacks=", #fallback,
             " -> ", peer_key)
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- _G.do_emit_peer_header(opts) — header_filter_by_lua_block: 可选回显后端标识
+-- ──────────────────────────────────────────────────────────────────────
+-- 默认【关】(opts.expose_routed_peer 不为 true 即关):与 2026-07 删除 X-Routed-*
+-- 那批 header 的安全取向一致——不向外泄露内部 peer。开启后回显:
+--     X-Routed-Peer: <ip:port>[/<GPU型号>]
+-- peer 取值优先用上游(CART)回报的【真实后端】($upstream_http_x_routed_peer);
+-- 走直连兜底时上游没这个头,退回本层选中的 peer。GPU 型号取该 peer 的 gpu 字段
+-- (autoconfig 从节点 GFD label 逐 peer 渲染进 conf),取不到就只回 ip:port。
+-- ⚠️ router_locations.inc 里的 proxy_hide_header 只挡【上游】那份,本函数写的是
+-- 本层自己的响应头,两者不冲突:先挡掉上游的,再按开关决定要不要回显。
+-- ══════════════════════════════════════════════════════════════════════
+function _G.do_emit_peer_header(opts)
+    if not opts or opts.expose_routed_peer ~= true then return end
+    -- CART 回报的真实后端优先;没有(直连兜底/普通 vllm)则用本层选中的 peer
+    local upstream_peer = ngx.var.upstream_http_x_routed_peer
+    if upstream_peer == "" then upstream_peer = nil end
+    local peer = upstream_peer or ngx.ctx.routed_peer
+    if not peer or peer == "" then return end
+    -- GPU 型号:本层 peer 直接用已记的;CART 报的真实后端去 gpu_by_key 查
+    -- (真实 vllm 通常也在本层 peer 表里作低优兜底 → 能查到;查不到就不带型号)
+    local gpu = ngx.ctx.routed_gpu
+    if upstream_peer then
+        gpu = opts.gpu_by_key and opts.gpu_by_key[upstream_peer] or nil
+    end
+    ngx.header["X-Routed-Peer"] = gpu and (peer .. "/" .. gpu) or peer
 end
 
 -- ══════════════════════════════════════════════════════════════════════
@@ -345,6 +376,8 @@ function _G.do_balancer()
             dict:incr(new_key, 1, 0)
             ngx.ctx.peer_counter_key = new_key
             ngx.ctx.routed_peer      = new_key .. " (retry#" .. attempt .. ")"
+            -- 重试换了 peer → GPU 型号跟着换(可能跨卡型 fallback)
+            ngx.ctx.routed_gpu       = opts and opts.gpu_by_key and opts.gpu_by_key[new_key] or nil
         end
         local ok, err = balancer.set_current_peer(new_peer[1], new_peer[2])
         if not ok then

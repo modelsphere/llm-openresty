@@ -40,8 +40,13 @@
             _G.bodylog_filter_chunk()
         }
 
-        # 路由决策不再写到响应 header（X-Routed-Session/Source/Mode/Peer/Retries 已删除，
-        # 防止外部泄露 sid / 后端 peer / 内部模式）。需要 debug 时改用 /_route_inspect。
+        # 路由决策不再写到响应 header（X-Routed-Session/Source/Mode/Retries 已删除，
+        # 防止外部泄露 sid / 内部模式）。需要 debug 时改用 /_route_inspect。
+        # 例外:X-Routed-Peer 可按路由开关回显（opts.expose_routed_peer=true，默认关），
+        # 值为 <ip:port>[/<GPU型号>]。开关关时不写，行为与删除前一致。
+        header_filter_by_lua_block {
+            _G.do_emit_peer_header(_G.__route_opts[ngx.var.route])
+        }
         # peer 连接失败/超时/502/503 时自动重试下一个 fallback peer
         # （配合 balancer_by_lua 的 set_more_tries 生效）
         # non_idempotent: 允许 POST 在 upstream 发送请求阶段失败时重试。vllm 所有请求都是 POST，
