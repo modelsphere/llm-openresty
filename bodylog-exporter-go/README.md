@@ -84,7 +84,7 @@ curl -s localhost:9110/metrics | head
 
 ### k8s Prometheus 抓取(裸机 target 走 Endpoints)
 
-bodylog 在裸机、Prometheus 在 k8s(kube-prometheus-stack):建**无 selector 的 Service + 手写 Endpoints(裸机 IP:9110)+ ServiceMonitor**(label 带 `release: kube-prometheus-stack`):
+bodylog 在裸机、Prometheus 在 k8s(kube-prometheus-stack):建**无 selector 的 Service + 手写 Endpoints(裸机 IP:9110)+ ServiceMonitor**(label 带 `release: kube-prometheus-stack`)。现成 manifest:[`deploy/prometheus-scrape.yaml`](deploy/prometheus-scrape.yaml)(`kubectl apply -f`,换主机改 name/IP 即可):
 
 ```yaml
 apiVersion: v1

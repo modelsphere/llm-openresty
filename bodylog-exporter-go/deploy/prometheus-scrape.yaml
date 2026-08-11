@@ -1,0 +1,53 @@
+# 让 k8s 的 kube-prometheus-stack 抓取【裸机上的 bodylog-exporter】(如 ts31 10.0.0.1:9110)。
+#
+# 为什么是三件套:exporter 在集群外(裸机),没有 pod 可 selector。
+#   ① Service(headless,无 selector):只声明命名端口 metrics:9110。
+#   ② Endpoints(手写,同名):把 Service 的后端指到裸机 IP —— 无 selector 时 k8s 不会自动填,必须手写。
+#   ③ ServiceMonitor(prometheus-operator 的 CRD,不是 k8s 原生):告诉 operator 抓这个 Service。
+#      ⚠️ label 必须带 `release: kube-prometheus-stack`,否则 Prometheus CR 的 serviceMonitorSelector 不选它。
+#
+# 换主机/多实例:改下面 name、Endpoints 的 ip、以及可选的 instance;每台一套。
+# 集群【内】的 target(pod/带 selector 的 Service)不用这套 —— 直接普通 ServiceMonitor selector 到真 Service 即可。
+#
+# apply: kubectl apply -f prometheus-scrape.yaml
+# 验证: Prometheus target `serviceMonitor/monitoring/bodylog-ts31/0` health=up
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bodylog-ts31
+  namespace: monitoring
+  labels: { app: bodylog-exporter, target: ts31 }
+spec:
+  clusterIP: None            # headless:仅用于让 ServiceMonitor 找到 Endpoints,不需要 VIP
+  ports:
+    - { name: metrics, port: 9110, targetPort: 9110, protocol: TCP }
+---
+apiVersion: v1
+kind: Endpoints              # 注:v1.33+ 提示 Endpoints 废弃(建议 EndpointSlice);但对手写外部 target 仍最简、operator 照读
+metadata:
+  name: bodylog-ts31         # 必须与上面 Service 同名
+  namespace: monitoring
+  labels: { app: bodylog-exporter, target: ts31 }
+subsets:
+  - addresses:
+      - { ip: 10.0.0.1 } # ← 裸机 IP(exporter 所在主机)
+    ports:
+      - { name: metrics, port: 9110, protocol: TCP }
+---
+apiVersion: monitoring.coreos.com/v1   # prometheus-operator CRD(非 k8s 原生)
+kind: ServiceMonitor
+metadata:
+  name: bodylog-ts31
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack     # ⚠️ 必需:匹配 Prometheus CR 的 serviceMonitorSelector
+spec:
+  namespaceSelector: { matchNames: [ monitoring ] }
+  selector:
+    matchLabels: { app: bodylog-exporter, target: ts31 }   # 选中上面的 Service
+  endpoints:
+    - port: metrics          # = Service/Endpoints 里的端口名
+      path: /metrics
+      interval: 30s
+      honorLabels: true      # 保留 exporter 自带的 backend/model label,不被 job/instance 覆盖
