@@ -77,8 +77,8 @@ func (t *tailer) recoverViaHTTP(ctx context.Context, startTs string, end time.Ti
 			}
 		}
 		pages++
-		if !mr.Truncated || mr.NextCursor == "" {
-			break
+		if !mr.Truncated || mr.NextCursor == "" || mr.NextCursor == cursor {
+			break // L8:游标不前进(异常)也停,避免死循环
 		}
 		cursor = mr.NextCursor
 	}

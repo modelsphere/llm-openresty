@@ -18,6 +18,8 @@ Environment=CHECKPOINT_PATH=/var/lib/bodylog-exporter/checkpoint.json
 # 跨天缺口 HTTP 补读(bodylog 本机 HTTP);bodylog 设了 token 才需 BODYLOG_HTTP_TOKEN
 Environment=BODYLOG_URL=http://127.0.0.1:9998
 #Environment=BODYLOG_HTTP_TOKEN=
+# 文件按天命名的时区,必须与 bodylog 一致(默认北京;无 tzdata 时回退固定 +08:00,中国无 DST 正好正确)。
+#Environment=DATE_TZ=Asia/Shanghai
 ExecStart=/usr/local/bin/bodylog-exporter
 Restart=always
 RestartSec=3

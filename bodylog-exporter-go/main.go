@@ -41,16 +41,25 @@ func envOrInt(k string, def int) int {
 }
 
 type config struct {
-	detailsDir     string        // BODYLOG_DIR/metrics/details
-	listen         string        // exporter 监听地址
-	checkpointPath string        // offset 持久化文件
-	bodylogURL     string        // bodylog HTTP base(仅跨天缺口补读用),空=不补读
-	token          string        // bodylog /metrics 鉴权(补读用)
-	recoveryLag    time.Duration // 补读上界 = now - lag(等 flush 落定)
-	followInterval time.Duration // tail 到 EOF 后的轮询间隔
+	detailsDir     string         // BODYLOG_DIR/metrics/details
+	listen         string         // exporter 监听地址
+	checkpointPath string         // offset 持久化文件
+	bodylogURL     string         // bodylog HTTP base(仅跨天缺口补读用),空=不补读
+	token          string         // bodylog /metrics 鉴权(补读用)
+	recoveryLag    time.Duration  // 补读上界 = now - lag(等 flush 落定)
+	followInterval time.Duration  // tail 到 EOF 后的轮询间隔
+	dateLoc        *time.Location // 文件按天命名的时区(必须与 bodylog 一致,默认北京)
 }
 
 func loadConfig() config {
+	// M3:bodylog 按 time.Local(北京)命名 <date>.jsonl;容器默认 UTC 会算错"今天"文件名。
+	// 固定 date 时区 = DATE_TZ(默认 Asia/Shanghai);无 tzdata 时回退 +08:00 定偏移。
+	tzName := envOr("DATE_TZ", "Asia/Shanghai")
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		log.Printf("warn: 加载时区 %s 失败(%v),回退固定 +08:00", tzName, err)
+		loc = time.FixedZone("CST", 8*3600)
+	}
 	return config{
 		detailsDir:     envOr("BODYLOG_DETAILS_DIR", "/data/bodylog/metrics/details"),
 		listen:         envOr("EXPORTER_LISTEN", ":9110"),
@@ -59,6 +68,7 @@ func loadConfig() config {
 		token:          envOr("BODYLOG_HTTP_TOKEN", ""),
 		recoveryLag:    time.Duration(envOrInt("RECOVERY_LAG_SECONDS", 10)) * time.Second,
 		followInterval: time.Duration(envOrInt("FOLLOW_INTERVAL_MS", 300)) * time.Millisecond,
+		dateLoc:        loc,
 	}
 }
 
