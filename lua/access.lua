@@ -200,6 +200,9 @@ function _G.do_route(opts)
     ngx.ctx.chosen_port      = chosen_hp[2]
     ngx.ctx.peer_counter_key = peer_key
     ngx.ctx.routed_peer      = peer_key
+    -- routed_peer_key:恒为干净的 "ip:port"(routed_peer 在重试时会被加 " (retry#N)"
+    -- 后缀,拿它查 gpu_by_key/name_by_key 会全部落空)。查表与 header 回显都用这个。
+    ngx.ctx.routed_peer_key  = peer_key
     -- 该 peer 所在节点的 GPU 型号(peer 命名字段 gpu,可选)。写进 bodylog 供按卡型聚合;
     -- 没配的 peer 为 nil,bodylog 字段缺失,不影响任何路由逻辑。
     ngx.ctx.routed_gpu       = opts.gpu_by_key and opts.gpu_by_key[peer_key] or nil
@@ -272,14 +275,24 @@ function _G.do_emit_peer_header(opts)
     -- CART 回报的真实后端优先;没有(直连兜底/普通 vllm)则用本层选中的 peer
     local upstream_peer = ngx.var.upstream_http_x_routed_peer
     if upstream_peer == "" then upstream_peer = nil end
-    local peer = upstream_peer or ngx.ctx.routed_peer
-    if not peer or peer == "" then return end
-    -- GPU 型号 / peer 名:本层 peer 直接用已记的;CART 报的真实后端去表里查
-    -- (真实 vllm 通常也在本层 peer 表里作低优兜底 → 能查到;查不到该段留空)
-    local gpu  = ngx.ctx.routed_gpu
-    local name = opts.name_by_key and opts.name_by_key[peer] or nil
+    -- ★上游(CART)回的是【完整 URL】,实测形如 "http://10.0.0.5:8000";而本层 peer
+    --   表的 key 是 "ip:port"。不剥 scheme 直接查 gpu_by_key/name_by_key 必然落空,
+    --   型号与名字两段会永远为空(2026-08-11 在 k8s 上实测 CART 回值才发现)。
+    --   剥掉 scheme 与末尾斜杠后再查,回显值也与本层格式统一。
     if upstream_peer then
-        gpu = opts.gpu_by_key and opts.gpu_by_key[upstream_peer] or nil
+        upstream_peer = upstream_peer:gsub("^%a[%w+.%-]*://", ""):gsub("/+$", "")
+    end
+    -- 本层 peer 用干净 key(routed_peer 在重试时带 " (retry#N)" 后缀,不能拿来查表)
+    local peer = upstream_peer or ngx.ctx.routed_peer_key
+    if not peer or peer == "" then return end
+    local gpu, name
+    if upstream_peer then
+        -- 真实 vllm 通常也在本层 peer 表里作低优兜底 → 能查到;查不到该段留空
+        gpu  = opts.gpu_by_key  and opts.gpu_by_key[peer]  or nil
+        name = opts.name_by_key and opts.name_by_key[peer] or nil
+    else
+        gpu  = ngx.ctx.routed_gpu
+        name = opts.name_by_key and opts.name_by_key[peer] or nil
     end
     ngx.header["X-Routed-Peer"] = peer .. "|" .. (gpu or "") .. "|" .. (name or "")
 end
@@ -379,6 +392,7 @@ function _G.do_balancer()
             dict:incr(new_key, 1, 0)
             ngx.ctx.peer_counter_key = new_key
             ngx.ctx.routed_peer      = new_key .. " (retry#" .. attempt .. ")"
+            ngx.ctx.routed_peer_key  = new_key   -- 干净 key(不带 retry 后缀),供查表/回显
             -- 重试换了 peer → GPU 型号跟着换(可能跨卡型 fallback)
             ngx.ctx.routed_gpu       = opts and opts.gpu_by_key and opts.gpu_by_key[new_key] or nil
         end
