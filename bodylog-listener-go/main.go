@@ -40,7 +40,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -140,8 +139,8 @@ func (w *hourWriter) close() {
 // resp_meta.reasoning / resp_meta.tool_calls）。~400B/行，按天写 metrics/details/<date>.jsonl，
 // 跨天封口后由 housekeep 转 parquet。/metrics 接口查的就是这份。
 type detailRecord struct {
-	Ts               string  `json:"ts"`               // 请求开始时刻
-	TsEnd            string  `json:"ts_end,omitempty"` // 请求结束时刻 = ts + rt（聚合分桶用此）
+	Ts               string  `json:"ts"`                // 请求开始时刻
+	TsEnd            string  `json:"ts_end,omitempty"`  // 请求结束时刻 = ts + rt（聚合分桶用此）
 	RequestID        string  `json:"request_id,omitempty"`
 	SourceAddr       string  `json:"source_addr,omitempty"`
 	URI              string  `json:"uri,omitempty"`
@@ -151,7 +150,6 @@ type detailRecord struct {
 	Peer             string  `json:"peer,omitempty"`         // openresty 选中的上游（可能是 router 中间层）
 	ForwardedTo      string  `json:"forwarded_to,omitempty"` // 原始 X-Routed-Peer URL
 	Backend          string  `json:"backend"`                // 归一化后的真实后端 host:port（= 聚合用的 peer key）
-	BackendGPU       string  `json:"backend_gpu,omitempty"`  // 该后端所在机器的 GPU 型号（H100/A100/…），查表得到，见 peerGPU
 	Mode             string  `json:"mode,omitempty"`
 	SessionSrc       string  `json:"session_src,omitempty"`
 	Model            string  `json:"model,omitempty"`
@@ -185,7 +183,6 @@ func extractDetail(m map[string]any) detailRecord {
 		Peer:             getString(m["peer"]),
 		ForwardedTo:      getString(m["forwarded_to"]),
 		Backend:          cachedPeer(m),
-		BackendGPU:       peerGPU(cachedPeer(m)),
 		Mode:             getString(m["mode"]),
 		SessionSrc:       getString(m["session_src"]),
 		Frt:              getFloat(m["first_chunk_t"]),
@@ -1075,61 +1072,6 @@ func getFloat(v any) float64 {
 	return 0
 }
 
-// ── 后端 GPU 型号映射 ──────────────────────────────────────────────────
-// 为什么在 listener 侧查表、而不是让 openresty 在每条日志里带上：GPU 型号是【低频变化的
-// 静态属性】（机器建好就定了），逐请求传输纯属浪费；且同一映射逻辑放两处必然走偏
-// （openresty 侧一度按"本层选中的 peer"取型号，而生产主路径本层选中的是 CART 中间层，
-// 取到的永远是空）。这里统一按【归一化后的真实后端 host:port】查，口径与 backend 字段一致。
-//
-// 数据来源：BODYLOG_PEER_GPU_FILE 指向的映射文件，每行 "<ip:port> <型号>"，# 开头为注释。
-// 例：
-//
-//	10.0.0.1:8050 H100
-//	10.0.0.2:8050 B300
-//
-// 该文件可从 monitor.conf 的 service 行（含 gpu_type 列）或 autoconfig 的节点标签生成。
-// 未配置文件 / 查不到的后端 → 返回空串（字段 omitempty 不出现），不影响其它统计。
-var peerGPUMap atomic.Value // map[string]string
-
-func loadPeerGPUMap(path string) {
-	if path == "" {
-		return
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		log.Printf("peer-gpu map: open %s failed: %v (backend_gpu will be empty)", path, err)
-		return
-	}
-	defer f.Close()
-	m := map[string]string{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fs := strings.Fields(line)
-		if len(fs) >= 2 {
-			m[fs[0]] = fs[1]
-		}
-	}
-	if err := sc.Err(); err != nil {
-		log.Printf("peer-gpu map: read %s failed: %v", path, err)
-		return
-	}
-	peerGPUMap.Store(m)
-	log.Printf("peer-gpu map: loaded %d entries from %s", len(m), path)
-}
-
-// peerGPU 查后端对应的 GPU 型号；未加载/查不到均返回空串。
-func peerGPU(backend string) string {
-	v := peerGPUMap.Load()
-	if v == nil || backend == "" {
-		return ""
-	}
-	return v.(map[string]string)[backend]
-}
-
 // normalizePeer: 优先用 forwarded_to（router 回的真实后端）聚合，否则用 openresty 选中的 peer。
 // 去掉 http(s):// 前缀、剥 path，留 host:port；空则 "(none)"。aggregator.ingest 与
 // extractDetail 共用，保证明细的 backend 字段与分钟聚合的 peer key 口径一致。
@@ -1278,7 +1220,7 @@ func sqlStr(s string) string {
 const detailsColumns = "{" +
 	"'ts':'VARCHAR','ts_end':'VARCHAR','request_id':'VARCHAR','source_addr':'VARCHAR','uri':'VARCHAR'," +
 	"'method':'VARCHAR','stream':'BOOLEAN','status':'BIGINT','peer':'VARCHAR','forwarded_to':'VARCHAR'," +
-	"'backend':'VARCHAR','backend_gpu':'VARCHAR','mode':'VARCHAR','session_src':'VARCHAR','model':'VARCHAR'," +
+	"'backend':'VARCHAR','mode':'VARCHAR','session_src':'VARCHAR','model':'VARCHAR'," +
 	"'finish_reason':'VARCHAR','frt':'DOUBLE','lct':'DOUBLE','rt':'DOUBLE'," +
 	"'chunk_count':'BIGINT','req_bytes':'BIGINT','resp_bytes':'BIGINT'," +
 	"'prompt_tokens':'BIGINT','completion_tokens':'BIGINT','cached_tokens':'BIGINT'," +
@@ -1583,7 +1525,6 @@ func main() {
 	dir := envOr("BODYLOG_DIR", defaultDir)
 	keepDays = envOrInt("BODYLOG_KEEP_DAYS", defaultKeepDays)
 	detailsKeepDays = envOrInt("BODYLOG_DETAILS_KEEP_DAYS", defaultDetailsKeepDays)
-	loadPeerGPUMap(envOr("BODYLOG_PEER_GPU_FILE", ""))
 	httpToken = envOr("BODYLOG_HTTP_TOKEN", "")
 	if httpToken != "" {
 		log.Printf("HTTP auth: ON — /summary + /metrics require Bearer token (BODYLOG_HTTP_TOKEN)")
