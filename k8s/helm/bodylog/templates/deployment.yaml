@@ -16,6 +16,9 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- if and .Values.exporter.enabled .Values.exporter.routeDiscovery.enabled (not .Values.exporter.openrestyPoll.routes) }}
+      serviceAccountName: {{ include "bodylog.fullname" . }}   # 有 list modelroutes 权限(动态发现用)
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -62,7 +65,54 @@ spec:
           {{- end }}
           volumeMounts:
             - { name: data, mountPath: {{ .Values.dataDir }} }
+        {{- if .Values.exporter.enabled }}
+        - name: exporter          # sidecar:明细 jsonl → Prometheus;可选 poll 集群内 openresty 控制面态
+          image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.exporter.image.pullPolicy }}
+          env:
+            - { name: BODYLOG_DETAILS_DIR, value: "{{ .Values.dataDir }}/metrics/details" }
+            - { name: EXPORTER_LISTEN,     value: "0.0.0.0:{{ .Values.exporter.port }}" }
+            - { name: CHECKPOINT_PATH,     value: "/ckpt/checkpoint.json" }
+            - { name: DATE_TZ,             value: "{{ .Values.exporter.dateTz }}" }
+            # 跨天 jsonl→parquet 轮转的缺口补读(同 pod 的 bodylog http 口)
+            - { name: BODYLOG_URL,         value: "http://127.0.0.1:{{ .Values.ports.http }}" }
+            - name: BODYLOG_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ include "bodylog.secretName" . }}, key: BODYLOG_HTTP_TOKEN }
+            {{- if .Values.exporter.openrestyPoll.url }}
+            - { name: OPENRESTY_POLL_URL,         value: "{{ .Values.exporter.openrestyPoll.url }}" }
+            - { name: OPENRESTY_POLL_INTERVAL_MS, value: "{{ .Values.exporter.openrestyPoll.intervalMs }}" }
+            {{- if .Values.exporter.openrestyPoll.routes }}
+            - { name: OPENRESTY_POLL_ROUTES,      value: "{{ join "," .Values.exporter.openrestyPoll.routes }}" }   # 静态覆盖
+            {{- else if .Values.exporter.routeDiscovery.enabled }}
+            # 动态发现:列 ModelRoute CR(不设 OPENRESTY_POLL_ROUTES → exporter 走 k8s 发现)
+            - { name: MODELROUTE_GROUP,                value: "{{ .Values.exporter.routeDiscovery.apiGroup }}" }
+            - { name: MODELROUTE_VERSION,              value: "{{ .Values.exporter.routeDiscovery.version }}" }
+            - { name: MODELROUTE_PLURAL,               value: "{{ .Values.exporter.routeDiscovery.plural }}" }
+            - { name: ROUTE_DISCOVERY_INTERVAL_SECONDS, value: "{{ .Values.exporter.routeDiscovery.intervalSeconds }}" }
+            - { name: OPENRESTY_SERVICE,               value: "{{ .Values.exporter.routeDiscovery.openrestyService }}" }
+            {{- end }}
+            {{- end }}
+          ports:
+            - { name: exporter, containerPort: {{ .Values.exporter.port }} }
+          {{- if .Values.probes.enabled }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.exporter.port }} }
+            periodSeconds: 15
+            failureThreshold: 3
+          {{- end }}
+          {{- with .Values.exporter.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: data, mountPath: {{ .Values.dataDir }}, readOnly: true }  # 只读 tail 明细
+            - { name: exporter-ckpt, mountPath: /ckpt }                          # offset checkpoint(emptyDir)
+        {{- end }}
       volumes:
+        {{- if .Values.exporter.enabled }}
+        - name: exporter-ckpt
+          emptyDir: {}          # checkpoint:容器重启续读;pod 重调度丢失 → 重读当天文件(counter 天然幂等)
+        {{- end }}
         - name: data
         {{- if .Values.persistence.enabled }}
           persistentVolumeClaim: { claimName: {{ include "bodylog.pvcName" . }} }

@@ -1,0 +1,92 @@
+# 独立部署 bodylog-exporter(仅 openresty-poll 用,不带 bodylog)。
+# 场景:集群没部署 bodylog、但想把 openresty 的实时路由/限流态导进 Prometheus。
+# tail 部分因无 details 目录而空跑(无害);poll 部分 list ModelRoute 动态发现 route + poll openresty。
+#
+# apply: kubectl apply -f exporter-standalone.yaml
+# 验证: Prometheus target serviceMonitor/llm-route/bodylog-exporter/0 = up;查 openresty_* 指标
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: bodylog-exporter, namespace: llm-gateway }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: bodylog-exporter-modelroute-reader }
+rules:
+  - apiGroups: [ "routing.gpucluster.io" ]
+    resources: [ "modelroutes" ]
+    verbs: [ "get", "list", "watch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: bodylog-exporter-modelroute-reader }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bodylog-exporter-modelroute-reader }
+subjects:
+  - { kind: ServiceAccount, name: bodylog-exporter, namespace: llm-gateway }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bodylog-exporter
+  namespace: llm-gateway
+  labels: { app: bodylog-exporter }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: bodylog-exporter } }
+  template:
+    metadata:
+      labels: { app: bodylog-exporter }
+    spec:
+      serviceAccountName: bodylog-exporter        # 有 list modelroutes 权限(动态发现)
+      containers:
+        - name: exporter
+          image: registry.example.com/llm/bodylog-exporter:0.1.3
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: BODYLOG_DETAILS_DIR, value: "/tmp/details" }   # 无 bodylog:空跑 tail
+            - { name: CHECKPOINT_PATH,     value: "/tmp/ckpt/checkpoint.json" }
+            - { name: EXPORTER_LISTEN,     value: "0.0.0.0:9110" }
+            # openresty-poll:集群内 openresty Service(同 ns 短名),route 走 k8s 动态发现
+            - { name: OPENRESTY_POLL_URL,          value: "http://openresty:8080" }
+            - { name: OPENRESTY_POLL_INTERVAL_MS,  value: "15000" }
+            - { name: ROUTE_DISCOVERY_INTERVAL_SECONDS, value: "30" }
+            # OPENRESTY_SERVICE 留空 = 全要(本集群单 openresty;且 modelroute 的 nginx.service 写法不统一)
+          ports:
+            - { name: metrics, containerPort: 9110 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9110 }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          volumeMounts:
+            - { name: scratch, mountPath: /tmp }
+      volumes:
+        - name: scratch
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bodylog-exporter
+  namespace: llm-gateway
+  labels: { app: bodylog-exporter }
+spec:
+  selector: { app: bodylog-exporter }
+  ports:
+    - { name: metrics, port: 9110, targetPort: metrics }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bodylog-exporter
+  namespace: llm-gateway
+  labels: { release: kube-prometheus-stack }   # 匹配 Prometheus CR 的 serviceMonitorSelector
+spec:
+  namespaceSelector: { matchNames: [ llm-route ] }
+  selector: { matchLabels: { app: bodylog-exporter } }
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      honorLabels: true

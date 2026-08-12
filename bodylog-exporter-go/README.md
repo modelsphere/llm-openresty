@@ -38,6 +38,34 @@
 | `bodylog_exporter_last_ts_seconds` | gauge | 最新 observe 行的结束时刻(unix 秒),**判滞后** |
 | `bodylog_exporter_recovery_total` | counter | 跨天缺口 HTTP 补读次数 |
 
+### openresty 控制面指标(openresty-poll,可选)
+
+**流量侧(上面)是事后逐请求;这一组是 openresty 的即时控制面态**(每 peer 当前并发、被 ban 的 peer、限流档位)——bodylog 拿不到,**对自动扩缩容反应更快**。开启方式见下方「openresty-poll 配置」:exporter 定时 GET openresty 已暴露的 JSON 端点(`/<route>/_route_state|_tps_status|_ttft_status|_429_status`),**不改 openresty**。全是 **gauge**(快照,每 poll 周期清空重填 → 掉线 peer 自动消失),仅 `openresty_rejected_total` 是 counter。
+
+维度:`route`(=ModelRoute 名)/ `peer`(真后端 host:port)/ `name`(peer 名)/ `priority`(路由层级)/ `model`(子池,无分模型时为 `_`)。
+
+| 指标 | 类型 | label | 含义 |
+|---|---|---|---|
+| `openresty_peer_active_conns` | gauge | route,peer,name,priority | 该 peer **当前并发**(least_conn 计数) |
+| `openresty_peer_banned` | gauge | 同上 | 是否被健康检查 **ban**(1/0) |
+| `openresty_peer_max_concurrency` | gauge | 同上 | 该 peer 静态并发上限 |
+| `openresty_route_active_level` | gauge | route | 当前生效优先级层(3=cart/2=backend/1=svc 兜底) |
+| `openresty_route_active_limit` | gauge | route | 生效层总并发上限 |
+| `openresty_route_healthy_peers` | gauge | route | 生效层健康 peer 数 |
+| `openresty_adaptive_cc` | gauge | route,model | **当前动态并发上限**(AIMD) |
+| `openresty_adaptive_cc_min` / `_max` | gauge | route,model | 生效下限 / 静态池容量 |
+| `openresty_adaptive_cc_conc` | gauge | route,model | **当前并发**(timer 判压力用的实时在途) |
+| `openresty_adaptive_cc_rej` | gauge | route,model | 本区间被压抑需求(并发 429 数) |
+| `openresty_tps_ewma` | gauge | route,model | 解码速率 EWMA(tok/s) |
+| `openresty_ttft_ewma_ms` | gauge | route,model | TTFT EWMA(ms) |
+| `openresty_tps_limiter_active` / `openresty_ttft_limiter_active` | gauge | route | 限流是否生效(1/0) |
+| `openresty_rejected_total` | **counter** | route,reason | 429 限流累计(reason=concurrency/ttft/tps) |
+| `openresty_poll_up` | gauge | — | 上轮 poll 是否全成功(1/0) |
+| `openresty_poll_errors_total` | counter | — | poll 出错累计 |
+| `openresty_poll_last_success_seconds` | gauge | — | 上次成功 poll 的 unix 秒 |
+
+**只 poll 一台**:k8s openresty Service(HA 时只选 active leader → 天然单逻辑目标),不带 instance label。
+
 ### label 说明
 
 - **`backend`**:归一化后的**真实后端** `host:port`(= bodylog 聚合的 peer key)。缺失时为 `(none)`(如未路由的 4xx);重试会出现 `<peer> (retry#1)` 变体。
@@ -67,6 +95,27 @@
 | `RECOVERY_LAG_SECONDS` | `10` | 补读上界 = `now - lag`(等 flush 落定) |
 | `FOLLOW_INTERVAL_MS` | `300` | tail 到 EOF 后的轮询间隔 |
 | `DATE_TZ` | `Asia/Shanghai` | 文件按天命名的时区,**须与 bodylog 一致**;无 tzdata 回退固定 `+08:00`(中国无 DST 正好正确) |
+
+### openresty-poll 配置(可选;空 URL = 只 tail、不 poll)
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `OPENRESTY_POLL_URL` | 空 | openresty base(如集群内 `http://openresty:8080`);**空=不启用**。裸机 exporter 够不到 k8s 故默认关 |
+| `OPENRESTY_POLL_ROUTES` | 空 | **静态逃生口**:逗号分隔 route 列表(如 `qwen,opt`)。**非空则不走动态发现**;留空=动态发现 |
+| `OPENRESTY_POLL_INTERVAL_MS` | `15000` | poll 周期 |
+| `OPENRESTY_POLL_TIMEOUT_MS` | `3000` | 单请求超时 |
+
+**route 集合默认【动态发现】**(不填 `OPENRESTY_POLL_ROUTES` 时):exporter 用 pod 的 in-cluster ServiceAccount 列 **ModelRoute CR**(`routing.gpucluster.io/v1alpha1`,`spec.nginx.route`)得到"当前 k8s 里所有 route",周期刷新、增删自动跟随 —— **无需静态配、route 变了不重启**。需 RBAC(SA 有 `list modelroutes`,helm `rbac.yaml` 已建)。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.gpucluster.io` / `v1alpha1` / `modelroutes` | CR 坐标 |
+| `ROUTE_DISCOVERY_INTERVAL_SECONDS` | `30` | list ModelRoute 周期 |
+| `OPENRESTY_SERVICE` | 空 | 只要 `nginx.service` 指向这台 openresty 的 route(多 openresty 时用);空=全要 |
+
+发现自监控:`openresty_route_discovery_up`(1/0)、`openresty_discovered_routes`(route 数)、`openresty_route_discovery_errors_total`。apiserver 抖动某轮失败 → **保留上次成功的 routes 不清空**。
+
+> **只读**:poll 的都是 openresty 的 GET 状态端点(`_route_state`/`_tps_status`/`_ttft_status`/`_429_status`),不改任何配置、不 reload。k8s 部署时作 bodylog **sidecar**(同 pod 可短名 `http://openresty:8080` 直连,SA 带 modelroute list 权限)。
 
 ---
 
@@ -149,6 +198,22 @@ metrics:
   - name: ttft-p95           # 饱和护栏,NaN 兜底 0
     query: 'histogram_quantile(0.95, sum by(le)(rate(bodylog_ttft_seconds_bucket{model="qwen"}[2m]))) or vector(0)'
     target: "2"
+```
+
+**用 openresty 控制面态扩缩容(比 bodylog 更即时)**:`active_conns` / `adaptive_cc` 是实时压力,反应比事后 counter 快:
+
+```promql
+# 每 pod 平均并发占用率(当前并发 / 静态上限)—— 越接近 1 越该扩
+avg(openresty_peer_active_conns{route="qwen"}) / avg(openresty_peer_max_concurrency{route="qwen"})
+
+# 自适应并发已顶到池容量(AIMD 打满 → 需要更多 pod)
+avg(openresty_adaptive_cc{route="qwen"}) / avg(openresty_adaptive_cc_max{route="qwen"})
+
+# 有 peer 被 ban(健康恶化,别盲目缩容)
+sum(openresty_peer_banned{route="qwen"})
+
+# 并发 429 正在发生(容量不足的直接信号)
+sum(rate(openresty_rejected_total{route="qwen",reason="concurrency"}[1m]))
 ```
 
 ---

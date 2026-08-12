@@ -94,6 +94,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// openresty-poll(可选):poll k8s 集群内那台 openresty 的实时路由/限流状态 → gauge。
+	// URL 空 = 不启用(裸机 exporter 够不到 k8s;默认关)。route 集合:静态 OPENRESTY_POLL_ROUTES
+	// 优先(逃生口);否则动态从 k8s 列 ModelRoute CR(route 增删自动跟随)。
+	if orc := loadORConfig(); orc.baseURL != "" {
+		var routesFn func() []string
+		if len(orc.staticRoutes) > 0 {
+			rs := orc.staticRoutes
+			routesFn = func() []string { return rs }
+			log.Printf("openresty-poll: %s routes=%v(静态) every %s", orc.baseURL, rs, orc.interval)
+		} else {
+			rd := newRouteDiscoverer(reg, loadDiscoverConfig())
+			go rd.run(ctx)
+			routesFn = rd.get
+			log.Printf("openresty-poll: %s routes=<k8s ModelRoute 动态发现> every %s", orc.baseURL, orc.interval)
+		}
+		go newORPoller(orc, newORMetrics(reg), routesFn).run(ctx)
+	} else {
+		log.Printf("openresty-poll: 未启用(设 OPENRESTY_POLL_URL 开启)")
+	}
+
 	newTailer(cfg, m).run(ctx) // 阻塞直到收到信号
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

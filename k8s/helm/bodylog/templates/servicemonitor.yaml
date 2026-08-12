@@ -1,0 +1,24 @@
+{{- if and .Values.exporter.enabled .Values.exporter.serviceMonitor.enabled }}
+# 让集群内 kube-prometheus-stack 抓 bodylog-exporter 的 :{{ .Values.exporter.port }}(/metrics)。
+# 需 prometheus-operator(ServiceMonitor 是它的 CRD,非 k8s 原生);label release 必须匹配
+# Prometheus CR 的 serviceMonitorSelector,否则不被选中。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "bodylog.fullname" . }}-exporter
+  labels:
+    {{- include "bodylog.labels" . | nindent 4 }}
+    release: {{ .Values.exporter.serviceMonitor.releaseLabel }}
+spec:
+  namespaceSelector:
+    matchNames: [ {{ .Release.Namespace }} ]
+  selector:
+    matchLabels: {{- include "bodylog.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: exporter          # = Service 里的端口名
+      path: /metrics
+      interval: {{ .Values.exporter.serviceMonitor.interval }}
+      honorLabels: true       # 保留 exporter 自带的 backend/model/route/peer label
+      # 指数 native histogram 只在 protobuf 里传;要 native 精度就打开下一行(需 Prometheus scrapeNativeHistograms)
+      # scrapeProtocols: [ PrometheusProto, OpenMetricsText1.0.0, PrometheusText0.0.4 ]
+{{- end }}
