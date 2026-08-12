@@ -64,6 +64,14 @@
 | `openresty_poll_errors_total` | counter | — | poll 出错累计 |
 | `openresty_poll_last_success_seconds` | gauge | — | 上次成功 poll 的 unix 秒 |
 
+**route 动态发现自监控**(走 k8s ModelRoute 发现时,见下方「openresty-poll 配置」):
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `openresty_discovered_routes` | gauge | 当前发现到的 route 数(= list ModelRoute CR 得到) |
+| `openresty_route_discovery_up` | gauge | 上轮 list ModelRoute 成功(1/0);失败时**保留上次 routes 不清空** |
+| `openresty_route_discovery_errors_total` | counter | ModelRoute 发现出错累计 |
+
 **只 poll 一台**:k8s openresty Service(HA 时只选 active leader → 天然单逻辑目标),不带 instance label。
 
 ### label 说明
