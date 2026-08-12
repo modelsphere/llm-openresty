@@ -163,11 +163,44 @@ spec:
   endpoints: [ { port: metrics, path: /metrics, interval: 30s, honorLabels: true } ]
 ```
 
-### k8s sidecar(集群自带 bodylog 时)
+### k8s:bodylog chart sidecar(主场景 —— 一个实例同时出两类指标)
 
-exporter 作 sidecar 加进 bodylog pod,**共享挂载 bodylog 卷**(只读),Service + ServiceMonitor 同上。
+集群装了 bodylog(`openresty/k8s/helm/bodylog`)时,exporter 作 **sidecar 内置在 bodylog chart 里**:同 pod 只读共享 data 卷 tail 明细(`bodylog_*`)+ poll 集群内 openresty(`openresty_*`)。**一个实例 = tail + poll 两半全出**。由 `values.exporter.*` 控制:
 
-CI:`openresty/.gitlab-ci.yml` 的 `build:exporter` 打 git tag 出镜像 `registry.example.com/llm/bodylog-exporter:<tag>`。
+```yaml
+exporter:
+  enabled: true
+  image: { repository: registry.example.com/llm/bodylog-exporter, tag: "" }  # tag="" 回落 chart appVersion
+  openrestyPoll:
+    url: "http://openresty:8080"   # 集群内 openresty Service;空=只 tail 不 poll
+    routes: []                     # 留空=动态发现;填了=静态覆盖
+    intervalMs: 15000
+  routeDiscovery:                  # 动态发现 route(list ModelRoute CR)
+    enabled: true                  # 自动建 SA+ClusterRole(list modelroutes)+Binding(templates/rbac.yaml)
+    openrestyService: ""           # 只统计 nginx.service 指向本 openresty 的 route;空=全要
+  serviceMonitor: { enabled: true, releaseLabel: kube-prometheus-stack }
+```
+
+```bash
+helm repo add harbor-chart-repo https://registry.example.com/chartrepo/llm
+helm -n <ns> upgrade --install bodylog harbor-chart-repo/bodylog --version <tag> --set-string secret.token=<token>
+```
+
+Service 自动加 `metrics:9110` 口 + ServiceMonitor(集群内直接抓)。
+
+### k8s:独立 poll-only 部署(集群没 bodylog 时)
+
+只想把 openresty 控制面态导进 Prometheus、集群里又没 bodylog:用独立 Deployment(tail 空跑,只 poll)。现成 manifest [`deploy/exporter-standalone.yaml`](deploy/exporter-standalone.yaml)(含 SA+ClusterRole+Binding+Deployment+Service+ServiceMonitor,`OPENRESTY_POLL_URL=http://openresty:8080` + 动态发现):
+
+```bash
+kubectl apply -f deploy/exporter-standalone.yaml   # 换 ns/openresty Service 名即可复用
+```
+
+### 裸机启用 openresty-poll(可选)
+
+裸机 systemd 场景默认只 tail;要顺带 poll **同机**的 openresty,给 `bodylog-exporter.service` 的 Environment 加 `OPENRESTY_POLL_URL`(如 `http://127.0.0.1:18080`)+ `OPENRESTY_POLL_ROUTES`(裸机非 k8s、无 ModelRoute API → 用静态 route 列表)。
+
+CI:`openresty/.gitlab-ci.yml` 的 `build:exporter` 打 git tag 出镜像 `registry.example.com/llm/bodylog-exporter:<tag>`;`build:chart` 同 tag 出 bodylog chart(sidecar 镜像回落 appVersion)。
 
 ---
 
