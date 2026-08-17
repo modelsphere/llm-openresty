@@ -85,7 +85,7 @@ func newORMetrics(reg *prometheus.Registry) *orMetrics {
 	g := func(name, help string, labels ...string) *prometheus.GaugeVec {
 		return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
 	}
-	// service = 后端 discovery.service(ns/name,route→service 由 routeDiscoverer 提供);与 bodylog_* 对齐,便于按 service 聚合(如 429)。
+	// service = 后端 discovery.service(ns/name,route→service 由 podRouteResolver 提供);与 bodylog_* 对齐,便于按 service 聚合(如 429)。
 	sroute := []string{"service", "route"}
 	peerLbls := []string{"service", "route", "peer", "name", "priority"}
 	srm := []string{"service", "route", "model"}
@@ -172,9 +172,9 @@ type orPoller struct {
 	cfg      orConfig
 	m        *orMetrics
 	client   *http.Client
-	routesFn func() []string       // 当前要 poll 的 route 集合(静态或 k8s 动态发现)
-	svcFn    func(string) string   // route → discovery.service(ns/name);nil 或返回 "" → service=unknown
-	prev     map[string]float64    // 429 counter delta 追踪:key="route|reason" → 上次绝对值
+	routesFn func() []string     // 当前要 poll 的 route 集合(静态或 k8s 动态发现)
+	svcFn    func(string) string // route → discovery.service(ns/name);nil 或返回 "" → service=unknown
+	prev     map[string]float64  // 429 counter delta 追踪:key="route|reason" → 上次绝对值
 }
 
 func newORPoller(cfg orConfig, m *orMetrics, routesFn func() []string, svcFn func(string) string) *orPoller {

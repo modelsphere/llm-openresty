@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -13,12 +14,12 @@ import (
 
 func TestBackendIP(t *testing.T) {
 	cases := map[string]string{
-		"10.0.0.5:8050":            "10.0.0.5",
-		"10.0.0.5:8050 (retry#1)":  "10.0.0.5",
-		"10.102.29.46:8071":             "10.102.29.46",
-		"  10.0.0.5:8050  ":          "10.0.0.5",
-		"(none)":                        "(none)",
-		"":                              "",
+		"10.0.0.5:8050":           "10.0.0.5",
+		"10.0.0.5:8050 (retry#1)": "10.0.0.5",
+		"10.102.29.46:8071":            "10.102.29.46",
+		"  10.0.0.5:8050  ":         "10.0.0.5",
+		"(none)":                       "(none)",
+		"":                             "",
 	}
 	for in, want := range cases {
 		if got := backendIP(in); got != want {
@@ -123,6 +124,73 @@ func TestResolverBuild(t *testing.T) {
 	}
 	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 1 {
 		t.Errorf("kimi replicas_ready = %v, 想要 1", n)
+	}
+
+	// poll 视角(收敛后同一发现器产出):routes(过滤+去重+排序)+ route→service。
+	if got, want := r.getRoutes(), []string{"fallback-model-service-0.1", "kimi-k2.5"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("getRoutes() = %v, 想要 %v", got, want)
+	}
+	if got := r.serviceFor("fallback-model-service-0.1"); got != "model-service/fallback-model-service-01" {
+		t.Errorf("serviceFor(fallback) = %q", got)
+	}
+	if got := r.serviceFor("nonexist"); got != "" {
+		t.Errorf("serviceFor(未知) 应空, 得 %q", got)
+	}
+}
+
+// nginxService 过滤:只有 nginx.service 匹配的 route 进 poll 列表;但 svc map 含所有 route。
+func TestResolverRouteFilter(t *testing.T) {
+	const mr = `{"items":[
+	  {"spec":{"nginx":{"route":"a","service":"llm-route/openresty"},"discovery":{"service":"ns/a-svc"}}},
+	  {"spec":{"nginx":{"route":"b","service":"llm-route/other"},"discovery":{"service":"ns/b-svc"}}}
+	]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "endpointslices") {
+			_, _ = w.Write([]byte(esJSON())) // 空端点(不影响本测试)
+			return
+		}
+		_, _ = w.Write([]byte(mr))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv)
+	r.nginxService = "llm-route/openresty"
+	r.refresh(context.Background())
+
+	if got, want := r.getRoutes(), []string{"a"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("过滤后 getRoutes() = %v, 想要 [a]", got)
+	}
+	if got := r.serviceFor("b"); got != "ns/b-svc" { // 被 poll 过滤掉,但 svc map 仍含它
+		t.Errorf("serviceFor(b) = %q, 想要 ns/b-svc(svc map 不受 poll 过滤影响)", got)
+	}
+}
+
+// apiserver 报错时:保留上次成功的 routes/映射,不清空(避免抖动全失明)。
+func TestResolverKeepsLastOnError(t *testing.T) {
+	fail := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if strings.Contains(r.URL.Path, "endpointslices") {
+			_, _ = w.Write([]byte(esJSON("10.0.0.5")))
+			return
+		}
+		_, _ = w.Write([]byte(mrFullJSON))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv)
+	r.refresh(context.Background())
+	before := r.getRoutes()
+	fail = true
+	r.refresh(context.Background()) // 这轮失败
+	if got := r.getRoutes(); !reflect.DeepEqual(got, before) {
+		t.Errorf("出错后 routes 应保留 %v, 实际 %v", before, got)
+	}
+	if _, _, ok := r.Lookup("10.0.0.5"); !ok {
+		t.Errorf("出错后 byIP 映射应保留")
 	}
 }
 

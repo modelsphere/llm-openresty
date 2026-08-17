@@ -3,10 +3,10 @@
 // 为什么需要:bodylog 的 backend 是 openresty 转发到的真实后端 = k8s pod IP:port,pod 重建会漂移;
 // 且明细的 model 字段常抓空(→unknown)。唯一稳定可靠的归属键是「这个 pod IP 属于哪个 ModelRoute」。
 // 数据源:list ModelRoute CR 取 spec.discovery.service → 查该 Service 的 EndpointSlice 得 pod IP 集,
-// 反建 map[podIP]{route,model}。周期刷新,pod 增删自动跟随。observe() 据此给 bodylog_* 打稳定的 route label。
+// 反建 map[podIP]{route,service}。周期刷新,pod 增删自动跟随。observe() 据此给 bodylog_* 打稳定的 service/route label。
 //
-// 与 k8s_routes.go 的 routeDiscoverer 是两码事:后者列 route 名给 openresty-poll 用;本解析器建 IP→route
-// 反查表给 tail 明细指标用。二者都走 in-cluster SA REST(裸 net/http,不引 client-go)。
+// 单一发现器:同一份 ModelRoute list 既产出富化映射(byIP + 副本数,给 tail 明细指标),
+// 也产出 route 列表 + route→service(给 openresty-poll)。走 in-cluster SA REST(裸 net/http,不引 client-go)。
 package main
 
 import (
@@ -20,11 +20,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	k8sTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	k8sCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )
 
 // routeInfo:一个后端 pod 所属的 route 及其 service(来自它所在的 ModelRoute)。
@@ -34,16 +40,20 @@ type routeInfo struct{ route, service string }
 
 type podRouteResolver struct {
 	group, version, plural string
+	nginxService           string // 只把 nginx.service==此的 route 计入 poll 列表(多 openresty 用;空=全要)
 	interval, timeout      time.Duration
 	apiBase                string
 	tokenPath              string
 	client                 *http.Client
 
-	mu   sync.RWMutex
-	byIP map[string]routeInfo
+	mu     sync.RWMutex
+	byIP   map[string]routeInfo // 后端 pod IP → {route, service}(富化用,含所有 route)
+	routes []string             // poll 用的 route 列表(按 nginxService 过滤 + 去重排序)
+	svc    map[string]string    // route → discovery.service(poll 打 service label 用,含所有 route)
 
 	up            prometheus.Gauge
 	pods          prometheus.Gauge
+	routesG       prometheus.Gauge
 	errs          prometheus.Counter
 	replicas      *prometheus.GaugeVec // {service, route} → 后端 pod 总数(含未就绪)
 	replicasReady *prometheus.GaugeVec // {service, route} → 就绪后端 pod 数
@@ -72,23 +82,42 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		log.Printf("route-enrich: 读 CA %s 失败(%v),TLS 用系统根", k8sCAPath, err)
 	}
 	r := &podRouteResolver{
-		group:     envOr("MODELROUTE_GROUP", "routing.gpucluster.io"),
-		version:   envOr("MODELROUTE_VERSION", "v1alpha1"),
-		plural:    envOr("MODELROUTE_PLURAL", "modelroutes"),
-		interval:  interval,
-		timeout:   timeout,
-		apiBase:   apiBase,
-		tokenPath: k8sTokenPath,
-		client:    &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tlsCfg}},
-		byIP:      map[string]routeInfo{},
-		up:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_up", Help: "上轮 podIP→route 映射刷新是否成功(1/0)"}),
-		pods:      prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_pods", Help: "当前映射覆盖的后端 pod IP 数"}),
-		errs:      prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "podIP→route 映射刷新出错累计"}),
+		group:         envOr("MODELROUTE_GROUP", "routing.gpucluster.io"),
+		version:       envOr("MODELROUTE_VERSION", "v1alpha1"),
+		plural:        envOr("MODELROUTE_PLURAL", "modelroutes"),
+		nginxService:  strings.TrimSpace(envOr("OPENRESTY_SERVICE", "")),
+		interval:      interval,
+		timeout:       timeout,
+		apiBase:       apiBase,
+		tokenPath:     k8sTokenPath,
+		client:        &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tlsCfg}},
+		byIP:          map[string]routeInfo{},
+		svc:           map[string]string{},
+		up:            prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_up", Help: "上轮 ModelRoute 发现/映射刷新是否成功(1/0)"}),
+		pods:          prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_pods", Help: "当前映射覆盖的后端 pod IP 数"}),
+		routesG:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_routes", Help: "当前发现的 route 数(poll 列表)"}),
+		errs:          prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "ModelRoute 发现/映射刷新出错累计"}),
 		replicas:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service(discovery.service)当前后端 pod 总数(EndpointSlice endpoint 数,含未就绪)"}, []string{"service", "route"}),
 		replicasReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端 pod 数(conditions.ready)"}, []string{"service", "route"}),
 	}
-	reg.MustRegister(r.up, r.pods, r.errs, r.replicas, r.replicasReady)
+	reg.MustRegister(r.up, r.pods, r.routesG, r.errs, r.replicas, r.replicasReady)
 	return r
+}
+
+// getRoutes:poll 要 poll 的 route 列表(按 nginxService 过滤后的快照)。
+func (r *podRouteResolver) getRoutes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, len(r.routes))
+	copy(out, r.routes)
+	return out
+}
+
+// serviceFor:route → discovery.service(ns/name)。未知返回 ""(poller 侧回退 unknown)。
+func (r *podRouteResolver) serviceFor(route string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.svc[route]
 }
 
 // svcRep:一个 service 的副本数(build 顺带产出,refresh 灌进 gauge)。n=总数(含未就绪),ready=就绪数。
@@ -123,7 +152,7 @@ func (r *podRouteResolver) run(ctx context.Context) {
 }
 
 func (r *podRouteResolver) refresh(ctx context.Context) {
-	next, reps, err := r.build(ctx)
+	res, err := r.build(ctx)
 	if err != nil {
 		r.errs.Inc()
 		r.up.Set(0)
@@ -131,25 +160,39 @@ func (r *podRouteResolver) refresh(ctx context.Context) {
 		return // 保留上次映射(不清空,避免 apiserver 抖动时全 route 归属失明)
 	}
 	r.mu.Lock()
-	r.byIP = next
+	r.byIP, r.routes, r.svc = res.byIP, res.routes, res.svc
 	r.mu.Unlock()
 	// Reset 后重灌:缩容/下线的 service series 自动消失,不残留旧值。
 	r.replicas.Reset()
 	r.replicasReady.Reset()
-	for _, rp := range reps {
+	for _, rp := range res.reps {
 		r.replicas.WithLabelValues(rp.service, rp.route).Set(float64(rp.n))
 		r.replicasReady.WithLabelValues(rp.service, rp.route).Set(float64(rp.ready))
 	}
 	r.up.Set(1)
-	r.pods.Set(float64(len(next)))
+	r.pods.Set(float64(len(res.byIP)))
+	r.routesG.Set(float64(len(res.routes)))
 }
 
-// modelRouteFull:富化要的投影 —— nginx.route + discovery.service。
+// resolveResult:一轮 build 的产出。byIP/reps/svc 含所有 route;routes 是 poll 用(按 nginxService 过滤)。
+type resolveResult struct {
+	byIP   map[string]routeInfo
+	reps   []svcRep
+	routes []string
+	svc    map[string]string
+}
+
+// modelRouteFull:投影 —— nginx.{route,service} + discovery.service。
 type modelRouteFull struct {
 	Items []struct {
 		Spec struct {
-			Nginx     struct{ Route string `json:"route"` }     `json:"nginx"`
-			Discovery struct{ Service string `json:"service"` } `json:"discovery"`
+			Nginx struct {
+				Route   string `json:"route"`
+				Service string `json:"service"`
+			} `json:"nginx"`
+			Discovery struct {
+				Service string `json:"service"`
+			} `json:"discovery"`
 		} `json:"spec"`
 	} `json:"items"`
 }
@@ -166,23 +209,37 @@ type endpointSliceList struct {
 	} `json:"items"`
 }
 
-// build:list ModelRoute → 每个 route 查 discovery.service 的 EndpointSlice → 汇总
-// map[podIP]{route,service} 及每 service 的后端 pod 数(svcRep)。
-func (r *podRouteResolver) build(ctx context.Context) (map[string]routeInfo, []svcRep, error) {
+// build:list ModelRoute → ① 每个有 discovery.service 的 route 查 EndpointSlice → map[podIP]{route,service} + 副本数;
+// ② route→service 映射(含所有 route);③ poll 用 route 列表(按 nginxService 过滤 + 去重排序)。
+func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 	body, err := r.get(ctx, fmt.Sprintf("%s/apis/%s/%s/%s", r.apiBase, r.group, r.version, r.plural))
 	if err != nil {
-		return nil, nil, err
+		return resolveResult{}, err
 	}
 	var lst modelRouteFull
 	if err := json.Unmarshal(body, &lst); err != nil {
-		return nil, nil, fmt.Errorf("decode ModelRouteList: %w", err)
+		return resolveResult{}, fmt.Errorf("decode ModelRouteList: %w", err)
 	}
-	out := map[string]routeInfo{}
-	var reps []svcRep
+	res := resolveResult{byIP: map[string]routeInfo{}, svc: map[string]string{}}
+	seen := map[string]bool{}
 	for _, it := range lst.Items {
 		route := strings.TrimSpace(it.Spec.Nginx.Route)
+		if route == "" { // monitor-only(无 nginx 路由)→ 既不 poll 也无法归属
+			continue
+		}
 		svc := strings.TrimSpace(it.Spec.Discovery.Service)
-		if route == "" || svc == "" { // 无 nginx 路由或无后端 Service → 无法归属,跳过
+		res.svc[route] = svc // 含所有 route(serviceFor 稳健)
+
+		// poll route 列表:按 nginxService 过滤(多 openresty 用;空=全要)。
+		if r.nginxService == "" || strings.TrimSpace(it.Spec.Nginx.Service) == r.nginxService {
+			if !seen[route] {
+				seen[route] = true
+				res.routes = append(res.routes, route)
+			}
+		}
+
+		// 富化映射:要 discovery.service 才能查后端 pod IP。
+		if svc == "" {
 			continue
 		}
 		ns, name := splitNsName(svc)
@@ -196,11 +253,12 @@ func (r *podRouteResolver) build(ctx context.Context) (map[string]routeInfo, []s
 		}
 		ri := routeInfo{route: route, service: svc} // svc 已是 "ns/name" 形式
 		for _, ip := range ips {
-			out[ip] = ri // 映射含未就绪 pod(它可能刚服务过一个请求,仍要能归属)
+			res.byIP[ip] = ri // 映射含未就绪 pod(它可能刚服务过一个请求,仍要能归属)
 		}
-		reps = append(reps, svcRep{service: svc, route: route, n: len(ips), ready: ready})
+		res.reps = append(res.reps, svcRep{service: svc, route: route, n: len(ips), ready: ready})
 	}
-	return out, reps, nil
+	sort.Strings(res.routes)
+	return res, nil
 }
 
 // podIPsForService:查某 Service 的全部 EndpointSlice(按 kubernetes.io/service-name label 归属)。

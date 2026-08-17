@@ -1,3 +1,6 @@
+{{- if and .Values.persistence.hostPath (empty .Values.nodeSelector) }}
+{{- fail "\n[bodylog] persistence.hostPath 已设但 nodeSelector 为空:hostPath 用 DirectoryOrCreate,pod 若调度到别的 node 会新建空目录(看似历史数据丢失)。必须配 nodeSelector 把 pod 钉到数据盘所在 node,例如:--set nodeSelector.\"kubernetes\\.io/hostname\"=<node>" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

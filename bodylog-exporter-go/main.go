@@ -94,34 +94,37 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 富化:后端 pod IP → route/model → 给 bodylog_* 打稳定的 route(= service)label。
-	// 仅 in-cluster 有意义(需 k8s API + SA);裸机(无 KUBERNETES_SERVICE_HOST)跳过 → route=unknown 优雅降级。
+	// 单一 ModelRoute 发现器:in-cluster 时起,同时供【富化(bodylog_* 打 service/route + 副本数)】
+	// 和【openresty-poll 的 route 列表 + route→service】。裸机(无 KUBERNETES_SERVICE_HOST)不起 → 优雅降级 unknown。
+	var res *podRouteResolver
 	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
-		res := newPodRouteResolver(reg)
+		res = newPodRouteResolver(reg)
 		go res.run(ctx)
 		m.resolver = res
-		log.Printf("route-enrich: podIP→route 富化已启用(in-cluster)")
+		log.Printf("route-enrich: podIP→service/route 富化已启用(in-cluster)")
 	} else {
-		log.Printf("route-enrich: 未启用(非 in-cluster,route label=unknown)")
+		log.Printf("route-enrich: 未启用(非 in-cluster,service/route label=unknown)")
 	}
 
 	// openresty-poll(可选):poll k8s 集群内那台 openresty 的实时路由/限流状态 → gauge。
 	// URL 空 = 不启用(裸机 exporter 够不到 k8s;默认关)。route 集合:静态 OPENRESTY_POLL_ROUTES
-	// 优先(逃生口);否则动态从 k8s 列 ModelRoute CR(route 增删自动跟随)。
+	// 优先(逃生口);否则复用上面的发现器(route 增删自动跟随 + route→service 打 service label)。
 	if orc := loadORConfig(); orc.baseURL != "" {
 		var routesFn func() []string
-		var svcFn func(string) string // route → discovery.service(给 openresty_* 打 service label)
-		if len(orc.staticRoutes) > 0 {
+		var svcFn func(string) string
+		switch {
+		case len(orc.staticRoutes) > 0:
 			rs := orc.staticRoutes
 			routesFn = func() []string { return rs }
 			svcFn = nil // 静态 route 无 ModelRoute 来源 → service=unknown
 			log.Printf("openresty-poll: %s routes=%v(静态) every %s", orc.baseURL, rs, orc.interval)
-		} else {
-			rd := newRouteDiscoverer(reg, loadDiscoverConfig())
-			go rd.run(ctx)
-			routesFn = rd.get
-			svcFn = rd.serviceFor
-			log.Printf("openresty-poll: %s routes=<k8s ModelRoute 动态发现> every %s", orc.baseURL, orc.interval)
+		case res != nil:
+			routesFn = res.getRoutes
+			svcFn = res.serviceFor
+			log.Printf("openresty-poll: %s routes=<ModelRoute 动态发现,复用富化发现器> every %s", orc.baseURL, orc.interval)
+		default:
+			routesFn = func() []string { return nil } // 非 in-cluster 又没静态 route → 无路可 poll
+			log.Printf("openresty-poll: %s 已配但非 in-cluster 且无静态 route,poll 空转", orc.baseURL)
 		}
 		go newORPoller(orc, newORMetrics(reg), routesFn, svcFn).run(ctx)
 	} else {
