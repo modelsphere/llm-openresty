@@ -55,6 +55,7 @@ type routeDiscoverer struct {
 
 	mu     sync.RWMutex
 	routes []string
+	svc    map[string]string // route → discovery.service(ns/name);给 openresty_* 打 service label
 
 	up    prometheus.Gauge
 	count prometheus.Gauge
@@ -102,6 +103,13 @@ func (rd *routeDiscoverer) get() []string {
 	return out
 }
 
+// serviceFor:route → discovery.service(ns/name)。未知返回 ""(poller 侧回退 unknown)。
+func (rd *routeDiscoverer) serviceFor(route string) string {
+	rd.mu.RLock()
+	defer rd.mu.RUnlock()
+	return rd.svc[route]
+}
+
 func (rd *routeDiscoverer) run(ctx context.Context) {
 	t := time.NewTicker(rd.cfg.interval)
 	defer t.Stop()
@@ -116,7 +124,7 @@ func (rd *routeDiscoverer) run(ctx context.Context) {
 	}
 }
 
-// modelRouteList:只取 spec.nginx.{route,service}。
+// modelRouteList:取 spec.nginx.{route,service}(路由名 + 归属 openresty)+ discovery.service(后端 Service)。
 type modelRouteList struct {
 	Items []struct {
 		Spec struct {
@@ -124,12 +132,15 @@ type modelRouteList struct {
 				Route   string `json:"route"`
 				Service string `json:"service"`
 			} `json:"nginx"`
+			Discovery struct {
+				Service string `json:"service"`
+			} `json:"discovery"`
 		} `json:"spec"`
 	} `json:"items"`
 }
 
 func (rd *routeDiscoverer) refresh(ctx context.Context) {
-	routes, err := rd.list(ctx)
+	routes, svc, err := rd.list(ctx)
 	if err != nil {
 		rd.errs.Inc()
 		rd.up.Set(0)
@@ -139,6 +150,7 @@ func (rd *routeDiscoverer) refresh(ctx context.Context) {
 	rd.mu.Lock()
 	changed := !equalStrs(rd.routes, routes)
 	rd.routes = routes
+	rd.svc = svc
 	rd.mu.Unlock()
 	rd.up.Set(1)
 	rd.count.Set(float64(len(routes)))
@@ -147,12 +159,12 @@ func (rd *routeDiscoverer) refresh(ctx context.Context) {
 	}
 }
 
-func (rd *routeDiscoverer) list(ctx context.Context) ([]string, error) {
+func (rd *routeDiscoverer) list(ctx context.Context) ([]string, map[string]string, error) {
 	// Namespaced CR 的全 ns 列举:/apis/<group>/<version>/<plural>
 	url := fmt.Sprintf("%s/apis/%s/%s/%s", rd.apiBase, rd.cfg.group, rd.cfg.version, rd.cfg.plural)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if tok, err := os.ReadFile(rd.tokenPath); err == nil { // token 会轮转,每次现读
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(tok)))
@@ -160,21 +172,22 @@ func (rd *routeDiscoverer) list(ctx context.Context) ([]string, error) {
 	req.Header.Set("Accept", "application/json")
 	resp, err := rd.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list %s → HTTP %d: %s", rd.cfg.plural, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, nil, fmt.Errorf("list %s → HTTP %d: %s", rd.cfg.plural, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var lst modelRouteList
 	if err := json.Unmarshal(body, &lst); err != nil {
-		return nil, fmt.Errorf("decode ModelRouteList: %w", err)
+		return nil, nil, fmt.Errorf("decode ModelRouteList: %w", err)
 	}
 	seen := map[string]bool{}
+	svc := map[string]string{}
 	var routes []string
 	for _, it := range lst.Items {
 		r := strings.TrimSpace(it.Spec.Nginx.Route)
@@ -188,9 +201,10 @@ func (rd *routeDiscoverer) list(ctx context.Context) ([]string, error) {
 			seen[r] = true
 			routes = append(routes, r)
 		}
+		svc[r] = strings.TrimSpace(it.Spec.Discovery.Service) // route → 后端 Service(ns/name)
 	}
 	sort.Strings(routes)
-	return routes, nil
+	return routes, svc, nil
 }
 
 func equalStrs(a, b []string) bool {

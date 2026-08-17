@@ -85,30 +85,32 @@ func newORMetrics(reg *prometheus.Registry) *orMetrics {
 	g := func(name, help string, labels ...string) *prometheus.GaugeVec {
 		return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
 	}
-	peerLbls := []string{"route", "peer", "name", "priority"}
-	rm := []string{"route", "model"}
+	// service = 后端 discovery.service(ns/name,route→service 由 routeDiscoverer 提供);与 bodylog_* 对齐,便于按 service 聚合(如 429)。
+	sroute := []string{"service", "route"}
+	peerLbls := []string{"service", "route", "peer", "name", "priority"}
+	srm := []string{"service", "route", "model"}
 	m := &orMetrics{
-		activeLevel:  g("openresty_route_active_level", "当前生效优先级层(3=cart/2=backend/1=svc 兜底)", "route"),
-		activeLimit:  g("openresty_route_active_limit", "生效层总并发上限(healthy peer max 之和)", "route"),
-		healthyPeers: g("openresty_route_healthy_peers", "生效层健康 peer 数", "route"),
+		activeLevel:  g("openresty_route_active_level", "当前生效优先级层(3=cart/2=backend/1=svc 兜底)", sroute...),
+		activeLimit:  g("openresty_route_active_limit", "生效层总并发上限(healthy peer max 之和)", sroute...),
+		healthyPeers: g("openresty_route_healthy_peers", "生效层健康 peer 数", sroute...),
 		peerActive:   g("openresty_peer_active_conns", "该 peer 当前并发(least_conn 计数)", peerLbls...),
 		peerBanned:   g("openresty_peer_banned", "该 peer 是否被健康检查 ban(1/0)", peerLbls...),
 		peerMax:      g("openresty_peer_max_concurrency", "该 peer 静态并发上限", peerLbls...),
 
-		tpsActive:      g("openresty_tps_limiter_active", "TPS/自适应并发限流是否生效(1/0)", "route"),
-		tpsEwma:        g("openresty_tps_ewma", "解码速率 EWMA(tok/s)", rm...),
-		adaptiveCC:     g("openresty_adaptive_cc", "当前动态并发上限(AIMD)", rm...),
-		adaptiveCCMin:  g("openresty_adaptive_cc_min", "自适应并发生效下限", rm...),
-		adaptiveCCMax:  g("openresty_adaptive_cc_max", "自适应并发静态池容量(AIMD clamp)", rm...),
-		adaptiveCCConc: g("openresty_adaptive_cc_conc", "当前并发(timer 判压力用的实时在途)", rm...),
-		adaptiveCCRej:  g("openresty_adaptive_cc_rej", "本区间被压抑需求(并发 429 数)", rm...),
+		tpsActive:      g("openresty_tps_limiter_active", "TPS/自适应并发限流是否生效(1/0)", sroute...),
+		tpsEwma:        g("openresty_tps_ewma", "解码速率 EWMA(tok/s)", srm...),
+		adaptiveCC:     g("openresty_adaptive_cc", "当前动态并发上限(AIMD)", srm...),
+		adaptiveCCMin:  g("openresty_adaptive_cc_min", "自适应并发生效下限", srm...),
+		adaptiveCCMax:  g("openresty_adaptive_cc_max", "自适应并发静态池容量(AIMD clamp)", srm...),
+		adaptiveCCConc: g("openresty_adaptive_cc_conc", "当前并发(timer 判压力用的实时在途)", srm...),
+		adaptiveCCRej:  g("openresty_adaptive_cc_rej", "本区间被压抑需求(并发 429 数)", srm...),
 
-		ttftActive: g("openresty_ttft_limiter_active", "TTFT 限流是否生效(1/0)", "route"),
-		ttftEwma:   g("openresty_ttft_ewma_ms", "TTFT EWMA(ms)", rm...),
+		ttftActive: g("openresty_ttft_limiter_active", "TTFT 限流是否生效(1/0)", sroute...),
+		ttftEwma:   g("openresty_ttft_ewma_ms", "TTFT EWMA(ms)", srm...),
 
 		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "openresty_rejected_total", Help: "429 限流累计(按 route × reason=concurrency/ttft/tps)",
-		}, []string{"route", "reason"}),
+			Name: "openresty_rejected_total", Help: "429 限流累计(按 service × route × reason=concurrency/ttft/tps)",
+		}, []string{"service", "route", "reason"}),
 
 		pollUp:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "openresty_poll_up", Help: "上轮 openresty poll 是否全成功(1/0)"}),
 		pollErrors: prometheus.NewCounter(prometheus.CounterOpts{Name: "openresty_poll_errors_total", Help: "openresty poll 出错累计"}),
@@ -170,18 +172,31 @@ type orPoller struct {
 	cfg      orConfig
 	m        *orMetrics
 	client   *http.Client
-	routesFn func() []string    // 当前要 poll 的 route 集合(静态或 k8s 动态发现)
-	prev     map[string]float64 // 429 counter delta 追踪:key="route|reason" → 上次绝对值
+	routesFn func() []string       // 当前要 poll 的 route 集合(静态或 k8s 动态发现)
+	svcFn    func(string) string   // route → discovery.service(ns/name);nil 或返回 "" → service=unknown
+	prev     map[string]float64    // 429 counter delta 追踪:key="route|reason" → 上次绝对值
 }
 
-func newORPoller(cfg orConfig, m *orMetrics, routesFn func() []string) *orPoller {
+func newORPoller(cfg orConfig, m *orMetrics, routesFn func() []string, svcFn func(string) string) *orPoller {
 	return &orPoller{
 		cfg:      cfg,
 		m:        m,
 		client:   &http.Client{Timeout: cfg.timeout},
 		routesFn: routesFn,
+		svcFn:    svcFn,
 		prev:     map[string]float64{},
 	}
+}
+
+// serviceOf:route → service label 值。svcFn 缺省或未知 → "unknown"(与 bodylog_* 对齐)。
+func (p *orPoller) serviceOf(route string) string {
+	if p.svcFn == nil {
+		return "unknown"
+	}
+	if s := p.svcFn(route); s != "" {
+		return s
+	}
+	return "unknown"
 }
 
 func (p *orPoller) run(ctx context.Context) {
@@ -207,17 +222,18 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 	ok := true
 
 	for _, route := range routes {
+		service := p.serviceOf(route)
 		var rs routeStateResp
 		if err := p.getJSON(ctx, "/"+route+"/_route_state", &rs); err != nil {
 			p.pollErr("route_state", route, err)
 			ok = false
 		} else {
-			p.m.activeLevel.WithLabelValues(route).Set(rs.ActiveLevel)
-			p.m.activeLimit.WithLabelValues(route).Set(rs.Limit)
-			p.m.healthyPeers.WithLabelValues(route).Set(rs.HealthyPeersInLevel)
+			p.m.activeLevel.WithLabelValues(service, route).Set(rs.ActiveLevel)
+			p.m.activeLimit.WithLabelValues(service, route).Set(rs.Limit)
+			p.m.healthyPeers.WithLabelValues(service, route).Set(rs.HealthyPeersInLevel)
 			for prio, bucket := range rs.ByPriority {
 				for _, pr := range bucket.Peers {
-					l := prometheus.Labels{"route": route, "peer": pr.Peer, "name": pr.Name, "priority": prio}
+					l := prometheus.Labels{"service": service, "route": route, "peer": pr.Peer, "name": pr.Name, "priority": prio}
 					p.m.peerActive.With(l).Set(pr.Active)
 					p.m.peerBanned.With(l).Set(b2f(pr.Banned))
 					p.m.peerMax.With(l).Set(pr.Max)
@@ -230,13 +246,13 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			p.pollErr("tps_status", route, err)
 			ok = false
 		} else {
-			p.m.tpsActive.WithLabelValues(route).Set(b2f(ts.Active))
-			setModelMap(p.m.tpsEwma, route, ts.EwmaTps)
-			setModelMap(p.m.adaptiveCC, route, ts.AdaptiveCC)
-			setModelMap(p.m.adaptiveCCMin, route, ts.AdaptiveCCMin)
-			setModelMap(p.m.adaptiveCCMax, route, ts.AdaptiveCCMax)
-			setModelMap(p.m.adaptiveCCConc, route, ts.AdaptiveCCConc)
-			setModelMap(p.m.adaptiveCCRej, route, ts.AdaptiveCCRej)
+			p.m.tpsActive.WithLabelValues(service, route).Set(b2f(ts.Active))
+			setModelMap(p.m.tpsEwma, service, route, ts.EwmaTps)
+			setModelMap(p.m.adaptiveCC, service, route, ts.AdaptiveCC)
+			setModelMap(p.m.adaptiveCCMin, service, route, ts.AdaptiveCCMin)
+			setModelMap(p.m.adaptiveCCMax, service, route, ts.AdaptiveCCMax)
+			setModelMap(p.m.adaptiveCCConc, service, route, ts.AdaptiveCCConc)
+			setModelMap(p.m.adaptiveCCRej, service, route, ts.AdaptiveCCRej)
 		}
 
 		var tt ttftStatusResp
@@ -244,8 +260,8 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			p.pollErr("ttft_status", route, err)
 			ok = false
 		} else {
-			p.m.ttftActive.WithLabelValues(route).Set(b2f(tt.Active))
-			setModelMap(p.m.ttftEwma, route, tt.EwmaMs)
+			p.m.ttftActive.WithLabelValues(service, route).Set(b2f(tt.Active))
+			setModelMap(p.m.ttftEwma, service, route, tt.EwmaMs)
 		}
 	}
 
@@ -257,13 +273,14 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			ok = false
 		} else {
 			for route, byReason := range rj.ByRoute {
+				service := p.serviceOf(route)
 				for reason, cur := range byReason {
 					key := route + "|" + reason
 					last := p.prev[key]
 					if cur >= last {
-						p.m.rejected.WithLabelValues(route, reason).Add(cur - last)
+						p.m.rejected.WithLabelValues(service, route, reason).Add(cur - last)
 					} else { // openresty worker 重启 → reject_stat 清零:当整段增量补上
-						p.m.rejected.WithLabelValues(route, reason).Add(cur)
+						p.m.rejected.WithLabelValues(service, route, reason).Add(cur)
 					}
 					p.prev[key] = cur
 				}
@@ -304,11 +321,11 @@ func (p *orPoller) getJSON(ctx context.Context, path string, v interface{}) erro
 	return json.Unmarshal(body, v)
 }
 
-// setModelMap:把 {model: *val} 写进 {route,model} gauge;nil(未初始化)跳过,不造 0 误导。
-func setModelMap(g *prometheus.GaugeVec, route string, mm map[string]*float64) {
+// setModelMap:把 {model: *val} 写进 {service,route,model} gauge;nil(未初始化)跳过,不造 0 误导。
+func setModelMap(g *prometheus.GaugeVec, service, route string, mm map[string]*float64) {
 	for model, v := range mm {
 		if v != nil {
-			g.WithLabelValues(route, model).Set(*v)
+			g.WithLabelValues(service, route, model).Set(*v)
 		}
 	}
 }

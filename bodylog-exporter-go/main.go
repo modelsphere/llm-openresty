@@ -110,17 +110,20 @@ func main() {
 	// 优先(逃生口);否则动态从 k8s 列 ModelRoute CR(route 增删自动跟随)。
 	if orc := loadORConfig(); orc.baseURL != "" {
 		var routesFn func() []string
+		var svcFn func(string) string // route → discovery.service(给 openresty_* 打 service label)
 		if len(orc.staticRoutes) > 0 {
 			rs := orc.staticRoutes
 			routesFn = func() []string { return rs }
+			svcFn = nil // 静态 route 无 ModelRoute 来源 → service=unknown
 			log.Printf("openresty-poll: %s routes=%v(静态) every %s", orc.baseURL, rs, orc.interval)
 		} else {
 			rd := newRouteDiscoverer(reg, loadDiscoverConfig())
 			go rd.run(ctx)
 			routesFn = rd.get
+			svcFn = rd.serviceFor
 			log.Printf("openresty-poll: %s routes=<k8s ModelRoute 动态发现> every %s", orc.baseURL, orc.interval)
 		}
-		go newORPoller(orc, newORMetrics(reg), routesFn).run(ctx)
+		go newORPoller(orc, newORMetrics(reg), routesFn, svcFn).run(ctx)
 	} else {
 		log.Printf("openresty-poll: 未启用(设 OPENRESTY_POLL_URL 开启)")
 	}

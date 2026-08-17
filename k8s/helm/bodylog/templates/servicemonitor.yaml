@@ -18,7 +18,9 @@ spec:
     - port: exporter          # = Service 里的端口名
       path: /metrics
       interval: {{ .Values.exporter.serviceMonitor.interval }}
-      honorLabels: true       # 保留 exporter 自带的 backend/model/route/peer label
+      honorLabels: true       # 保留 exporter 自带的 service/route/backend/model/peer label
+                              # ⚠️ 尤其 service:target 也会注入同名 label(=抓取的 Service 名),
+                              # honorLabels 让 exporter 的 service(模型 discovery.service)胜出,by(service) 才聚合到模型
       # 指数 native histogram 只在 protobuf 里传;要 native 精度就打开下一行(需 Prometheus scrapeNativeHistograms)
       # scrapeProtocols: [ PrometheusProto, OpenMetricsText1.0.0, PrometheusText0.0.4 ]
 {{- end }}
