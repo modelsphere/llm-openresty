@@ -47,10 +47,15 @@ type metrics struct {
 	offset   prometheus.Gauge
 	lastTs   prometheus.Gauge
 	recovers prometheus.Counter
+
+	// 富化:后端 pod IP → route/model(给每条指标打稳定的 route label)。nil=不富化(route=unknown)。
+	resolver *podRouteResolver
 }
 
 func newMetrics(reg *prometheus.Registry) *metrics {
-	bm := []string{"backend", "model"}
+	// service = ModelRoute discovery.service(ns/name,用户主聚合维度);route = nginx.route。
+	// 二者都随后端 pod 稳定(pod IP 漂移也不变),补上 bodylog backend/model 缺的 service 归属。
+	srbm := []string{"service", "route", "backend", "model"}
 	ctr := func(name, help string, labels []string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	}
@@ -64,18 +69,18 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		}, labels)
 	}
 	m := &metrics{
-		requests:      ctr("bodylog_requests_total", "请求数", []string{"backend", "model", "status_class", "stream"}),
-		promptTok:     ctr("bodylog_prompt_tokens_total", "prompt token 累计", bm),
-		completionTok: ctr("bodylog_completion_tokens_total", "completion token 累计", bm),
-		cachedTok:     ctr("bodylog_cached_tokens_total", "cached token 累计", bm),
-		reasoningTok:  ctr("bodylog_reasoning_tokens_total", "reasoning token 累计", bm),
-		totalTok:      ctr("bodylog_total_tokens_total", "total token 累计", bm),
-		reqBytes:      ctr("bodylog_req_bytes_total", "请求体字节累计", bm),
-		respBytes:     ctr("bodylog_resp_bytes_total", "响应体字节累计", bm),
-		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"backend", "model", "finish_reason"}),
-		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300}, []string{"backend", "model", "stream"}),
-		ttft:          hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 3, 5, 10}, bm),
-		outTokPerSec:  hist("bodylog_output_tok_per_second", "单请求生成速率 completion_tokens/rt(tok/s)", []float64{5, 10, 20, 30, 50, 80, 120, 200, 400}, bm),
+		requests:      ctr("bodylog_requests_total", "请求数", []string{"service", "route", "backend", "model", "status_class", "stream"}),
+		promptTok:     ctr("bodylog_prompt_tokens_total", "prompt token 累计", srbm),
+		completionTok: ctr("bodylog_completion_tokens_total", "completion token 累计", srbm),
+		cachedTok:     ctr("bodylog_cached_tokens_total", "cached token 累计", srbm),
+		reasoningTok:  ctr("bodylog_reasoning_tokens_total", "reasoning token 累计", srbm),
+		totalTok:      ctr("bodylog_total_tokens_total", "total token 累计", srbm),
+		reqBytes:      ctr("bodylog_req_bytes_total", "请求体字节累计", srbm),
+		respBytes:     ctr("bodylog_resp_bytes_total", "响应体字节累计", srbm),
+		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
+		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300}, []string{"service", "route", "backend", "model", "stream"}),
+		ttft:          hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 3, 5, 10}, srbm),
+		outTokPerSec:  hist("bodylog_output_tok_per_second", "单请求生成速率 completion_tokens/rt(tok/s)", []float64{5, 10, 20, 30, 50, 80, 120, 200, 400}, srbm),
 		lines:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
 		offset:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
 		lastTs:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
@@ -122,43 +127,55 @@ func orDefault(s, def string) string {
 // observe:把一条明细行累加进 Prometheus。0/空字段按"缺测"跳过,不污染分位/不造无谓 series。
 func (m *metrics) observe(d detailRecord) {
 	backend := orDefault(d.Backend, "(none)")
-	model := orDefault(d.Model, "unknown")
+	model := orDefault(d.Model, "unknown") // model 纯来自明细,不做兜底
+	// 富化:后端 pod IP → service(= ns/name,主聚合维度)+ route(nginx.route)。未命中回退 unknown。
+	route, service := "unknown", "unknown"
+	if m.resolver != nil {
+		if rt, svc, ok := m.resolver.Lookup(backendIP(d.Backend)); ok {
+			if rt != "" {
+				route = rt
+			}
+			if svc != "" {
+				service = svc
+			}
+		}
+	}
 	sc := statusClass(d.Status)
 	sl := streamLabel(d.Stream)
 
-	m.requests.WithLabelValues(backend, model, sc, sl).Inc()
+	m.requests.WithLabelValues(service, route, backend, model, sc, sl).Inc()
 	if d.PromptTokens > 0 {
-		m.promptTok.WithLabelValues(backend, model).Add(float64(d.PromptTokens))
+		m.promptTok.WithLabelValues(service, route, backend, model).Add(float64(d.PromptTokens))
 	}
 	if d.CompletionTokens > 0 {
-		m.completionTok.WithLabelValues(backend, model).Add(float64(d.CompletionTokens))
+		m.completionTok.WithLabelValues(service, route, backend, model).Add(float64(d.CompletionTokens))
 	}
 	if d.CachedTokens > 0 {
-		m.cachedTok.WithLabelValues(backend, model).Add(float64(d.CachedTokens))
+		m.cachedTok.WithLabelValues(service, route, backend, model).Add(float64(d.CachedTokens))
 	}
 	if d.ReasoningTokens > 0 {
-		m.reasoningTok.WithLabelValues(backend, model).Add(float64(d.ReasoningTokens))
+		m.reasoningTok.WithLabelValues(service, route, backend, model).Add(float64(d.ReasoningTokens))
 	}
 	if d.TotalTokens > 0 {
-		m.totalTok.WithLabelValues(backend, model).Add(float64(d.TotalTokens))
+		m.totalTok.WithLabelValues(service, route, backend, model).Add(float64(d.TotalTokens))
 	}
 	if d.ReqBytes > 0 {
-		m.reqBytes.WithLabelValues(backend, model).Add(float64(d.ReqBytes))
+		m.reqBytes.WithLabelValues(service, route, backend, model).Add(float64(d.ReqBytes))
 	}
 	if d.RespBytes > 0 {
-		m.respBytes.WithLabelValues(backend, model).Add(float64(d.RespBytes))
+		m.respBytes.WithLabelValues(service, route, backend, model).Add(float64(d.RespBytes))
 	}
 	if d.FinishReason != "" {
-		m.finishReason.WithLabelValues(backend, model, d.FinishReason).Inc()
+		m.finishReason.WithLabelValues(service, route, backend, model, d.FinishReason).Inc()
 	}
 	if d.Rt > 0 {
-		m.rt.WithLabelValues(backend, model, sl).Observe(d.Rt)
+		m.rt.WithLabelValues(service, route, backend, model, sl).Observe(d.Rt)
 	}
 	if d.Frt > 0 { // 非流式 frt=0,跳过,不污染 TTFT 分位
-		m.ttft.WithLabelValues(backend, model).Observe(d.Frt)
+		m.ttft.WithLabelValues(service, route, backend, model).Observe(d.Frt)
 	}
 	if d.Rt > 0 && d.CompletionTokens > 0 {
-		m.outTokPerSec.WithLabelValues(backend, model).Observe(float64(d.CompletionTokens) / d.Rt)
+		m.outTokPerSec.WithLabelValues(service, route, backend, model).Observe(float64(d.CompletionTokens) / d.Rt)
 	}
 
 	m.lines.Inc()

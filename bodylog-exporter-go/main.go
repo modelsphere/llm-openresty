@@ -94,6 +94,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// 富化:后端 pod IP → route/model → 给 bodylog_* 打稳定的 route(= service)label。
+	// 仅 in-cluster 有意义(需 k8s API + SA);裸机(无 KUBERNETES_SERVICE_HOST)跳过 → route=unknown 优雅降级。
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		res := newPodRouteResolver(reg)
+		go res.run(ctx)
+		m.resolver = res
+		log.Printf("route-enrich: podIP→route 富化已启用(in-cluster)")
+	} else {
+		log.Printf("route-enrich: 未启用(非 in-cluster,route label=unknown)")
+	}
+
 	// openresty-poll(可选):poll k8s 集群内那台 openresty 的实时路由/限流状态 → gauge。
 	// URL 空 = 不启用(裸机 exporter 够不到 k8s;默认关)。route 集合:静态 OPENRESTY_POLL_ROUTES
 	// 优先(逃生口);否则动态从 k8s 列 ModelRoute CR(route 增删自动跟随)。

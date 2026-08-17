@@ -16,8 +16,8 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      {{- if and .Values.exporter.enabled .Values.exporter.routeDiscovery.enabled (not .Values.exporter.openrestyPoll.routes) }}
-      serviceAccountName: {{ include "bodylog.fullname" . }}   # 有 list modelroutes 权限(动态发现用)
+      {{- if .Values.exporter.enabled }}
+      serviceAccountName: {{ include "bodylog.fullname" . }}   # list modelroutes + endpointslices(route 富化 & 动态发现用)
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
@@ -114,7 +114,9 @@ spec:
           emptyDir: {}          # checkpoint:容器重启续读;pod 重调度丢失 → 重读当天文件(counter 天然幂等)
         {{- end }}
         - name: data
-        {{- if .Values.persistence.enabled }}
+        {{- if .Values.persistence.hostPath }}
+          hostPath: { path: {{ .Values.persistence.hostPath | quote }}, type: DirectoryOrCreate }  # 复用宿主机裸盘(须配 nodeSelector 钉 node)
+        {{- else if .Values.persistence.enabled }}
           persistentVolumeClaim: { claimName: {{ include "bodylog.pvcName" . }} }
         {{- else }}
           emptyDir: {}          # 非持久:Pod 重启丢历史 bodylog(仅测试)

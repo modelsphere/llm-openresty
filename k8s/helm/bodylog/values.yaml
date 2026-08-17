@@ -17,6 +17,11 @@ dataDir: /data/bodylog
 # 持久化:落盘卷。生产必开(关了 Pod 重启丢历史 bodylog)。
 persistence:
   enabled: true
+  # hostPath:非空 → data 卷用【宿主机目录】(复用某 node 的裸盘,如已有 bodylog 数据的机器)。
+  #   置非空时:不建 PVC、忽略 storageClassName/size/existingClaim;
+  #   ⚠️ 必须配 nodeSelector 把 pod 钉到有这块盘的那台 node(否则调度到别的 node 会指到空目录);
+  #   ⚠️ 单写者:接管前必须先停掉那台机器上原来的 bodylog 进程,不能两个 listener 同写一目录。
+  hostPath: ""
   storageClassName: ""          # 空=用集群默认 SC(如 ceph-block)
   accessMode: ReadWriteOnce
   size: 2Ti                    # 生产量级:ts34 90天≈2.3T,配合 keepDays=60 稳进(ceph-block 3.3TiB 池)
