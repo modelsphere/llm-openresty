@@ -123,10 +123,12 @@ func main() {
 			svcFn = res.serviceFor
 			log.Printf("openresty-poll: %s routes=<ModelRoute 动态发现,复用富化发现器> every %s", orc.baseURL, orc.interval)
 		default:
-			routesFn = func() []string { return nil } // 非 in-cluster 又没静态 route → 无路可 poll
-			log.Printf("openresty-poll: %s 已配但非 in-cluster 且无静态 route,poll 空转", orc.baseURL)
+			// 非 in-cluster 又没静态 route → 无路可 poll,不启动(避免 poller 空转还报 pollUp=1)。
+			log.Printf("openresty-poll: %s 已配但非 in-cluster 且无静态 route → 不启用", orc.baseURL)
 		}
-		go newORPoller(orc, newORMetrics(reg), routesFn, svcFn).run(ctx)
+		if routesFn != nil {
+			go newORPoller(orc, newORMetrics(reg), routesFn, svcFn).run(ctx)
+		}
 	} else {
 		log.Printf("openresty-poll: 未启用(设 OPENRESTY_POLL_URL 开启)")
 	}

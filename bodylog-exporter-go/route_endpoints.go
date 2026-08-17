@@ -160,8 +160,12 @@ func (r *podRouteResolver) refresh(ctx context.Context) {
 		return // 保留上次映射(不清空,避免 apiserver 抖动时全 route 归属失明)
 	}
 	r.mu.Lock()
+	changed := !equalStrs(r.routes, res.routes)
 	r.byIP, r.routes, r.svc = res.byIP, res.routes, res.svc
 	r.mu.Unlock()
+	if changed { // route 增删时留个线索(排查某 route 何时上下线)
+		log.Printf("route-enrich: routes=%v", res.routes)
+	}
 	// Reset 后重灌:缩容/下线的 service series 自动消失,不残留旧值。
 	r.replicas.Reset()
 	r.replicasReady.Reset()
@@ -312,6 +316,19 @@ func (r *podRouteResolver) get(ctx context.Context, u string) ([]byte, error) {
 		return nil, fmt.Errorf("GET %s → HTTP %d: %s", u, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return body, nil
+}
+
+// equalStrs:两个 route 切片是否逐项相等(均已排序)。
+func equalStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // splitNsName:"ns/name" → (ns, name);无 "/" 时 ns 回退 "default"。
