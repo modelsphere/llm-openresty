@@ -42,10 +42,11 @@ type podRouteResolver struct {
 	mu   sync.RWMutex
 	byIP map[string]routeInfo
 
-	up       prometheus.Gauge
-	pods     prometheus.Gauge
-	errs     prometheus.Counter
-	replicas *prometheus.GaugeVec // {service, route} → 该 service 后端 pod 数
+	up            prometheus.Gauge
+	pods          prometheus.Gauge
+	errs          prometheus.Counter
+	replicas      *prometheus.GaugeVec // {service, route} → 后端 pod 总数(含未就绪)
+	replicasReady *prometheus.GaugeVec // {service, route} → 就绪后端 pod 数
 }
 
 func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
@@ -83,16 +84,17 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		up:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_up", Help: "上轮 podIP→route 映射刷新是否成功(1/0)"}),
 		pods:      prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_pods", Help: "当前映射覆盖的后端 pod IP 数"}),
 		errs:      prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "podIP→route 映射刷新出错累计"}),
-		replicas:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service(discovery.service)当前后端 pod 数(EndpointSlice endpoint 数)"}, []string{"service", "route"}),
+		replicas:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service(discovery.service)当前后端 pod 总数(EndpointSlice endpoint 数,含未就绪)"}, []string{"service", "route"}),
+		replicasReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端 pod 数(conditions.ready)"}, []string{"service", "route"}),
 	}
-	reg.MustRegister(r.up, r.pods, r.errs, r.replicas)
+	reg.MustRegister(r.up, r.pods, r.errs, r.replicas, r.replicasReady)
 	return r
 }
 
-// svcRep:一个 service 的副本数(build 顺带产出,refresh 灌进 bodylog_service_replicas gauge)。
+// svcRep:一个 service 的副本数(build 顺带产出,refresh 灌进 gauge)。n=总数(含未就绪),ready=就绪数。
 type svcRep struct {
 	service, route string
-	n              int
+	n, ready       int
 }
 
 // Lookup:后端 pod IP → route/service。未命中返回 ok=false(observe 侧回退 route/service=unknown)。
@@ -133,8 +135,10 @@ func (r *podRouteResolver) refresh(ctx context.Context) {
 	r.mu.Unlock()
 	// Reset 后重灌:缩容/下线的 service series 自动消失,不残留旧值。
 	r.replicas.Reset()
+	r.replicasReady.Reset()
 	for _, rp := range reps {
 		r.replicas.WithLabelValues(rp.service, rp.route).Set(float64(rp.n))
+		r.replicasReady.WithLabelValues(rp.service, rp.route).Set(float64(rp.ready))
 	}
 	r.up.Set(1)
 	r.pods.Set(float64(len(next)))
@@ -150,11 +154,14 @@ type modelRouteFull struct {
 	} `json:"items"`
 }
 
-// endpointSliceList:discovery.k8s.io/v1 EndpointSlice —— 只取 endpoints[].addresses[]。
+// endpointSliceList:discovery.k8s.io/v1 EndpointSlice —— 取 endpoints[].addresses[] + conditions.ready。
 type endpointSliceList struct {
 	Items []struct {
 		Endpoints []struct {
-			Addresses []string `json:"addresses"`
+			Addresses  []string `json:"addresses"`
+			Conditions struct {
+				Ready *bool `json:"ready"` // nil=unknown(EndpointSlice 约定按 ready 处理)
+			} `json:"conditions"`
 		} `json:"endpoints"`
 	} `json:"items"`
 }
@@ -182,39 +189,46 @@ func (r *podRouteResolver) build(ctx context.Context) (map[string]routeInfo, []s
 		if name == "" {
 			continue
 		}
-		ips, err := r.podIPsForService(ctx, ns, name)
+		ips, ready, err := r.podIPsForService(ctx, ns, name)
 		if err != nil {
 			log.Printf("route-enrich: route=%s svc=%s EndpointSlice 失败: %v", route, svc, err)
 			continue // 单个 service 失败不拖累其它 route
 		}
 		ri := routeInfo{route: route, service: svc} // svc 已是 "ns/name" 形式
 		for _, ip := range ips {
-			out[ip] = ri // 一个 pod IP 属于一个 route(正常不冲突;后写覆盖)
+			out[ip] = ri // 映射含未就绪 pod(它可能刚服务过一个请求,仍要能归属)
 		}
-		reps = append(reps, svcRep{service: svc, route: route, n: len(ips)})
+		reps = append(reps, svcRep{service: svc, route: route, n: len(ips), ready: ready})
 	}
 	return out, reps, nil
 }
 
-// podIPsForService:查某 Service 的全部 EndpointSlice(按 kubernetes.io/service-name label 归属)→ pod IP 列表。
-func (r *podRouteResolver) podIPsForService(ctx context.Context, ns, name string) ([]string, error) {
+// podIPsForService:查某 Service 的全部 EndpointSlice(按 kubernetes.io/service-name label 归属)。
+// 返回全部 pod IP(含未就绪,给映射用)+ 就绪 IP 数(ready gauge 用)。
+// ready 语义:conditions.ready==true 计就绪;nil(unknown)按 EndpointSlice 约定视为就绪。
+func (r *podRouteResolver) podIPsForService(ctx context.Context, ns, name string) (ips []string, ready int, err error) {
 	sel := url.QueryEscape("kubernetes.io/service-name=" + name)
 	u := fmt.Sprintf("%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=%s", r.apiBase, ns, sel)
 	body, err := r.get(ctx, u)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var esl endpointSliceList
 	if err := json.Unmarshal(body, &esl); err != nil {
-		return nil, fmt.Errorf("decode EndpointSliceList: %w", err)
+		return nil, 0, fmt.Errorf("decode EndpointSliceList: %w", err)
 	}
-	var ips []string
 	for _, es := range esl.Items {
 		for _, ep := range es.Endpoints {
-			ips = append(ips, ep.Addresses...)
+			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+			for _, ip := range ep.Addresses {
+				ips = append(ips, ip)
+				if isReady {
+					ready++
+				}
+			}
 		}
 	}
-	return ips, nil
+	return ips, ready, nil
 }
 
 // get:带 SA token 的 k8s REST GET(token 每次现读,支持轮转)。

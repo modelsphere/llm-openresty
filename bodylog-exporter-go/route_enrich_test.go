@@ -48,13 +48,17 @@ const mrFullJSON = `{"items":[
   {"spec":{"monitor":{"model":"m-only"}}}
 ]}`
 
-// 两个 service 各自的 EndpointSlice(fallback 两个 pod、kimi 一个 pod)。
-func esJSON(ips ...string) string {
-	var q []string
-	for _, ip := range ips {
-		q = append(q, `"`+ip+`"`)
+// 某 service 的 EndpointSlice;每个 spec 是一个 endpoint 的 IP,带 "!" 后缀=未就绪(conditions.ready=false)。
+func esJSON(specs ...string) string {
+	var eps []string
+	for _, s := range specs {
+		ready, ip := "true", s
+		if strings.HasSuffix(s, "!") {
+			ready, ip = "false", strings.TrimSuffix(s, "!")
+		}
+		eps = append(eps, `{"addresses":["`+ip+`"],"conditions":{"ready":`+ready+`}}`)
 	}
-	return `{"items":[{"endpoints":[{"addresses":[` + strings.Join(q, ",") + `]}]}]}`
+	return `{"items":[{"endpoints":[` + strings.Join(eps, ",") + `]}]}`
 }
 
 func newTestResolver(t *testing.T, srv *httptest.Server) *podRouteResolver {
@@ -75,7 +79,8 @@ func TestResolverBuild(t *testing.T) {
 			if got := r.URL.Query().Get("labelSelector"); got != "kubernetes.io/service-name=fallback-model-service-01" {
 				t.Errorf("labelSelector = %q", got)
 			}
-			_, _ = w.Write([]byte(esJSON("10.0.0.5", "10.0.0.5")))
+			// 两个后端,第二个未就绪 → total=2、ready=1;映射仍应含两者。
+			_, _ = w.Write([]byte(esJSON("10.0.0.5", "10.0.0.5!")))
 		case r.URL.Path == "/apis/discovery.k8s.io/v1/namespaces/kimi/endpointslices":
 			_, _ = w.Write([]byte(esJSON("10.0.0.5")))
 		default:
@@ -106,12 +111,18 @@ func TestResolverBuild(t *testing.T) {
 		t.Errorf("monitor-only(无 discovery.service)不应进映射")
 	}
 
-	// bodylog_service_replicas:fallback 2 个后端、kimi 1 个。
+	// replicas(总数,含未就绪) vs replicas_ready(就绪):fallback 2/1,kimi 1/1。
 	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 2 {
-		t.Errorf("fallback replicas = %v, 想要 2", n)
+		t.Errorf("fallback replicas(total) = %v, 想要 2", n)
+	}
+	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 1 {
+		t.Errorf("fallback replicas_ready = %v, 想要 1", n)
 	}
 	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 1 {
-		t.Errorf("kimi replicas = %v, 想要 1", n)
+		t.Errorf("kimi replicas(total) = %v, 想要 1", n)
+	}
+	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 1 {
+		t.Errorf("kimi replicas_ready = %v, 想要 1", n)
 	}
 }
 
