@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestBackendIP(t *testing.T) {
@@ -103,6 +104,14 @@ func TestResolverBuild(t *testing.T) {
 	}
 	if _, _, ok := r.Lookup("m-only"); ok {
 		t.Errorf("monitor-only(无 discovery.service)不应进映射")
+	}
+
+	// bodylog_service_replicas:fallback 2 个后端、kimi 1 个。
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 2 {
+		t.Errorf("fallback replicas = %v, 想要 2", n)
+	}
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 1 {
+		t.Errorf("kimi replicas = %v, 想要 1", n)
 	}
 }
 
