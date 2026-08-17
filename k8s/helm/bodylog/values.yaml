@@ -14,6 +14,11 @@ ports:
 # 落盘目录(挂 PVC)。按天分目录、按小时切文件,跨日 tar.gz 归档。
 dataDir: /data/bodylog
 
+# 时区:listener 按 time.Local 命名 <date>.jsonl、exporter 按 DATE_TZ tail 同名文件 —— 二者【必须一致】,
+# 否则 exporter 去 tail 不存在的文件、读不到数据(容器默认 UTC,而生产按北京落盘 → 必须显式设)。
+# 同时注入两个容器的 TZ env;exporter DATE_TZ 缺省跟随本值。
+timezone: "Asia/Shanghai"
+
 # 持久化:落盘卷。生产必开(关了 Pod 重启丢历史 bodylog)。
 persistence:
   enabled: true
@@ -50,7 +55,7 @@ exporter:
     tag: ""                     # 缺省用 Chart.appVersion
     pullPolicy: IfNotPresent
   port: 9110                     # /metrics 抓取口
-  dateTz: "Asia/Shanghai"        # 明细按天命名的时区,须与 bodylog 一致
+  dateTz: ""                     # 明细按天命名时区;空=跟随顶层 timezone(须与 listener TZ 一致)。一般不用单独设
   resources:
     requests: { cpu: "50m",  memory: "64Mi" }
     limits:   { cpu: "500m", memory: "256Mi" }
