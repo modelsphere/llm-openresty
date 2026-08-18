@@ -35,7 +35,9 @@ const (
 
 // routeInfo:一个后端 pod 所属的 route 及其 service(来自它所在的 ModelRoute)。
 // route   = spec.nginx.route(如 "fallback-model-service-0.1");
-// service = spec.discovery.service(ns/name 形式,如 "model-service/fallback-model-service-01",用户一般按它聚合)。
+// service = spec.discovery.service(ns/name 形式,如 "model-service/fallback-model-service-01",用户一般按它聚合),
+//
+//	经 normalizeServiceLabel 剥掉 LWS 的 "-leader" 后缀(kimi/kimi-k25-leader → kimi/kimi-k25)。
 type routeInfo struct{ route, service string }
 
 type podRouteResolver struct {
@@ -231,8 +233,9 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 		if route == "" { // monitor-only(无 nginx 路由)→ 既不 poll 也无法归属
 			continue
 		}
-		svc := strings.TrimSpace(it.Spec.Discovery.Service)
-		res.svc[route] = svc // 含所有 route(serviceFor 稳健)
+		svc := strings.TrimSpace(it.Spec.Discovery.Service) // 原始 discovery.service:查 EndpointSlice 必须用真实 Service 名
+		svcLabel := normalizeServiceLabel(svc)              // 展示用 label:剥掉 LWS 的 "-leader" 后缀
+		res.svc[route] = svcLabel                           // 含所有 route(serviceFor 稳健)
 
 		// poll route 列表:按 nginxService 过滤(多 openresty 用;空=全要)。
 		if r.nginxService == "" || strings.TrimSpace(it.Spec.Nginx.Service) == r.nginxService {
@@ -255,11 +258,11 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 			log.Printf("route-enrich: route=%s svc=%s EndpointSlice 失败: %v", route, svc, err)
 			continue // 单个 service 失败不拖累其它 route
 		}
-		ri := routeInfo{route: route, service: svc} // svc 已是 "ns/name" 形式
+		ri := routeInfo{route: route, service: svcLabel} // "ns/name" 形式(已剥 -leader)
 		for _, ip := range ips {
 			res.byIP[ip] = ri // 映射含未就绪 pod(它可能刚服务过一个请求,仍要能归属)
 		}
-		res.reps = append(res.reps, svcRep{service: svc, route: route, n: len(ips), ready: ready})
+		res.reps = append(res.reps, svcRep{service: svcLabel, route: route, n: len(ips), ready: ready})
 	}
 	sort.Strings(res.routes)
 	return res, nil
@@ -329,6 +332,16 @@ func equalStrs(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// normalizeServiceLabel:把展示用的 service label 剥掉 LWS leader 服务的 "-leader" 后缀。
+// 背景:LWS(LeaderWorkerSet)暴露推理端口(8050)的 Service 恒名为 "<lws-name>-leader"
+// —— 同名的无头 governing 服务 "<lws-name>" 没有端口,discovery 只能指向 "-leader" 那个。
+// 于是 discovery.service = "kimi/kimi-k25-leader",而用户眼里的逻辑服务是 "kimi/kimi-k25"(= LWS 名)。
+// 本函数只归一化【label 展示】,查 EndpointSlice 仍用原始 discovery.service(真实 Service 名),互不影响。
+// 只在结尾剥后缀:namespace 段在 "/" 之前不受影响;非 LWS 服务(如 fallback-model-service-01)不含该后缀,原样返回。
+func normalizeServiceLabel(svc string) string {
+	return strings.TrimSuffix(svc, "-leader")
 }
 
 // splitNsName:"ns/name" → (ns, name);无 "/" 时 ns 回退 "default"。

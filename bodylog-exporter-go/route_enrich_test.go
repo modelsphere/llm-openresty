@@ -42,6 +42,21 @@ func TestSplitNsName(t *testing.T) {
 	}
 }
 
+func TestNormalizeServiceLabel(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"kimi/kimi-k25-leader", "kimi/kimi-k25"},                                  // LWS leader → 逻辑服务名
+		{"model-service/fallback-model-service-01", "model-service/fallback-model-service-01"}, // 非 LWS,原样
+		{"kimi-k25-leader", "kimi-k25"},                                            // 无 ns 也剥
+		{"kimi/kimi-k25", "kimi/kimi-k25"},                                         // 已无后缀,不动
+		{"foo-leader/bar", "foo-leader/bar"},                                       // "-leader" 在 ns 段(结尾是 bar)→ 不误剥
+	}
+	for _, c := range cases {
+		if got := normalizeServiceLabel(c.in); got != c.want {
+			t.Errorf("normalizeServiceLabel(%q) = %q, 想要 %q", c.in, got, c.want)
+		}
+	}
+}
+
 // mrFull:两个 route,各指一个 discovery.service;第三个没 nginx.route(monitor-only,应跳过)。
 const mrFullJSON = `{"items":[
   {"spec":{"nginx":{"route":"fallback-model-service-0.1"},"monitor":{"model":"fallback-model-service-0.1"},"discovery":{"service":"model-service/fallback-model-service-01"}}},
