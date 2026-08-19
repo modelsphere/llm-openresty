@@ -13,8 +13,3 @@ spec:
     - name: http                  # monitor 拉 /summary(BODYLOG_SUMMARY_URL 指 http://<svc>:<http>/summary)
       port: {{ .Values.ports.http }}
       targetPort: http
-    {{- if .Values.exporter.enabled }}
-    - name: exporter              # bodylog-exporter /metrics(ServiceMonitor 抓这个)
-      port: {{ .Values.exporter.port }}
-      targetPort: exporter
-    {{- end }}

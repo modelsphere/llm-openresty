@@ -1,0 +1,86 @@
+{{- if and .Values.data.hostPath (empty .Values.nodeSelector) }}
+{{- fail "\n[bodylog-exporter] data.hostPath 已设但 nodeSelector 为空:明细在【节点本地盘】,exporter 必须与 listener 同节点。请把 pod 钉到 listener 所在 node,例如:--set nodeSelector.\"kubernetes\\.io/hostname\"=<node>" }}
+{{- end }}
+{{- if empty .Values.data.hostPath }}
+{{- fail "\n[bodylog-exporter] data.hostPath 为空:必须指向 listener 落盘的节点目录(= listener persistence.hostPath),否则读不到明细。" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bodylog-exporter.fullname" . }}
+  labels: {{- include "bodylog-exporter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  strategy:
+    type: {{ .Values.strategy }}   # Recreate:避免滚更时两 exporter 并存被抓成重复 series
+  selector:
+    matchLabels: {{- include "bodylog-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "bodylog-exporter.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "bodylog-exporter.fullname" . }}   # list modelroutes + endpointslices(动态发现 & route 富化)
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: exporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: BODYLOG_DETAILS_DIR, value: "{{ .Values.data.dir }}/metrics/details" }
+            - { name: EXPORTER_LISTEN,     value: "0.0.0.0:{{ .Values.port }}" }
+            - { name: CHECKPOINT_PATH,     value: "/ckpt/checkpoint.json" }
+            - { name: TZ,                  value: "{{ .Values.timezone }}" }
+            - { name: DATE_TZ,             value: "{{ .Values.dateTz | default .Values.timezone }}" }
+            # 跨天 jsonl→parquet 轮转的缺口补读:走 listener 的 Service(独立 pod,不是 127.0.0.1)
+            - { name: BODYLOG_URL,         value: "http://{{ .Values.listener.service }}:{{ .Values.listener.httpPort }}" }
+            - name: BODYLOG_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ include "bodylog-exporter.secretName" . }}, key: BODYLOG_HTTP_TOKEN }
+            {{- if .Values.openrestyPoll.url }}
+            - { name: OPENRESTY_POLL_URL,         value: "{{ .Values.openrestyPoll.url }}" }
+            - { name: OPENRESTY_POLL_INTERVAL_MS, value: "{{ .Values.openrestyPoll.intervalMs }}" }
+            {{- if .Values.openrestyPoll.routes }}
+            - { name: OPENRESTY_POLL_ROUTES,      value: "{{ join "," .Values.openrestyPoll.routes }}" }   # 静态覆盖
+            {{- else if .Values.routeDiscovery.enabled }}
+            # 动态发现:列 ModelRoute CR(不设 OPENRESTY_POLL_ROUTES → exporter 走 k8s 发现)
+            - { name: MODELROUTE_GROUP,                 value: "{{ .Values.routeDiscovery.apiGroup }}" }
+            - { name: MODELROUTE_VERSION,               value: "{{ .Values.routeDiscovery.version }}" }
+            - { name: MODELROUTE_PLURAL,                value: "{{ .Values.routeDiscovery.plural }}" }
+            - { name: ROUTE_DISCOVERY_INTERVAL_SECONDS, value: "{{ .Values.routeDiscovery.intervalSeconds }}" }
+            - { name: OPENRESTY_SERVICE,                value: "{{ .Values.routeDiscovery.openrestyService }}" }
+            {{- end }}
+            {{- end }}
+          ports:
+            - { name: exporter, containerPort: {{ .Values.port }} }
+          {{- if .Values.probes.enabled }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.port }} }
+            periodSeconds: 15
+            failureThreshold: 3
+          {{- end }}
+          {{- with .Values.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: data, mountPath: {{ .Values.data.dir }}, readOnly: true }   # 只读 tail 明细(不写,和 listener 无写冲突)
+            - { name: ckpt, mountPath: /ckpt }                                     # offset checkpoint(可写)
+      volumes:
+        - name: data
+          hostPath: { path: {{ .Values.data.hostPath | quote }}, type: Directory }   # = listener 的节点盘;Directory:不存在直接失败(而非建空目录静默读不到)
+        - name: ckpt
+        {{- if .Values.checkpoint.hostPath }}
+          hostPath: { path: {{ .Values.checkpoint.hostPath | quote }}, type: DirectoryOrCreate }   # 落节点盘 → 升级零 counter reset
+        {{- else }}
+          emptyDir: {}                                                             # pod 重建丢 offset → 重读当天(counter 幂等)
+        {{- end }}

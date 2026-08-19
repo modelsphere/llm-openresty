@@ -1,0 +1,78 @@
+image:
+  repository: registry.example.com/llm/bodylog-exporter
+  tag: ""                       # 缺省用 Chart.appVersion
+  pullPolicy: IfNotPresent
+
+replicas: 1
+# 单副本:tail 明细 + 暴露 /metrics。Recreate:滚更时先停旧再起新 —— 避免两 exporter 并存
+# 被 Prometheus 同时抓成【重复 series】。升级只滚本 pod,listener(另一个 chart/pod)完全不受影响。
+strategy: Recreate
+
+port: 9110                       # /metrics 抓取口
+
+# 明细数据来源:= listener 落盘目录 + /metrics/details。数据在【节点本地盘 hostPath】,
+# 所以 exporter 必须与 listener 同节点(下面 nodeSelector 钉同一 node),【只读】tail。
+data:
+  dir: /data/bodylog            # 容器内挂载点,须 = listener 的 dataDir
+  hostPath: ""                  # 节点上的真实目录,须 = listener persistence.hostPath(非空且一致)
+
+# 时区:listener 按 time.Local 命名 <date>.jsonl、exporter 按 DATE_TZ tail 同名文件 —— 必须一致,
+# 否则 exporter 去 tail 不存在的文件、读不到数据(容器默认 UTC,生产按北京落盘 → 必须显式设)。
+timezone: "Asia/Shanghai"
+dateTz: ""                      # 空=跟随 timezone
+
+# 跨天 jsonl→parquet 轮转的缺口补读:独立 pod 走 listener 的 Service(不是同 pod 的 127.0.0.1)。
+listener:
+  service: bodylog              # listener Service 名(同 ns);跨 ns 用 bodylog.<ns>.svc
+  httpPort: 9998
+
+# 补读要带 token(与 listener 一致)。默认复用 listener 已建的 Secret(键 BODYLOG_HTTP_TOKEN)。
+secret:
+  existingSecret: bodylog       # 复用 listener 的 Secret;置空 + create=true 则本 chart 自建
+  create: false
+  token: ""                     # create=true 时 --set-string secret.token=<权威源 openresty/bodylog_http_token>
+
+# checkpoint:offset 续读位置。
+#   emptyDir(默认):pod 重建丢 offset → 重读当天 jsonl(counter 幂等,Prometheus rate() 认 reset,无毛刺);
+#   hostPath(非空):落节点盘 → pod 重建也不丢 offset → 升级【零 counter reset】(给一个可写节点目录,别指向只读 data)。
+checkpoint:
+  hostPath: ""
+
+# openresty-poll:poll 集群内 openresty 的 /<route>/_route_state|_tps_status|_ttft_status|_429_status。
+# url 空 = 只 tail 不 poll。route 集合默认动态发现(routeDiscovery);routes 为静态逃生口。
+openrestyPoll:
+  url: "http://openresty:8080"
+  routes: []
+  intervalMs: 15000
+# 动态发现 route:list ModelRoute CR(需 rbac.yaml 的 SA+ClusterRole)。
+routeDiscovery:
+  enabled: true
+  apiGroup: routing.gpucluster.io
+  version: v1alpha1
+  plural: modelroutes
+  intervalSeconds: 30
+  openrestyService: ""          # 多 openresty 时只统计 nginx.service 指本 openresty 的 route;空=全要
+
+# 让集群内 kube-prometheus-stack 抓 exporter 的 :port(需 prometheus-operator)。
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  releaseLabel: kube-prometheus-stack
+
+service:
+  type: ClusterIP
+
+resources:
+  requests: { cpu: "50m",  memory: "64Mi" }
+  limits:   { cpu: "500m", memory: "256Mi" }
+
+probes:
+  enabled: true
+
+# ⚠️ 必须钉到 listener 所在 node(明细在该 node 本地盘)。hostPath 非空但 nodeSelector 空 → 模板报错。
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+nameOverride: ""
+fullnameOverride: ""

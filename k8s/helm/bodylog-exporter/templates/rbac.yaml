@@ -1,0 +1,36 @@
+# exporter 的 SA 权限:
+#   1) list/watch ModelRoute CR —— route 动态发现(openresty-poll)+ route 富化(取 discovery.service);
+#   2) list/watch EndpointSlice —— route 富化:查 discovery.service 的后端 pod IP,反建 podIP→route 映射。
+# 缺 modelroutes 权限 → poll/富化 403;缺 endpointslices → 富化拿不到 pod IP、route label 恒 unknown。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "bodylog-exporter.fullname" . }}
+  labels: {{- include "bodylog-exporter.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "bodylog-exporter.fullname" . }}-modelroute-reader
+  labels: {{- include "bodylog-exporter.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [ "{{ .Values.routeDiscovery.apiGroup }}" ]
+    resources: [ "{{ .Values.routeDiscovery.plural }}" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "discovery.k8s.io" ]
+    resources: [ "endpointslices" ]
+    verbs: [ "get", "list", "watch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "bodylog-exporter.fullname" . }}-modelroute-reader
+  labels: {{- include "bodylog-exporter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "bodylog-exporter.fullname" . }}-modelroute-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "bodylog-exporter.fullname" . }}
+    namespace: {{ .Release.Namespace }}

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: bodylog-exporter
+description: bodylog-exporter(独立部署)——tail bodylog listener 落的明细 jsonl → Prometheus 指标,并 poll 集群内 openresty 控制面态。与 listener【解耦】:升级本 chart 只滚 exporter 自己的 pod,不重启 listener → 收帧/落盘零中断。须与 listener 同节点(共享节点本地盘,只读 tail)。
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords: [bodylog, exporter, prometheus, observability]

@@ -46,40 +46,9 @@ secret:
   existingSecret: ""
   token: ""                     # 部署时 --set-string secret.token=<真值>;权威源 openresty/bodylog_http_token
 
-# bodylog-exporter sidecar:tail 明细 jsonl → Prometheus 指标(流量侧),并可选 poll 集群内 openresty
-# 的实时路由/限流状态(控制面侧)。与 bodylog 同 pod、共享 data 卷(只读读 details)。
-exporter:
-  enabled: true
-  image:
-    repository: registry.example.com/llm/bodylog-exporter
-    tag: ""                     # 缺省用 Chart.appVersion
-    pullPolicy: IfNotPresent
-  port: 9110                     # /metrics 抓取口
-  dateTz: ""                     # 明细按天命名时区;空=跟随顶层 timezone(须与 listener TZ 一致)。一般不用单独设
-  resources:
-    requests: { cpu: "50m",  memory: "64Mi" }
-    limits:   { cpu: "500m", memory: "256Mi" }
-  # openresty-poll:poll 集群内 openresty 的 /<route>/_route_state|_tps_status|_ttft_status|_429_status。
-  # url 空 = 只做 tail、不 poll。route 集合默认【动态发现】(见 routeDiscovery);routes 为静态逃生口。
-  openrestyPoll:
-    url: "http://openresty:8080"   # 集群内 openresty Service(同 ns 短名;跨 ns 用 openresty.<ns>.svc:8080)
-    routes: []                     # 静态覆盖(非空则不走动态发现);留空=用 routeDiscovery 动态列 ModelRoute
-    intervalMs: 15000
-  # 动态发现 route:list ModelRoute CR(routing.gpucluster.io)→ 当前 k8s 里所有 route,增删自动跟随。
-  # 需 RBAC(rbac.yaml 建 SA+ClusterRole 让 pod 能 list modelroutes)。
-  routeDiscovery:
-    enabled: true
-    apiGroup: routing.gpucluster.io
-    version: v1alpha1
-    plural: modelroutes
-    intervalSeconds: 30
-    # 只统计 nginx.service 指向这台 openresty 的 route(多 openresty 时用);空=全要(单 openresty 留空)
-    openrestyService: ""
-  # ServiceMonitor:让集群内 kube-prometheus-stack 抓 exporter 的 :9110(需 prometheus-operator)。
-  serviceMonitor:
-    enabled: true
-    interval: 30s
-    releaseLabel: kube-prometheus-stack   # Prometheus CR 的 serviceMonitorSelector 匹配的 label 值
+# bodylog-exporter 已【拆成独立 chart】(k8s/helm/bodylog-exporter):tail 本 listener 落的明细 jsonl →
+# Prometheus,并 poll openresty 控制面态。独立部署 → 升级 exporter 不再重启 listener(收帧/落盘零中断)。
+# 部署 exporter 时:与本 listener 同 nodeSelector、data.hostPath 指同一节点盘、secret.existingSecret 复用本 Secret。
 
 service:
   type: ClusterIP               # frame 口给集群内 openresty 连;http 口给 monitor 拉。跨集群另配。
