@@ -55,10 +55,12 @@ spec:
           livenessProbe:
             httpGet: { path: /healthz, port: {{ .Values.ports.http }} }
             periodSeconds: 15
-            failureThreshold: 3
+            timeoutSeconds: 10             # 默认 1s;高负载时 /healthz 可能慢一拍,给足超时避免误杀(2026-08-19:探针 1s 超时把忙碌 listener 杀重启)
+            failureThreshold: 6            # 3→6:连续 90s 不健康才重启,容忍瞬时繁忙
           readinessProbe:                  # /healthz 始终开放(不鉴权),就绪即可被 Service 路由
             httpGet: { path: /healthz, port: {{ .Values.ports.http }} }
             periodSeconds: 10
+            timeoutSeconds: 10             # 同上:忙碌时别误摘出 Service(摘掉会让 openresty 连不上→积压)
             failureThreshold: 3
           {{- end }}
           {{- with .Values.resources }}
