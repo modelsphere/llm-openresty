@@ -1666,6 +1666,11 @@ func main() {
 			continue
 		}
 		conns.Store(c, struct{}{})
+		// 竞态兜底：若在 Store 之前 shutdown 的 conns.Range 已跑过（漏关此连接），
+		// 这里自己关掉，避免 handleConn 永久阻塞在 readFrame 导致 connWG.Wait() 死等。
+		if ctx.Err() != nil {
+			_ = c.Close()
+		}
 		connWG.Add(1)
 		go func(c net.Conn) {
 			defer connWG.Done()
