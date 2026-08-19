@@ -79,8 +79,9 @@ spec:
         - name: data
           hostPath: { path: {{ .Values.data.hostPath | quote }}, type: Directory }   # = listener 的节点盘;Directory:不存在直接失败(而非建空目录静默读不到)
         - name: ckpt
-        {{- if .Values.checkpoint.hostPath }}
-          hostPath: { path: {{ .Values.checkpoint.hostPath | quote }}, type: DirectoryOrCreate }   # 落节点盘 → 升级零 counter reset
+        {{- if .Values.checkpoint.emptyDir }}
+          emptyDir: {}                                                             # 仅测试:pod 重建丢 offset → 重读当天
         {{- else }}
-          emptyDir: {}                                                             # pod 重建丢 offset → 重读当天(counter 幂等)
+          {{- $ckpt := .Values.checkpoint.hostPath | default (printf "%s/%s-ckpt" (dir .Values.data.hostPath) (include "bodylog-exporter.fullname" .)) }}
+          hostPath: { path: {{ $ckpt | quote }}, type: DirectoryOrCreate }         # 落节点盘(默认取 data 父目录同盘 sibling)→ 升级零 counter reset
         {{- end }}
