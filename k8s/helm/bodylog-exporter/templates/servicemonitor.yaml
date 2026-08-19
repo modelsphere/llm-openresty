@@ -1,0 +1,27 @@
+{{- if .Values.serviceMonitor.enabled }}
+# 让集群内 kube-prometheus-stack 抓 bodylog-exporter 的 :{{ .Values.port }}(/metrics)。
+# 需 prometheus-operator(ServiceMonitor 是它的 CRD);label release 必须匹配 Prometheus CR 的
+# serviceMonitorSelector,否则不被选中。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "bodylog-exporter.fullname" . }}
+  labels:
+    {{- include "bodylog-exporter.labels" . | nindent 4 }}
+    release: {{ .Values.serviceMonitor.releaseLabel }}
+spec:
+  {{- if .Values.serviceMonitor.jobName }}
+  jobLabel: jobName          # 读 Service 的 jobName label 当 Prometheus job → 保持 job=bodylog 连续
+  {{- end }}
+  namespaceSelector:
+    matchNames: [ {{ .Release.Namespace }} ]
+  selector:
+    matchLabels: {{- include "bodylog-exporter.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: exporter
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      honorLabels: true       # 保留 exporter 自带的 service/route/backend/model label
+                              # ⚠️ target 也会注入同名 service label(=抓取的 Service 名),honorLabels
+                              # 让 exporter 的 service(模型 discovery.service)胜出,by(service) 才聚合到模型
+{{- end }}

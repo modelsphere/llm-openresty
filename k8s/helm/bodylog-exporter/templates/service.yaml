@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bodylog-exporter.fullname" . }}
+  labels:
+    {{- include "bodylog-exporter.labels" . | nindent 4 }}
+    {{- if .Values.serviceMonitor.jobName }}
+    jobName: {{ .Values.serviceMonitor.jobName | quote }}   # ServiceMonitor.jobLabel 读它 → 钉住 Prometheus 的 job label
+    {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "bodylog-exporter.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: exporter              # /metrics(ServiceMonitor 抓这个)
+      port: {{ .Values.port }}
+      targetPort: exporter

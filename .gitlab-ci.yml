@@ -76,4 +76,8 @@ build:chart:
     - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" k8s/helm/bodylog/Chart.yaml'
     - export MODULE_NAME=bodylog CHART_FOLDER=k8s/helm/bodylog
     - push-chart
-    - 'echo "charts pushed: openresty + bodylog ${CI_COMMIT_TAG} → ChartMuseum(harbor-chart-repo)"'
+    # bodylog-exporter chart(独立于 bodylog listener,复用 bodylog-exporter 镜像)
+    - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" k8s/helm/bodylog-exporter/Chart.yaml'
+    - export MODULE_NAME=bodylog-exporter CHART_FOLDER=k8s/helm/bodylog-exporter
+    - push-chart
+    - 'echo "charts pushed: openresty + bodylog + bodylog-exporter ${CI_COMMIT_TAG} → ChartMuseum(harbor-chart-repo)"'
