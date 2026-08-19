@@ -55,7 +55,7 @@ service:
 
 resources:
   requests: { cpu: "250m", memory: "512Mi" }
-  limits:   { cpu: "2",    memory: "4Gi" }   # duckdb /metrics 查询 + 归档吃内存
+  limits:   { cpu: "2",    memory: "64Gi" }  # duckdb /metrics 查询 + 归档 + openresty 回灌洪峰吃内存;4Gi 会 OOM 死循环(2026-08-19 rollout 事故),提到 64Gi 留足冗余(节点 ~503G)
 
 probes:
   enabled: true                 # /healthz(9998,始终开放)做 liveness/readiness

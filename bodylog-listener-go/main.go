@@ -56,6 +56,11 @@ const (
 	defaultDetailsKeepDays = 365              // metrics 明细 parquet 保留天数，可被 BODYLOG_DETAILS_KEEP_DAYS 覆盖
 	metricsMaxRows         = 5000             // /metrics 单次返回硬上限（≈2.5MB JSON）；截断时回 returned_to 供按 ts 续取
 	readBufSize            = 1 << 20
+	// 异步落盘：socket 读(handleConn)只把整帧丢进 frameCh，writer 池并行 assemble+落盘。
+	// 读路径不再被同步写/mutex 竞争拖慢 → openresty 的大 flush 能在 send 超时(1s)内送完，
+	// 不再触发「超时→无 ACK 重发→重复+堵满 buffer→drop」死循环（2026-08-19 事故根因）。
+	numFrameWriters = 8     // writer 池大小（并行 assemble+写；hourWriter/detailsWriter/agg 各自加锁，并发安全）
+	frameChanBuf    = 16384 // 帧队列缓冲深度（吸收 openresty 大 flush 洪峰；配合大内存 limit）
 )
 
 // keepDays: 历史归档保留天数。默认 defaultKeepDays，main() 启动时从 BODYLOG_KEEP_DAYS 覆盖。
@@ -139,8 +144,8 @@ func (w *hourWriter) close() {
 // resp_meta.reasoning / resp_meta.tool_calls）。~400B/行，按天写 metrics/details/<date>.jsonl，
 // 跨天封口后由 housekeep 转 parquet。/metrics 接口查的就是这份。
 type detailRecord struct {
-	Ts               string  `json:"ts"`                // 请求开始时刻
-	TsEnd            string  `json:"ts_end,omitempty"`  // 请求结束时刻 = ts + rt（聚合分桶用此）
+	Ts               string  `json:"ts"`               // 请求开始时刻
+	TsEnd            string  `json:"ts_end,omitempty"` // 请求结束时刻 = ts + rt（聚合分桶用此）
 	RequestID        string  `json:"request_id,omitempty"`
 	SourceAddr       string  `json:"source_addr,omitempty"`
 	URI              string  `json:"uri,omitempty"`
@@ -548,7 +553,17 @@ func readFrame(r io.Reader) (meta, req, resp []byte, err error) {
 	return
 }
 
-func handleConn(c net.Conn, w *hourWriter, dw *detailsWriter, agg *aggregator) {
+// rawFrame：从一个连接读出的完整帧 + 源地址，交给 writer 池异步处理。
+// meta/req/resp 是 readFrame 内新分配 buf 的子切片（每帧独立、不复用），可安全跨 goroutine 传递。
+type rawFrame struct {
+	meta, req, resp []byte
+	src             string
+}
+
+// handleConn：只负责快速把整帧从 socket 读出、丢进 frameCh（不做 assemble/落盘）。
+// 读路径不被落盘/mutex 拖慢 → openresty 的 send 能在其 1s 超时内完成 → 不触发
+// 「超时→无 ACK 重发→重复」死循环。落盘由 processFrame 在 writer 池里异步做。
+func handleConn(c net.Conn, frameCh chan<- rawFrame) {
 	defer c.Close()
 	// 从 TCP RemoteAddr 取源 IP（去掉 :port）。loopback 写 "127.0.0.1"，
 	// LAN/跨机时是发送方 OpenResty 主机 IP；落盘到 entry.source_addr 字段，
@@ -566,29 +581,35 @@ func handleConn(c net.Conn, w *hourWriter, dw *detailsWriter, agg *aggregator) {
 			}
 			return
 		}
-		m, out, err := assembleEntry(meta, req, resp, srcAddr)
-		if err != nil {
-			log.Printf("assemble err: %v", err)
-			continue
-		}
-		if err := w.write(out); err != nil {
-			log.Printf("write err: %v", err)
-			return
-		}
-		// 预算 stream/usage/peer 各一次,缓存进 m 供 ingest(分桶)与 extractDetail(明细)复用,
-		// 避免两者在每帧热路径上各算一遍。在 out 落盘之后做,不影响全量 bodylog（__* 不入 out）。
-		m["__stream"] = extractStream(m)
-		m["__usage"] = extractUsage(m)
-		m["__peer"] = normalizePeer(m)
-		// 同步 agg.ingest：O(1) 加锁更新一个 bucket，纳秒级，不影响主路径吞吐
-		if agg != nil {
-			agg.ingest(m)
-		}
-		// per-request metrics 明细（剥正文，~400B）：旁挂写，失败只告警不影响主落盘
-		if dw != nil {
-			if err := dw.write(extractDetail(m)); err != nil {
-				log.Printf("details write err: %v", err)
-			}
+		frameCh <- rawFrame{meta: meta, req: req, resp: resp, src: srcAddr}
+	}
+}
+
+// processFrame：把一条原始帧 assemble 成 JSONL 落盘 + 分钟聚合 + 明细。由 writer 池并发调用
+// （hourWriter/detailsWriter/aggregator 各自加锁，并发安全；多 writer 间落盘顺序无关，每行独立自带 ts）。
+func processFrame(rf rawFrame, w *hourWriter, dw *detailsWriter, agg *aggregator) {
+	m, out, err := assembleEntry(rf.meta, rf.req, rf.resp, rf.src)
+	if err != nil {
+		log.Printf("assemble err: %v", err)
+		return
+	}
+	if err := w.write(out); err != nil {
+		log.Printf("write err: %v", err)
+		return
+	}
+	// 预算 stream/usage/peer 各一次,缓存进 m 供 ingest(分桶)与 extractDetail(明细)复用,
+	// 避免两者在每帧热路径上各算一遍。在 out 落盘之后做,不影响全量 bodylog（__* 不入 out）。
+	m["__stream"] = extractStream(m)
+	m["__usage"] = extractUsage(m)
+	m["__peer"] = normalizePeer(m)
+	// agg.ingest：O(1) 加锁更新一个 bucket，纳秒级
+	if agg != nil {
+		agg.ingest(m)
+	}
+	// per-request metrics 明细（剥正文，~400B）：旁挂写，失败只告警不影响主落盘
+	if dw != nil {
+		if err := dw.write(extractDetail(m)); err != nil {
+			log.Printf("details write err: %v", err)
 		}
 	}
 }
@@ -1230,7 +1251,10 @@ const detailsColumns = "{" +
 // 或文件名列表（read_json 两者都接受）。rotateDetails 与 metricsHandler 共用，保证写/读
 // 口径一致。NDJSON（一行一条）→ format='newline_delimited'。
 func readDetailsJSON(arg string) string {
-	return "read_json(" + arg + ", columns=" + detailsColumns + ", format='newline_delimited')"
+	// ignore_errors=true：读 jsonl 时跳过坏行/半截行(如 listener 被 SIGKILL 中断写、
+	// 或旧事故残留的撕裂行)而不是整个查询失败 → /metrics 不因单条坏行 503、跨天 parquet
+	// 转换也不会卡死。坏行只被跳过、不影响其余行(2026-08-19 事故后加固)。
+	return "read_json(" + arg + ", columns=" + detailsColumns + ", format='newline_delimited', ignore_errors=true)"
 }
 
 func (a *aggregator) ingest(m map[string]any) {
@@ -1573,12 +1597,30 @@ func main() {
 	agg := newAggregator(dir, 7*24*60)
 	agg.reload()
 
+	// 异步落盘管线：帧队列 + writer 池。handleConn 只入队（快），processFrame 在池里落盘。
+	frameCh := make(chan rawFrame, frameChanBuf)
+	var writerWG sync.WaitGroup
+	for i := 0; i < numFrameWriters; i++ {
+		writerWG.Add(1)
+		go func() {
+			defer writerWG.Done()
+			for rf := range frameCh {
+				processFrame(rf, w, dw, agg)
+			}
+		}()
+	}
+	// 活跃连接登记：优雅关闭时主动关连接，解开阻塞在 readFrame 的 handleConn 使其 return
+	// （不再往 frameCh 送）→ 之后才能安全 close(frameCh) 并把队列 drain 干净（零丢关闭）。
+	var conns sync.Map // net.Conn -> struct{}
+	var connWG sync.WaitGroup
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	go func() {
 		<-ctx.Done()
 		log.Println("shutdown requested")
-		_ = ln.Close()
+		_ = ln.Close()                                                             // 停止 accept
+		conns.Range(func(k, _ any) bool { _ = k.(net.Conn).Close(); return true }) // 关活跃连接，解开 readFrame
 	}()
 
 	go housekeep(dir)
@@ -1623,8 +1665,24 @@ func main() {
 			log.Printf("accept err: %v", err)
 			continue
 		}
-		go handleConn(c, w, dw, agg)
+		conns.Store(c, struct{}{})
+		// 竞态兜底：若在 Store 之前 shutdown 的 conns.Range 已跑过（漏关此连接），
+		// 这里自己关掉，避免 handleConn 永久阻塞在 readFrame 导致 connWG.Wait() 死等。
+		if ctx.Err() != nil {
+			_ = c.Close()
+		}
+		connWG.Add(1)
+		go func(c net.Conn) {
+			defer connWG.Done()
+			defer conns.Delete(c)
+			handleConn(c, frameCh)
+		}(c)
 	}
+	// 优雅关闭（零丢）：等所有连接读完退出（不再有人往 frameCh 送）→ 关 frameCh
+	// → 等 writer 池把队列里剩余帧全部落盘 → 再收尾关文件。
+	connWG.Wait()
+	close(frameCh)
+	writerWG.Wait()
 	w.close()
 	if dw != nil {
 		dw.close()
