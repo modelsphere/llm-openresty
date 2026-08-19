@@ -19,6 +19,12 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      # 显式 default(而非省略):从带 exporter sidecar 的旧版升级时,旧版设过
+      # serviceAccountName: <fullname> 并建了同名 SA。若这里【省略】此字段,helm 3-way merge 会
+      # 【保留】live 上旧的 serviceAccountName,同时删掉那个 SA(rbac.yaml 已移除)→ 新 pod
+      # FailedCreate(serviceaccount not found)、rollout 卡住。显式 default 让 helm 明确覆盖旧引用。
+      # (listener 不调 k8s API,default SA 足够。)
+      serviceAccountName: default
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
