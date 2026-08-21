@@ -107,7 +107,12 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 
 ### ⚠️ 字段可靠性(0/空按"缺测"跳过,不污染分位/不造无谓 series)
 
-- `ttft`(frt):**非流式恒 0**,跳过 → TTFT 只统计流式请求。
+- `ttft`(frt):**只在 `stream=true` 时记**(明细里的 `stream` 由 listener 从请求体正则抠出)。
+  ⚠️ 早期版本按 `frt > 0` 过滤,以为「非流式 frt=0」——**实际非流式的 `first_chunk_t ≈ rt`**
+  (只有一个 body chunk,它到达时响应就结束),恒 >0,一条都没滤掉,导致 TTFT 直方图混进大量
+  非流式样本,实测 p99(82s)甚至超过 RT p99(77s)。0.1.10 起改为按 `stream` 过滤。
+  代价:`req_body` 未采到/为 base64 时 `stream` 抠不出来(=null),该请求即使是流式也会漏记 TTFT
+  ——**样本变少,不会算错**;实测 800 条明细中 `stream=null` 的无一呈流式形态。
 - **token 类**:响应无 usage 时为 0 → **流式请求必须带 `stream_options.include_usage=true`**,否则 `completion_tokens`=0、`output_tok_per_second` 无数据。
 - `model`/`finish_reason`:响应非 JSON(如 error)时可能为空。
 - `reasoning_tokens`:非推理模型恒 0。

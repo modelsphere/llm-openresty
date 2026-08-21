@@ -171,7 +171,15 @@ func (m *metrics) observe(d detailRecord) {
 	if d.Rt > 0 {
 		m.rt.WithLabelValues(service, route, backend, model, sl).Observe(d.Rt)
 	}
-	if d.Frt > 0 { // 非流式 frt=0,跳过,不污染 TTFT 分位
+	// TTFT 只记流式请求。
+	// ⚠️ 不能靠 frt>0 过滤(此前的做法):非流式的 first_chunk_t ≈ rt —— 非流式只有一个 body
+	//    chunk,它到达时响应也就结束了,所以 frt 恒 >0,一条都滤不掉。后果是 TTFT 直方图混进
+	//    大量 frt≈rt 的样本,实测 p99(82s)甚至超过 RT p99(77s),物理上不可能。
+	// stream 由 listener 从请求体正则抠出(main.go extractStream);抠不到=nil,含
+	//    「客户端没传 stream 参数」(OpenAI 语义即非流式)与「req_body 没采到/base64」两种。
+	//    实测 800 条明细里 stream=nil 的无一呈流式形态(frt<0.8*rt),故按非流式处理。
+	// 代价:req_body 未采到的【真流式】请求会漏记 TTFT(样本变少,不会算错);当前为 0 条。
+	if d.Frt > 0 && d.Stream != nil && *d.Stream {
 		m.ttft.WithLabelValues(service, route, backend, model).Observe(d.Frt)
 	}
 	if d.Rt > 0 && d.CompletionTokens > 0 {
