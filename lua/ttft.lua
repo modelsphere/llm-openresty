@@ -6,6 +6,7 @@
 local M = {}
 
 local util = require "util"
+local slo  = require "slo"   -- CRD 下发的 SLO(未接/裸机时恒空 → 全部回落静态,行为不变)
 
 -- ══════════════════════════════════════════════════════════════════════
 -- TTFT 限流辅助：EWMA key 派生 + 半开探测令牌窗口
@@ -52,20 +53,26 @@ end
 --   ② opts.ttft_limit_ms(路由级默认;register_route 里已 fallback 到全局 _G.TTFT_LIMIT_MS)
 -- 这样同一 peers_by_model 路由内每个模型可配不同阈值(机型/模型基线不同)。
 -- model 同 ttft_key_prefix:显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model。
+-- 在线 override(共享字典,跨 worker 一致;免 reload,见 /_ttft_limit)。
+--   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)。
+-- 单独抽出来是因为它在优先级链里**压过 CRD** —— 线上出事时能立刻手工压住,不用等 operator。
+function M.ttft_override_for(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    local td = ngx.shared[opts.ttft_dict]
+    if not td then return nil end
+    if opts.peers_by_model then
+        local mo = td:get((opts.route_name or "?") .. ":" .. (m or "") .. ":limit_override")
+        if mo then return mo end
+    end
+    return td:get((opts.route_name or "?") .. ":limit_override")
+end
+
 function M.ttft_limit_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    -- 在线 override(共享字典,跨 worker 一致,优先级最高;免 reload,见 /_ttft_limit)
-    --   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)
-    local td = ngx.shared[opts.ttft_dict]
-    if td then
-        if opts.peers_by_model then
-            local mo = td:get((opts.route_name or "?") .. ":" .. (m or "") .. ":limit_override")
-            if mo then return mo end
-        end
-        local ro = td:get((opts.route_name or "?") .. ":limit_override")
-        if ro then return ro end
-    end
+    local ovr = M.ttft_override_for(opts, m)
+    if ovr then return ovr end
     local bym = opts.ttft_limit_by_model
     if bym and opts.peers_by_model then
         local v = bym[m or ""]
@@ -74,16 +81,22 @@ function M.ttft_limit_for(opts, model)
     return opts.ttft_limit_ms
 end
 
--- 本路由/模型生效的**指标列表**:{ {metric=, q=, threshold=}, ... },nil = 无阈值(特性不生效)。
--- P0 数据源只有静态配置 → 恒为单指标 p80/q=0.8,与改动前逐字节等价。
--- P1 接 CRD 后在此处插入 CRD 查找(优先级 override > CRD > factory opts > _G),
--- 其余所有代码(折叠、判定、dbg)都只认这张表,不必再动。
+-- 本路由/模型生效的**指标列表**:{ {metric=, q=, threshold=}, ... };第二返回值是来源(供 dbg 标注)。
+-- 优先级链:**手工 override > CRD 下发 > factory opts > _G 全局默认**。
+--   * override 压过 CRD:留应急口子,线上出事不用等 operator;
+--   * CRD 未覆盖本 route(或裸机根本没有 CRD)→ 回落静态,**与接 CRD 前逐字节一致**。
 -- ⚠️ 判定必须遍历**这张声明表**,而不是遍历 dict 里现存的 EWMA key ——
 --    否则删掉某个指标后,它残留的 EWMA 还会继续拒人最多 ttft_ttl 秒。
 -- threshold 可能是 nil(路由没配阈值):此时**照样记 EWMA**(dbg 可见、AIMD 可读),只是不参与判定
 -- —— 与改动前「ttft_record 不看有没有阈值」的行为一致。
 function M.ttft_metrics(opts, model)
-    return { { metric = "p80", q = 0.8, threshold = M.ttft_limit_for(opts, model) } }
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    local ovr = M.ttft_override_for(opts, m)
+    if ovr then return { { metric = "p80", q = 0.8, threshold = ovr } }, "override" end
+    local ms = slo.metrics_for(opts.route_name, m, "ttft")
+    if ms then return ms, "crd" end
+    return { { metric = "p80", q = 0.8, threshold = M.ttft_limit_for(opts, m) } }, "static"
 end
 
 -- 样本 → 直方图桶号(1..#buckets+1,最后一个是 overflow)

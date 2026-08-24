@@ -8,6 +8,7 @@ local util         = require "util"
 local route        = require "route"
 local ttft         = require "ttft"
 local tps          = require "tps"
+local slo          = require "slo"
 local bodylog      = require "bodylog"
 local reqtransform = require "reqtransform"
 
@@ -109,8 +110,9 @@ function _G.dbg_ttft_status(opts)
         end
         for _, m in ipairs(models) do
             local key = (m == false) and "_" or m
-            local list = {}
-            for _, mt in ipairs(ttft.ttft_metrics(opts, m)) do
+            local mlist, msrc = ttft.ttft_metrics(opts, m)   -- msrc: override|crd|static
+            local list = {}   -- 纯数组:混入字符串 key 会让 cjson 编成对象,source 挂外层 wrapper
+            for _, mt in ipairs(mlist) do
                 list[#list+1] = { metric = mt.metric, q = mt.q,
                                   threshold_ms = mt.threshold,
                                   ewma_ms = td:get(ttft.ttft_ewma_key(opts, m, mt.metric)) }
@@ -120,7 +122,7 @@ function _G.dbg_ttft_status(opts)
             --    `grep -o '"_":[0-9.]*'` 直接在原始 JSON 文本里捞,而 [0-9.]* 能匹配零个字符 ——
             --    若这里也出现 `"_":[`,head -1 可能取到它,数字部分为空 → ewma 假报空。
             --    数组形状下只有 "model":"_",不会产生裸的 `"<model>":` 键。
-            mstat[#mstat+1] = { model = key, items = list }
+            mstat[#mstat+1] = { model = key, source = msrc, items = list }
         end
     end
     local active = ttft.ttft_dict_if_on(opts) and true or false
@@ -142,10 +144,46 @@ function _G.dbg_ttft_status(opts)
         probe_per_window      = opts.ttft_probe_per_window,
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
         -- ↓ 新增(只增不改不重排,回归套件依赖既有字段)
-        metrics               = mstat,                        -- 每模型的完整指标列表(metric/q/threshold/ewma)
+        metrics               = mstat,                        -- 每模型指标列表 + source(override|crd|static)
+        slo_version           = slo.status().version,         -- CRD 下发版本(nil=未接 CRD → 走静态)
         dict_capacity         = td and td:capacity() or nil,  -- 容量观测:直方图 key 数随模型/指标增长,
         dict_free_space       = td and td:free_space() or nil,--   一旦 LRU 淘汰 ewin/fd 锁会静默坏掉折叠
     }))
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- GET  /_slo_conf         → 当前生效的 SLO(CRD 下发)状态 + 已解析的表
+-- POST /_slo_conf <json>  → 手动注入一份(应急下发 / 回归测试注入),仅 127.0.0.1
+--                           注入后置 pinned,直到**文件内容真的变了**才让 loader 夺回控制权,
+--                           否则注入会被下一个 tick 抹掉。
+-- 全局 endpoint,不吃 opts(SLO 数据是整实例一份,按 route 名查)。
+-- ══════════════════════════════════════════════════════════════════════
+function _G.dbg_slo_conf()
+    ngx.header["Content-Type"] = "application/json"
+    if ngx.req.get_method() == "POST" then
+        -- 与其它写类 endpoint 一致:只允许本机(location 里已 allow 127.0.0.1 的除外,这里再兜一层)
+        local ip = ngx.var.remote_addr
+        if ip ~= "127.0.0.1" and ip ~= "::1" then
+            ngx.status = 403
+            ngx.say([[{"error":"POST /_slo_conf 仅允许 127.0.0.1"}]])
+            return
+        end
+        ngx.req.read_body()
+        local body = ngx.req.get_body_data()
+        if not body then
+            local fp = ngx.req.get_body_file()          -- body 过大被落盘时从文件读
+            if fp then local f = io.open(fp, "r"); if f then body = f:read("*a"); f:close() end end
+        end
+        local ok, err = slo.apply_post(body or "")
+        if not ok then
+            ngx.status = 400
+            ngx.say(cjson_dbg.encode({ error = "注入失败(未改动现有数据)", detail = err }))
+            return
+        end
+        ngx.say(cjson_dbg.encode({ ok = true, status = slo.status() }))
+        return
+    end
+    ngx.say(cjson_dbg.encode({ status = slo.status(), data = slo.dump() }))
 end
 
 -- POST /_ttft_toggle?on=0 → 关本路由 TTFT(写 ttft_dict 的 "__off",免 reload);
@@ -293,14 +331,15 @@ function _G.dbg_tps_status(opts)
         for _, m in ipairs(models) do
             local key = (m == false) and "_" or m
             local pre = (m == false) and rp or (rp .. m .. ":")
-            local list = {}
-            for _, mt in ipairs(tps.tps_metrics(opts, m)) do
+            local mlist, msrc = tps.tps_metrics(opts, m)     -- msrc: override|crd|static
+            local list = {}   -- 纯数组,理由同 /_ttft_status
+            for _, mt in ipairs(mlist) do
                 list[#list+1] = { metric = mt.metric, q = mt.q,
                                   threshold_tps = mt.threshold,
                                   ewma_tps = td:get(tps.tps_ewma_key(opts, m, mt.metric)) }
             end
             ewmas[key]   = list[1] and list[1].ewma_tps or nil
-            mstat[#mstat+1] = { model = key, items = list }   -- 数组形状,理由同 /_ttft_status
+            mstat[#mstat+1] = { model = key, source = msrc, items = list }   -- 数组形状,理由同 /_ttft_status
             nousage[key] = td:get(pre .. "nousage") or 0
         end
     end
@@ -337,7 +376,8 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_rej       = adaptive_cc_rej,     -- 本区间被压抑需求(并发429数);>0 → 下tick 快涨到 desired
         adaptive_cc_interval  = opts.adaptive_cc and opts.adaptive_cc_interval or nil,
         -- ↓ 新增(只增不改不重排)
-        metrics               = mstat,                        -- 每模型完整指标列表(metric/q/threshold/ewma)
+        metrics               = mstat,                        -- 每模型指标列表 + source(override|crd|static)
+        slo_version           = slo.status().version,
         dict_capacity         = td and td:capacity() or nil,
         dict_free_space       = td and td:free_space() or nil,
     }))

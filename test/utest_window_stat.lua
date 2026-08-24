@@ -39,8 +39,12 @@ local function newdict()
     return d
 end
 
+-- ttft.lua 顶层 require 的模块都要先手动装进 package.loaded ——
+-- 单测用 loadfile 直接装载,不走 lua_package_path,require 找不到文件会直接报错。
+-- (P1 给 ttft.lua 新增了 require "slo",这里漏了就整个单测挂掉。)
 local util = assert(loadfile(LUA .. "/util.lua"))()
 package.loaded.util = util
+package.loaded.slo = assert(loadfile(LUA .. "/slo.lua"))()
 local ttft = assert(loadfile(LUA .. "/ttft.lua"))()
 
 local pass, fail = 0, 0

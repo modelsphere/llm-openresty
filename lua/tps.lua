@@ -6,6 +6,7 @@
 local M = {}
 
 local util = require "util"
+local slo  = require "slo"   -- CRD 下发的 SLO(未接/裸机时恒空 → 全部回落静态,行为不变)
 
 -- ══════════════════════════════════════════════════════════════════════
 -- TPS 限流(解码速率)辅助:与 TTFT 同构,差三处——P20 低尾 / ewma<=下限 / opt-in。
@@ -45,18 +46,24 @@ end
 
 -- 解析本请求该用的 TPS 下限(tokens/sec):override > tps_limit_by_model[model] > opts.tps_limit_tps。
 -- model 显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model —— 与 tps_key_prefix 一致。
-function M.tps_limit_for(opts, model)
+-- 在线 override(见 /_tps_limit)。抽出来的理由同 ttft_override_for:它在优先级链里压过 CRD。
+function M.tps_override_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
     local td = ngx.shared[opts.tps_dict]
-    if td then
-        if opts.peers_by_model then
-            local mo = td:get((opts.route_name or "?") .. ":" .. (m or "") .. ":limit_override")
-            if mo then return mo end
-        end
-        local ro = td:get((opts.route_name or "?") .. ":limit_override")
-        if ro then return ro end
+    if not td then return nil end
+    if opts.peers_by_model then
+        local mo = td:get((opts.route_name or "?") .. ":" .. (m or "") .. ":limit_override")
+        if mo then return mo end
     end
+    return td:get((opts.route_name or "?") .. ":limit_override")
+end
+
+function M.tps_limit_for(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    local ovr = M.tps_override_for(opts, m)
+    if ovr then return ovr end
     local bym = opts.tps_limit_by_model
     if bym and opts.peers_by_model then
         local v = bym[m or ""]
@@ -70,8 +77,15 @@ end
 -- (TTFT 的 `p80` = 「80% 请求 ≤ threshold」→ 取高尾 P80 → q = 0.8。)
 -- 方向换算只在这里/下发侧做一次,util.window_stat 只认「取第 q 分位」这一个原语。
 -- q 写字面量 0.2,不写 1-0.8(= 0.19999999999999996)—— 纯卫生,实测不影响判定。
+-- 优先级链同 ttft_metrics:override > CRD > factory opts > _G;第二返回值是来源。
 function M.tps_metrics(opts, model)
-    return { { metric = "p80", q = 0.2, threshold = M.tps_limit_for(opts, model) } }
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    local ovr = M.tps_override_for(opts, m)
+    if ovr then return { { metric = "p80", q = 0.2, threshold = ovr } }, "override" end
+    local ms = slo.metrics_for(opts.route_name, m, "otps")
+    if ms then return ms, "crd" end
+    return { { metric = "p80", q = 0.2, threshold = M.tps_limit_for(opts, m) } }, "static"
 end
 
 -- 违约判定(access 的 TPS-429 与 timers 的 AIMD 共用)。方向与 TTFT 相反:EWMA **低于**下限才是过载。

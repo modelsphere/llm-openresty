@@ -153,6 +153,12 @@
         allow 127.0.0.1; deny all;
         content_by_lua_block { _G.dbg_ttft_429_toggle(_G.__route_opts[ngx.var.route]) }
     }
+    # SLO(LLMSLORequirement CRD)当前生效数据。全局的,不按 route 取 opts。
+    #   GET  /_slo_conf          → 状态(version/来源/pinned/last_error)+ 已解析的表
+    #   POST /_slo_conf  <json>  → 手动注入一份(应急下发 / 回归测试注入),仅 127.0.0.1
+    location = /_slo_conf {
+        content_by_lua_block { _G.dbg_slo_conf() }
+    }
     location = /_tps_status {
         content_by_lua_block { _G.dbg_tps_status(_G.__route_opts[ngx.var.route]) }
     }
