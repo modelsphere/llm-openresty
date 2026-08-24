@@ -42,6 +42,9 @@ http {
     math.randomseed(ngx.now()*1000 + ngx.worker.pid())
     _G.TPS_BUCKETS = {5,10,20,40,80,150,300}
     _G.ADAPTIVE_CC_TTL = 16   -- 测试用小 TTL(生产默认 300);AC5 自愈快速触发。expire(10s)<16 → cc 保持
+    -- ⚠️ 显式钉住派生系数(AC6 用):不钉的话会继承 session_base.conf 的当前值,生产一改测试就红。
+    --    这里取 0.4(= 2026-08 生产值);只有 AC6 的 acd 路由依赖派生 min,别的路由都显式配了 adaptive_cc_min。
+    _G.ADAPTIVE_CC_MIN_FRAC = 0.4
     -- per-peer max=3 → 静态 max=6(两 peer 同优先级 sum)
     local p2 = {{"127.0.0.1",28931,"m1",0,3},{"127.0.0.1",28932,"m2",0,3}}
     -- per-peer max=20 → 静态 max=40(派生 min = floor(40*0.1)=4)
@@ -176,10 +179,10 @@ sleep 26; cc5heal=$(acc $AC)                            # 静默 >> CC_TTL → c
   || no "AC5 cc5a=$cc5a hold=$cc5hold ewma='$ev5' heal='$cc5heal'"
 
 # AC6 默认开 + 派生 min:acd 只配 tps_limit_tps(未写 adaptive_cc)→ 全局默认翻自适应(on=true);
-#   不配 min → 派生=静态max(40)*0.25=10,max=40
+#   不配 min → 派生 = 静态max(40) × ADAPTIVE_CC_MIN_FRAC(init block 里钉死 0.4)= 16,max=40
 read on mn_ mx_ < <(curl -s "$ACD/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);mn=d.get('adaptive_cc_min') or {};mx=d.get('adaptive_cc_max') or {};print(d.get('adaptive_cc_on'), mn.get('_'), mx.get('_'))")
-{ [ "$on" = "True" ] && [ "$mn_" = "4" ] && [ "$mx_" = "40" ]; } \
-  && ok "AC6 默认开(只配tps_limit_tps→on=$on)+派生min=$mn_(=40*0.1),max=$mx_" || no "AC6 on=$on min=$mn_ max=$mx_"
+{ [ "$on" = "True" ] && [ "$mn_" = "16" ] && [ "$mx_" = "40" ]; } \
+  && ok "AC6 默认开(只配tps_limit_tps→on=$on)+派生min=$mn_(=40*0.4),max=$mx_" || no "AC6 on=$on min=$mn_ max=$mx_"
 
 # AC7 零回归对照:hard 路由(不开 adaptive)慢流 → 仍 tps-429(硬熔断存活 + 互斥真实)
 expire; estab_seq $HD 50 20
