@@ -98,12 +98,29 @@ function _G.dbg_ttft_status(opts)
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.ttft_dict]   -- 原始 handle(用于展示,即便热关也能看 EWMA)
     local rp = (opts.route_name or "?") .. ":"   -- route 前缀(共享 dict)
-    local ewmas = {}
+    -- ewma_ms 保持老形状(model → 数值,单指标时取第一条),新增 metrics 展示完整指标列表。
+    local ewmas, mstat = {}, {}
     if td then
+        local models = {}
         if opts.peers_by_model then
-            for m in pairs(opts.peers_by_model) do ewmas[m] = td:get(rp .. m .. ":ewma") end
+            for m in pairs(opts.peers_by_model) do models[#models+1] = m end
         else
-            ewmas["_"] = td:get(rp .. "ewma")
+            models[1] = false
+        end
+        for _, m in ipairs(models) do
+            local key = (m == false) and "_" or m
+            local list = {}
+            for _, mt in ipairs(ttft.ttft_metrics(opts, m)) do
+                list[#list+1] = { metric = mt.metric, q = mt.q,
+                                  threshold_ms = mt.threshold,
+                                  ewma_ms = td:get(ttft.ttft_ewma_key(opts, m, mt.metric)) }
+            end
+            ewmas[key] = list[1] and list[1].ewma_ms or nil
+            -- ⚠️ metrics 用**数组**而不是「按 model 键的 map」:回归脚本 test_ttft.sh 的 ewv() 是
+            --    `grep -o '"_":[0-9.]*'` 直接在原始 JSON 文本里捞,而 [0-9.]* 能匹配零个字符 ——
+            --    若这里也出现 `"_":[`,head -1 可能取到它,数字部分为空 → ewma 假报空。
+            --    数组形状下只有 "model":"_",不会产生裸的 `"<model>":` 键。
+            mstat[#mstat+1] = { model = key, items = list }
         end
     end
     local active = ttft.ttft_dict_if_on(opts) and true or false
@@ -124,6 +141,10 @@ function _G.dbg_ttft_status(opts)
         probe_window          = opts.ttft_probe_window,
         probe_per_window      = opts.ttft_probe_per_window,
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
+        -- ↓ 新增(只增不改不重排,回归套件依赖既有字段)
+        metrics               = mstat,                        -- 每模型的完整指标列表(metric/q/threshold/ewma)
+        dict_capacity         = td and td:capacity() or nil,  -- 容量观测:直方图 key 数随模型/指标增长,
+        dict_free_space       = td and td:free_space() or nil,--   一旦 LRU 淘汰 ewin/fd 锁会静默坏掉折叠
     }))
 end
 
@@ -260,15 +281,27 @@ function _G.dbg_tps_status(opts)
             fill_cc("_", false)
         end
     end
+    -- ewma_tps 保持老形状(单指标时取第一条),新增 metrics 展示完整指标列表。同 /_ttft_status。
+    local mstat = {}
     if td then
+        local models = {}
         if opts.peers_by_model then
-            for m in pairs(opts.peers_by_model) do
-                ewmas[m]   = td:get(rp .. m .. ":ewma")
-                nousage[m] = td:get(rp .. m .. ":nousage") or 0
-            end
+            for m in pairs(opts.peers_by_model) do models[#models+1] = m end
         else
-            ewmas["_"]   = td:get(rp .. "ewma")
-            nousage["_"] = td:get(rp .. "nousage") or 0
+            models[1] = false
+        end
+        for _, m in ipairs(models) do
+            local key = (m == false) and "_" or m
+            local pre = (m == false) and rp or (rp .. m .. ":")
+            local list = {}
+            for _, mt in ipairs(tps.tps_metrics(opts, m)) do
+                list[#list+1] = { metric = mt.metric, q = mt.q,
+                                  threshold_tps = mt.threshold,
+                                  ewma_tps = td:get(tps.tps_ewma_key(opts, m, mt.metric)) }
+            end
+            ewmas[key]   = list[1] and list[1].ewma_tps or nil
+            mstat[#mstat+1] = { model = key, items = list }   -- 数组形状,理由同 /_ttft_status
+            nousage[key] = td:get(pre .. "nousage") or 0
         end
     end
     local active = tps.tps_dict_if_on(opts) and true or false
@@ -303,6 +336,10 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_abs       = opts.adaptive_cc and opts.adaptive_cc_abs or nil,   -- 绝对头寸(slots)
         adaptive_cc_rej       = adaptive_cc_rej,     -- 本区间被压抑需求(并发429数);>0 → 下tick 快涨到 desired
         adaptive_cc_interval  = opts.adaptive_cc and opts.adaptive_cc_interval or nil,
+        -- ↓ 新增(只增不改不重排)
+        metrics               = mstat,                        -- 每模型完整指标列表(metric/q/threshold/ewma)
+        dict_capacity         = td and td:capacity() or nil,
+        dict_free_space       = td and td:free_space() or nil,
     }))
 end
 

@@ -34,6 +34,48 @@ function M.pick_rendezvous(sid, peer_list)
     return best_idx, best_h
 end
 
+-- ══════════════════════════════════════════════════════════════════════
+-- 窗口直方图 → 统计量(TTFT / TPS 共用;两边原先是 ttft_window_p80 / tps_window_p20 两份
+-- 逐字同构的拷贝,只差分位系数与桶数组)
+-- ══════════════════════════════════════════════════════════════════════
+-- 从窗口 w 的直方图算**第 q 分位**(累计越过 total*q 的桶上界);空窗返 nil。
+-- ⚠️ 空窗必须返 nil 而非 0:下游把 nil 当「无样本,不判定」(fail-open),
+--    返 0 会让 TPS 侧 `0 <= limit` 恒成立 → 瞬间全拒。
+-- ⚠️ buckets 由**调用方现读** _G.TTFT_BUCKETS_MS / _G.TPS_BUCKETS 传入,不要在 register_route
+--    里快照进 opts —— 否则「改 _G 免 reload 立即生效」会悄悄变成「必须 reload」。
+-- 桶共 n+1 个(第 n+1 个是 overflow),overflow 代表值 = 末桶 × 2。
+function M.window_quantile(td, pre, w, buckets, q)
+    local b = buckets
+    local n = #b
+    local counts, total = {}, 0
+    for i = 1, n + 1 do
+        local c = td:get(pre .. "h:" .. w .. ":" .. i) or 0
+        counts[i] = c; total = total + c
+    end
+    if total == 0 then return nil end
+    local target, cum = total * q, 0
+    for i = 1, n + 1 do
+        cum = cum + counts[i]
+        if cum >= target then return b[i] or (b[n] * 2) end   -- overflow 桶代表值 = 末桶×2
+    end
+    return b[n] * 2
+end
+
+-- 窗口均值(CRD 的 `avg` 指标)。直方图算不出均值,故 record 时额外累计 sum/cnt 两个 key。
+-- 空窗同样返 nil(语义与 window_quantile 对齐)。
+function M.window_avg(td, pre, w)
+    local cnt = td:get(pre .. "h:" .. w .. ":cnt") or 0
+    if cnt == 0 then return nil end
+    return (td:get(pre .. "h:" .. w .. ":sum") or 0) / cnt
+end
+
+-- 按 CRD 的 metric 名从窗口取值:"avg" 走均值,"pNN" 走分位(q 由调用方给,
+-- 因为 TTFT 的 q=coverage 而 OTPS 的 q=1-coverage,方向换算不在引擎内做)。
+function M.window_stat(td, pre, w, buckets, metric, q)
+    if metric == "avg" then return M.window_avg(td, pre, w) end
+    return M.window_quantile(td, pre, w, buckets, q)
+end
+
 -- 共享 nil-opts 兜底:route 未注册(register_route 失败 / server 的 set $route 与 register 名不匹配)
 -- 时 _G.__route_opts[ngx.var.route] 为 nil。content/access phase 的 do_route + 各 dbg_* 统一用它返
 -- JSON 500,避免同一 guard 复制到 ~20 处后漂移(code review G6)。返回 true=opts 缺失(调用方应

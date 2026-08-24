@@ -8,6 +8,7 @@ local M = {}
 
 local route = require "route"
 local tps   = require "tps"
+local ttft  = require "ttft"   -- AIMD 的 TTFT 过载信号走 ttft_assess(以前手搓 key 前缀,与真实 schema 会分叉)
 
 -- ══════════════════════════════════════════════════════════════════════
 -- M.do_health_check_loop(opts) — init_worker 调用，启动健康检查 timer
@@ -152,45 +153,34 @@ function M.do_adaptive_cc_loop(opts)
     local CC_TTL = opts.adaptive_cc_ttl
     local rname = opts.route_name or "?"
 
-    -- 解析某 model 的 TPS 阈值(override > by_model > route),timer 版不读 ngx.ctx。
+    -- 解析某 model 的 TPS 阈值(override > by_model > route)。以前这里手抄了一份 tps_limit_for,
+    -- 现在直接调 helper 传显式 model(timer 无 ngx.ctx)—— 逻辑等价,且不会再各自漂移。
     local function thr_for(model)
-        if model then
-            local mo = td:get(rname .. ":" .. model .. ":limit_override")
-            if mo then return mo end
-        end
-        local ro = td:get(rname .. ":limit_override")
-        if ro then return ro end
-        if model and opts.tps_limit_by_model then
-            local v = opts.tps_limit_by_model[model]
-            if v then return v end
-        end
-        return opts.tps_limit_tps
+        return tps.tps_limit_for(opts, model)
     end
 
     -- TTFT 过载信号(方案②):后端首 token 慢(TTFT EWMA 超阈值)也算过载 → 让 cc 收。
     -- 只对开了 TTFT 限流的路由生效(TTFT_ENABLED + ttft_dict + 未热关 + 有 limit),否则返 false →
     -- 行为与纯 TPS adaptive_cc 完全一致(向后兼容)。timer 无 ngx.ctx,用显式 model 构造 key/阈值,
-    -- 与 ttft.lua 的 ttft_key_prefix / ttft_limit_for 同构(override > by_model > opts.ttft_limit_ms)。
+    -- 现在走 ttft.ttft_assess(opts, ttd, model, strict=true) —— 以前这里手搓 key 前缀 + 手抄阈值解析,
+    -- key schema 一变(加 :all:<metric>: 段)就会读到不存在的 key、静默返 false。
+    -- strict=true 保留原来的 `>`(access 的 429 用 `>=`,见 ttft_assess 注释)。
     -- per-route opts.adaptive_cc_use_ttft=false 可关(缺省 nil=开)。
     local function ttft_overloaded(model)
         if opts.adaptive_cc_use_ttft == false then return false end
         if not _G.TTFT_ENABLED then return false end
         local ttd = ngx.shared[opts.ttft_dict]
         if not ttd or ttd:get(rname .. ":__off") then return false end
-        local pre = rname .. ":" .. (model and (model .. ":") or "")   -- 与 ttft_key_prefix 同构
-        local ew = ttd:get(pre .. "ewma")
-        if not ew then return false end
-        local lim = (model and ttd:get(rname .. ":" .. model .. ":limit_override"))
-                 or ttd:get(rname .. ":limit_override")
-                 or (opts.ttft_limit_by_model and model and opts.ttft_limit_by_model[model])
-                 or opts.ttft_limit_ms
-        return lim ~= nil and ew > lim
+        return ttft.ttft_assess(opts, ttd, model, true).hit
     end
 
     -- 单子池一步 AIMD(model=false 表 flat 路由)。
     local function step_one(model)
         local pre = tps.tps_key_prefix(opts, model)   -- 统一走 helper(flat: model=false → "route:")
-        local ewma = td:get(pre .. "ewma")
+        -- strict=true → 用 `<`(保留原比较符;access 的 TPS-429 用 `<=`)。
+        -- ta.ewma = 第一条指标的 EWMA,仍当**活性信号**用(nil = 无近期解码样本)。
+        local ta   = tps.tps_assess(opts, td, model, true)
+        local ewma = ta.ewma
         -- TPS EWMA 是**活性信号**:nil = 无近期解码样本(lull / 无流量)→ 保持当前值不动(不写 → cc 按 CC_TTL
         -- 自然老化到 min)。TTFT 收缩只在**有 TPS 活性**时叠加,不能靠 TTFT 单独驱动 —— 否则 TTFT 尖峰后
         -- 流量归零、TPS EWMA 已过期而 TTFT EWMA 仍 stale-high(可存活 ttft_ttl),会每 tick 把空闲池的 cc 拽到 min。
@@ -210,7 +200,7 @@ function M.do_adaptive_cc_loop(opts)
             local ABS  = opts.adaptive_cc_abs or 0
             -- 目标 cc:相对(conc/mid≈1.25×)与绝对(conc+ABS)取大 → 任何并发下都留够 ABS 绝对头寸。
             local desired = math.max(conc / mid, conc + ABS)
-            if ewma < thr or ttft_over then
+            if ta.hit or ttft_over then
                 -- 过载 → 缩,最高优先(压过下面「并发429→涨」)。两类过载(均需 TPS 有活性信号):
                 --   ① 解码慢:TPS EWMA < 阈值(照旧,保护后端 decode 争用);
                 --   ② 首token慢:TTFT EWMA > 阈值(方案②新增)。TTFT-bound 过载时(decode 尚可但

@@ -48,11 +48,15 @@ http {
   }
   server { listen 19697; server_name _;
     # 灌值:/_seed?route=r&ttft=..&tps=..&cc=..&rt=..&rej=..  (缺省不设的字段不动)
+    # ⚠️ EWMA key 不再手拼 rt..":ewma" —— schema 现在是 <route>[:<model>]:<range>:<metric>:ewma。
+    #    统一调引擎自己的 key helper(ttft_ewma_key / tps_ewma_key),schema 再变这里也不会漂。
     location = /_seed { content_by_lua_block {
         local a = ngx.req.get_uri_args(); local rt = a.route or "r"
         local ts = ngx.shared.ttft_stat; local tp = ngx.shared.tps_stat
-        if a.ttft then ts:set(rt..":ewma", tonumber(a.ttft), 60) end
-        if a.tps  then tp:set(rt..":ewma", tonumber(a.tps),  60) end
+        local o  = _G.__route_opts[rt]
+        local ttft_m = require "ttft"; local tps_m = require "tps"
+        if a.ttft then ts:set(ttft_m.ttft_ewma_key(o, false, "p80"), tonumber(a.ttft), 60) end
+        if a.tps  then tp:set(tps_m.tps_ewma_key(o, false, "p80"),  tonumber(a.tps),  60) end
         if a.cc   then tp:set(rt..":adaptive_cc", tonumber(a.cc), 60) end
         if a.rt   then tp:set(rt..":rt_sum", tonumber(a.rt), 60) end
         if a.rej  then tp:set(rt..":rej", tonumber(a.rej), 60) end

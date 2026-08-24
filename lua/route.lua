@@ -426,18 +426,22 @@ function M.assess_pool(opts, peers, peer_keys)
     local _, _, avg_5min = M.compute_cluster_avg(opts.cluster_avg_dict,
         opts.peers_by_model and ngx.ctx.req_model or nil)
 
-    -- TTFT EWMA(池级,按 model 分 key;总开关关 / dict 未声明 = nil = 不参与判定)
-    local ttft_ewma
+    -- TTFT 违约判定(池级,按 model 分 key;总开关关 / dict 未声明 = nil = 不参与判定)。
+    -- ttft_assess 遍历**声明的**指标列表做 OR;单指标(P0 默认)时 ttft_ewma 与旧行为逐字节一致。
+    local ttft_ewma, ttft_hit
     local td = ttft.ttft_dict_if_on(opts)
     if td then
-        ttft_ewma = td:get(ttft.ttft_ewma_key(opts))
+        ttft_hit  = ttft.ttft_assess(opts, td)
+        ttft_ewma = ttft_hit.ewma
     end
 
-    -- TPS EWMA(解码速率,opt-in;特性关/无数据 = nil = 不参与判定,fail-open)
-    local tps_ewma
+    -- TPS 违约判定(解码速率,opt-in;特性关/无数据 = nil = 不参与判定,fail-open)
+    -- strict=false → 用 `<=`,与改动前 access.lua 的比较符一致(timers 的 AIMD 另用 `<`,见 tps_assess)
+    local tps_ewma, tps_hit
     local tpd = tps.tps_dict_if_on(opts)
     if tpd then
-        tps_ewma = tpd:get(tps.tps_ewma_key(opts))
+        tps_hit  = tps.tps_assess(opts, tpd, nil, false)
+        tps_ewma = tps_hit.ewma
     end
 
     -- 自适应并发上限(AIMD;do_adaptive_cc_loop 每 interval 写入,带 TTL)。经 tps_dict_if_on 读:
@@ -455,6 +459,7 @@ function M.assess_pool(opts, peers, peer_keys)
         healthy_all = healthy_all, healthy_peers = healthy_peers,
         limit = limit, rt_sum = rt_sum, avg_5min = avg_5min,
         ttft_ewma = ttft_ewma, tps_ewma = tps_ewma, adaptive_cc = adaptive_cc,
+        ttft_hit = ttft_hit, tps_hit = tps_hit,   -- 多指标判定结果(含触发那一条的 ewma/limit/metric)
         tps_prefix = tps_prefix,  -- tps_key_prefix(opts) 缓存(仅 adaptive+tps_on 时非 nil)
         tps_on = (tpd ~= nil),   -- tps 特性对本路由是否生效(__off/_G.TPS_ENABLED/未 opt-in = false)
     }
