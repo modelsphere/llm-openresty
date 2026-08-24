@@ -153,9 +153,12 @@ end
 
 -- ══════════════════════════════════════════════════════════════════════
 -- GET  /_slo_conf         → 当前生效的 SLO(CRD 下发)状态 + 已解析的表
--- POST /_slo_conf <json>  → 手动注入一份(应急下发 / 回归测试注入),仅 127.0.0.1
---                           注入后置 pinned,直到**文件内容真的变了**才让 loader 夺回控制权,
---                           否则注入会被下一个 tick 抹掉。
+-- POST /_slo_conf <json>  → 手动注入一份,仅 127.0.0.1。注入后置 pinned,直到**文件内容真的变了**
+--                           才让 loader 夺回控制权,否则会被下一个 tick 抹掉。
+-- ⚠️ GET/POST 都是 **per-worker 语义**(SLO 数据在 module-local table,生产 worker 数 20):
+--    POST 只改一个 worker;GET 也只反映**接住这次请求的那个 worker**,多次 GET 可能不一致。
+--    → 仅用于调试和单 worker 的回归注入;生产应急改阈值请用 /_ttft_limit / /_tps_limit
+--      (写 shared dict、全 worker 一致,且优先级在 CRD 之上)。
 -- 全局 endpoint,不吃 opts(SLO 数据是整实例一份,按 route 名查)。
 -- ══════════════════════════════════════════════════════════════════════
 function _G.dbg_slo_conf()

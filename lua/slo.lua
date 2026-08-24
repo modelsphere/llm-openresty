@@ -10,6 +10,10 @@
 --
 -- ⚠️ 裸机(gateway-host/ts31/gateway-host 无 k8s)零影响:SLO_CONFIG_PATH 未设 → 不起 timer、表恒空
 --    → 所有查询 miss → 调用方回落静态配置,行为与接 CRD 前逐字节一致。
+--
+-- ⚠️ 数据文件必须在**节点本地文件系统**上(k8s ConfigMap 卷即是,实测 ext4 + ..data 原子 symlink 切换)。
+--    禁止网络存储(NFS / CephFS PVC):下面的 io.open 是阻塞调用,跑在 ngx.timer 里,
+--    网络抖动会卡住该 worker 的整个事件循环。
 
 local M = {}
 
@@ -123,8 +127,13 @@ local function apply(tbl, src)
             " routes=", (function() local n = 0; for _ in pairs(tbl.routes) do n = n + 1 end; return n end)())
 end
 
--- 供 /_slo_conf POST 用:手动注入(应急下发 / 回归测试注入)。
--- 置 PINNED —— 直到**文件内容真的变了**才让 loader 夺回控制权,否则注入会被下一个 tick 抹掉。
+-- 供 /_slo_conf POST 用:手动注入。置 PINNED —— 直到**文件内容真的变了**才让 loader 夺回控制权,
+-- 否则注入会被下一个 tick 抹掉。
+--
+-- ⚠️⚠️ **注入只作用于处理该请求的那一个 worker**(数据在 per-worker table 里,生产 worker 数 20)。
+--    所以它是**调试 / 单 worker 回归测试**手段,**不能当生产应急下发用** ——
+--    真正的应急通道是 `/_ttft_limit` / `/_tps_limit`:它们写 shared dict(**全 worker 一致**),
+--    且在优先级链里就排在 CRD **之上**,本来就是为这个场景设计的。
 function M.apply_post(txt)
     local tbl, err = M.parse(txt)
     if not tbl then LAST_ERR = err; ERR_COUNT = ERR_COUNT + 1; return nil, err end
@@ -178,10 +187,12 @@ function M.start_loader()
     local interval = tonumber(os.getenv("SLO_RELOAD_INTERVAL")) or 5
     local function loop(premature)
         if premature then return end
-        if not PINNED then
-            local ok, err = pcall(M.tick, path)
-            if not ok then ngx.log(ngx.ERR, "[slo] loader tick 崩溃: ", err) end
-        end
+        -- ⚠️ 这里**不能**用 `if not PINNED then tick() end`:那样 POST 注入后 loader 就再也不读文件,
+        --    于是永远观测不到"文件变了",PINNED 也就永远不会清 —— 一次 POST 会永久停掉该 worker 的
+        --    自动加载。正确做法是照常 tick,由 tick 内部决定:内容没变就早返回(POST 的数据得以保留),
+        --    内容真的变了才 apply 并清 PINNED。
+        local ok, err = pcall(M.tick, path)
+        if not ok then ngx.log(ngx.ERR, "[slo] loader tick 崩溃: ", err) end
         local _, terr = ngx.timer.at(interval, loop)
         if terr and not ngx.worker.exiting() then
             ngx.log(ngx.ERR, "[slo] loader 调度失败: ", terr)
