@@ -80,7 +80,9 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
 		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300}, []string{"service", "route", "backend", "model", "stream"}),
 		ttft:          hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 3, 5, 10}, srbm),
-		outTokPerSec:  hist("bodylog_output_tok_per_second", "单请求生成速率 completion_tokens/rt(tok/s)", []float64{5, 10, 20, 30, 50, 80, 120, 200, 400}, srbm),
+		// 2026-08-26:分母从 rt 改为 rt-frt(扣除 prefill),仅流式 + 下限过滤,与 openresty 引擎
+		// 的 tps_limit_tps 口径对齐。详见 observe() 里的说明。历史数据与新数据不可比。
+		outTokPerSec:  hist("bodylog_output_tok_per_second", "单请求解码速率 completion_tokens/(rt-frt)(tok/s,已扣 prefill;仅流式)", []float64{5, 10, 20, 30, 50, 80, 120, 200, 400}, srbm),
 		lines:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
 		offset:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
 		lastTs:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
@@ -182,8 +184,23 @@ func (m *metrics) observe(d detailRecord) {
 	if d.Frt > 0 && d.Stream != nil && *d.Stream {
 		m.ttft.WithLabelValues(service, route, backend, model).Observe(d.Frt)
 	}
-	if d.Rt > 0 && d.CompletionTokens > 0 {
-		m.outTokPerSec.WithLabelValues(service, route, backend, model).Observe(float64(d.CompletionTokens) / d.Rt)
+	// 解码速率 = completion_tokens / 解码耗时(rt - frt),**分母必须扣掉 prefill**。
+	// 此前分母用 rt(含 prefill),后果:
+	//   ① 与 openresty 引擎口径不一致 —— 引擎(tps.lua)算的是 ctok/(总时长-ttft),
+	//      两边对同一概念用两套定义,拿引擎的 tps_limit_tps(15~30)去卡这个指标是苹果比橘子;
+	//   ② 系统性低估,且**对慢请求低估得最狠** —— 实测慢尾请求中位 frt 占 rt 的 48%
+	//      (中位 86 token / 10.2s,扣掉 4.9s prefill 后 8.4→16.2 tok/s),把低尾压低约 2.4 倍。
+	//      注意别用全局 ttft_sum/rt_sum(仅 11%)去判断影响大小,那个被占多数的快请求稀释了。
+	// ⚠️ 只统计流式请求,理由同上面 TTFT:非流式只有一个 body chunk,frt≈rt → rt-frt≈0,
+	//    相除得天文数字,会把整个直方图顶进 overflow 桶。
+	// ⚠️ 下限过滤对齐引擎(tps_min_tokens=16 / tps_min_decode_s=0.5):短响应固定开销占比过高
+	//    (20 token / 2s = 10 tok/s),不代表稳态解码速率,不滤会污染低尾。实测滤掉约 16%。
+	// ⚠️ 语义变更:改动前后的历史数据不可比,依赖它的告警阈值需要按新口径重定。
+	if d.Stream != nil && *d.Stream && d.CompletionTokens >= 16 {
+		if decode := d.Rt - d.Frt; decode >= 0.5 {
+			m.outTokPerSec.WithLabelValues(service, route, backend, model).
+				Observe(float64(d.CompletionTokens) / decode)
+		}
 	}
 
 	m.lines.Inc()
