@@ -12,10 +12,24 @@ metadata: { name: bodylog-exporter, namespace: llm-gateway }
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata: { name: bodylog-exporter-modelroute-reader }
+# 与 k8s/helm/bodylog-exporter/templates/rbac.yaml 保持一致(那份是权威,这份是不带 helm 的逃生口)。
 rules:
   - apiGroups: [ "routing.gpucluster.io" ]
     resources: [ "modelroutes" ]
     verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "discovery.k8s.io" ]
+    resources: [ "endpointslices" ]
+    verbs: [ "get", "list", "watch" ]
+  # 期望副本数(bodylog_service_replicas_desired)的 ownerRef 上溯:pod → ... → 顶层工作负载。
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "get" ]
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets", "deployments", "statefulsets" ]
+    verbs: [ "get" ]
+  - apiGroups: [ "leaderworkerset.x-k8s.io" ]
+    resources: [ "leaderworkersets" ]
+    verbs: [ "get" ]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

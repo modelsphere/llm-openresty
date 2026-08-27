@@ -1,7 +1,12 @@
 # exporter 的 SA 权限:
 #   1) list/watch ModelRoute CR —— route 动态发现(openresty-poll)+ route 富化(取 discovery.service);
-#   2) list/watch EndpointSlice —— route 富化:查 discovery.service 的后端 pod IP,反建 podIP→route 映射。
-# 缺 modelroutes 权限 → poll/富化 403;缺 endpointslices → 富化拿不到 pod IP、route label 恒 unknown。
+#   2) list/watch EndpointSlice —— route 富化:查 discovery.service 的后端 pod IP,反建 podIP→route 映射;
+#   3) get pod + 各工作负载 —— 求 bodylog_service_replicas_desired(期望副本数):
+#      从 EndpointSlice 的 targetRef 取一个 pod,沿 ownerReferences 上溯到顶层工作负载读 spec.replicas。
+#      必须走到顶:LWS 滚动更新时 leader StatefulSet 的 spec.replicas 被 maxSurge 抬高,
+#      停在 StatefulSet 拿到的是 surge 值,会把满员的服务判成降级。
+# 缺 modelroutes 权限 → poll/富化 403;缺 endpointslices → 富化拿不到 pod IP、route label 恒 unknown;
+# 缺 (3) → 只是 desired gauge 缺失(日志有 403),其余指标不受影响。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -20,6 +25,18 @@ rules:
   - apiGroups: [ "discovery.k8s.io" ]
     resources: [ "endpointslices" ]
     verbs: [ "get", "list", "watch" ]
+  # 期望副本数的上溯链。只要 get:整条链都是按 ownerRef 里的确切名字点名取,不需要 list/watch。
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "get" ]
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets", "deployments", "statefulsets" ]
+    verbs: [ "get" ]
+  {{- range .Values.desiredReplicas.extraOwnerApiGroups }}
+  - apiGroups: [ "{{ .apiGroup }}" ]
+    resources: {{ toJson .resources }}
+    verbs: [ "get" ]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

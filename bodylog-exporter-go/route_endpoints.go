@@ -57,8 +57,9 @@ type podRouteResolver struct {
 	pods          prometheus.Gauge
 	routesG       prometheus.Gauge
 	errs          prometheus.Counter
-	replicas      *prometheus.GaugeVec // {service, route} → 后端 pod 总数(含未就绪)
-	replicasReady *prometheus.GaugeVec // {service, route} → 就绪后端 pod 数
+	replicas        *prometheus.GaugeVec // {service, route} → 后端 pod 总数(含未就绪)
+	replicasReady   *prometheus.GaugeVec // {service, route} → 就绪后端 pod 数
+	replicasDesired *prometheus.GaugeVec // {service, route} → 期望副本数(工作负载 spec.replicas)
 }
 
 func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
@@ -101,8 +102,11 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		errs:          prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "ModelRoute 发现/映射刷新出错累计"}),
 		replicas:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service(discovery.service)当前后端 pod 总数(EndpointSlice endpoint 数,含未就绪)"}, []string{"service", "route"}),
 		replicasReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端 pod 数(conditions.ready)"}, []string{"service", "route"}),
+		// 期望副本数:判「降级」要拿【就绪】比【期望】,不能比【实际】—— 滚动更新的 maxSurge 会把实际抬高,
+		// 拿实际当分母会在每次 rollout 期间把满员的服务误判成降级。查不到时不发这条 series(见 desiredForPod)。
+		replicasDesired: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_desired", Help: "该 service 期望副本数(顶层工作负载 spec.replicas;LWS 取 LWS 本身而非被 surge 抬高的 StatefulSet)"}, []string{"service", "route"}),
 	}
-	reg.MustRegister(r.up, r.pods, r.routesG, r.errs, r.replicas, r.replicasReady)
+	reg.MustRegister(r.up, r.pods, r.routesG, r.errs, r.replicas, r.replicasReady, r.replicasDesired)
 	return r
 }
 
@@ -123,9 +127,12 @@ func (r *podRouteResolver) serviceFor(route string) string {
 }
 
 // svcRep:一个 service 的副本数(build 顺带产出,refresh 灌进 gauge)。n=总数(含未就绪),ready=就绪数。
+// desired=期望副本数,desiredOK=false 表示这轮没查出来(不发 gauge,而不是发 0 —— 0 会被读成"缩到零")。
 type svcRep struct {
 	service, route string
 	n, ready       int
+	desired        int
+	desiredOK      bool
 }
 
 // Lookup:后端 pod IP → route/service。未命中返回 ok=false(observe 侧回退 route/service=unknown)。
@@ -171,9 +178,13 @@ func (r *podRouteResolver) refresh(ctx context.Context) {
 	// Reset 后重灌:缩容/下线的 service series 自动消失,不残留旧值。
 	r.replicas.Reset()
 	r.replicasReady.Reset()
+	r.replicasDesired.Reset()
 	for _, rp := range res.reps {
 		r.replicas.WithLabelValues(rp.service, rp.route).Set(float64(rp.n))
 		r.replicasReady.WithLabelValues(rp.service, rp.route).Set(float64(rp.ready))
+		if rp.desiredOK {
+			r.replicasDesired.WithLabelValues(rp.service, rp.route).Set(float64(rp.desired))
+		}
 	}
 	r.up.Set(1)
 	r.pods.Set(float64(len(res.byIP)))
@@ -203,7 +214,8 @@ type modelRouteFull struct {
 	} `json:"items"`
 }
 
-// endpointSliceList:discovery.k8s.io/v1 EndpointSlice —— 取 endpoints[].addresses[] + conditions.ready。
+// endpointSliceList:discovery.k8s.io/v1 EndpointSlice —— 取 endpoints[].addresses[] + conditions.ready
+// + targetRef(哪个 pod,作为 ownerRef 上溯求期望副本数的入口)。
 type endpointSliceList struct {
 	Items []struct {
 		Endpoints []struct {
@@ -211,9 +223,32 @@ type endpointSliceList struct {
 			Conditions struct {
 				Ready *bool `json:"ready"` // nil=unknown(EndpointSlice 约定按 ready 处理)
 			} `json:"conditions"`
+			TargetRef *struct {
+				Kind string `json:"kind"`
+				Name string `json:"name"`
+			} `json:"targetRef"`
 		} `json:"endpoints"`
 	} `json:"items"`
 }
+
+// ownerObj:ownerRef 上溯只需要每层对象的两样东西 —— 它的控制器 owner,和它自己的 spec.replicas。
+type ownerObj struct {
+	Metadata struct {
+		OwnerReferences []struct {
+			APIVersion string `json:"apiVersion"`
+			Kind       string `json:"kind"`
+			Name       string `json:"name"`
+			Controller *bool  `json:"controller"`
+		} `json:"ownerReferences"`
+	} `json:"metadata"`
+	Spec struct {
+		Replicas *int `json:"replicas"`
+	} `json:"spec"`
+}
+
+// ownerWalkMaxDepth:Pod → ReplicaSet → Deployment 与 Pod → StatefulSet → LeaderWorkerSet 都是 2 跳,
+// 留一点余量后设死上限 —— ownerReferences 理论上可以成环(手工构造/控制器 bug),没有上限就是死循环。
+const ownerWalkMaxDepth = 5
 
 // build:list ModelRoute → ① 每个有 discovery.service 的 route 查 EndpointSlice → map[podIP]{route,service} + 副本数;
 // ② route→service 映射(含所有 route);③ poll 用 route 列表(按 nginxService 过滤 + 去重排序)。
@@ -228,6 +263,9 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 	}
 	res := resolveResult{byIP: map[string]routeInfo{}, svc: map[string]string{}}
 	seen := map[string]bool{}
+	// 同一轮内共享:多个 route 常指向同一组工作负载(如 cart 与推理服务同属一个 release),
+	// 上溯路径高度重合,缓存把 apiserver 的 GET 次数压到每个对象一次。
+	ownerCache := map[string]*ownerObj{}
 	for _, it := range lst.Items {
 		route := strings.TrimSpace(it.Spec.Nginx.Route)
 		if route == "" { // monitor-only(无 nginx 路由)→ 既不 poll 也无法归属
@@ -253,7 +291,7 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 		if name == "" {
 			continue
 		}
-		ips, ready, err := r.podIPsForService(ctx, ns, name)
+		ips, ready, samplePod, err := r.podIPsForService(ctx, ns, name)
 		if err != nil {
 			log.Printf("route-enrich: route=%s svc=%s EndpointSlice 失败: %v", route, svc, err)
 			continue // 单个 service 失败不拖累其它 route
@@ -262,25 +300,32 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 		for _, ip := range ips {
 			res.byIP[ip] = ri // 映射含未就绪 pod(它可能刚服务过一个请求,仍要能归属)
 		}
-		res.reps = append(res.reps, svcRep{service: svcLabel, route: route, n: len(ips), ready: ready})
+		rep := svcRep{service: svcLabel, route: route, n: len(ips), ready: ready}
+		if samplePod != "" {
+			// 期望副本数走 ownerRef 上溯,失败只是这条 gauge 缺一轮,不影响富化映射。
+			if d, ok := r.desiredForPod(ctx, ns, samplePod, ownerCache); ok {
+				rep.desired, rep.desiredOK = d, true
+			}
+		}
+		res.reps = append(res.reps, rep)
 	}
 	sort.Strings(res.routes)
 	return res, nil
 }
 
 // podIPsForService:查某 Service 的全部 EndpointSlice(按 kubernetes.io/service-name label 归属)。
-// 返回全部 pod IP(含未就绪,给映射用)+ 就绪 IP 数(ready gauge 用)。
+// 返回全部 pod IP(含未就绪,给映射用)+ 就绪 IP 数(ready gauge 用)+ 任一 pod 名(求期望副本数的入口)。
 // ready 语义:conditions.ready==true 计就绪;nil(unknown)按 EndpointSlice 约定视为就绪。
-func (r *podRouteResolver) podIPsForService(ctx context.Context, ns, name string) (ips []string, ready int, err error) {
+func (r *podRouteResolver) podIPsForService(ctx context.Context, ns, name string) (ips []string, ready int, samplePod string, err error) {
 	sel := url.QueryEscape("kubernetes.io/service-name=" + name)
 	u := fmt.Sprintf("%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=%s", r.apiBase, ns, sel)
 	body, err := r.get(ctx, u)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	var esl endpointSliceList
 	if err := json.Unmarshal(body, &esl); err != nil {
-		return nil, 0, fmt.Errorf("decode EndpointSliceList: %w", err)
+		return nil, 0, "", fmt.Errorf("decode EndpointSliceList: %w", err)
 	}
 	for _, es := range esl.Items {
 		for _, ep := range es.Endpoints {
@@ -291,9 +336,82 @@ func (r *podRouteResolver) podIPsForService(ctx context.Context, ns, name string
 					ready++
 				}
 			}
+			// 任意一个 endpoint 的 pod 都行:同一个 Service 背后的 pod 归同一个工作负载,
+			// 上溯到顶拿到的是同一个 spec.replicas。滚动更新期间新旧组并存也不影响
+			// —— 新旧 pod 的 ownerRef 链最终都收敛到同一个顶层对象。
+			if samplePod == "" && ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" {
+				samplePod = ep.TargetRef.Name
+			}
 		}
 	}
-	return ips, ready, nil
+	return ips, ready, samplePod, nil
+}
+
+// desiredForPod:从一个后端 pod 沿 ownerReferences 上溯到顶层工作负载,取它的 spec.replicas。
+//
+// 为什么要走到【顶】而不是停在第一层:LeaderWorkerSet 的 leader pod 属于一个 StatefulSet,
+// 而滚动更新时 LWS 控制器会把那个 StatefulSet 的 spec.replicas 按 maxSurge 抬高
+// (实测 surge 中 sts=3 / lws=2)。停在 StatefulSet 拿到的就是被 surge 污染的数字,
+// 正是这个 gauge 要避免的东西。Deployment 侧同理:停在 ReplicaSet 会拿到旧 RS 的残值。
+//
+// 找不到(裸 pod / 顶层对象没有 spec.replicas / 权限不足)返回 ok=false,调用方据此跳过发点。
+func (r *podRouteResolver) desiredForPod(ctx context.Context, ns, pod string, cache map[string]*ownerObj) (int, bool) {
+	apiVersion, kind, name := "v1", "Pod", pod
+	for depth := 0; depth < ownerWalkMaxDepth; depth++ {
+		obj, err := r.getOwnerObj(ctx, ns, apiVersion, kind, name, cache)
+		if err != nil {
+			log.Printf("route-enrich: 求期望副本数 %s/%s %s/%s 失败: %v", ns, pod, kind, name, err)
+			return 0, false
+		}
+		var owner *struct {
+			APIVersion string `json:"apiVersion"`
+			Kind       string `json:"kind"`
+			Name       string `json:"name"`
+			Controller *bool  `json:"controller"`
+		}
+		for i := range obj.Metadata.OwnerReferences {
+			if o := &obj.Metadata.OwnerReferences[i]; o.Controller != nil && *o.Controller {
+				owner = o
+				break
+			}
+		}
+		if owner == nil { // 到顶了:这一层就是工作负载本身
+			if obj.Spec.Replicas == nil {
+				return 0, false
+			}
+			return *obj.Spec.Replicas, true
+		}
+		apiVersion, kind, name = owner.APIVersion, owner.Kind, owner.Name
+	}
+	log.Printf("route-enrich: 求期望副本数 %s/%s 上溯超过 %d 层(ownerReferences 可能成环),放弃", ns, pod, ownerWalkMaxDepth)
+	return 0, false
+}
+
+// getOwnerObj:按 apiVersion/kind/name 取一个命名空间对象(只解出 ownerRefs + spec.replicas)。
+// resource 名由 Kind 小写加 s 推导 —— 覆盖这条链上会出现的全部类型
+// (Pod/ReplicaSet/Deployment/StatefulSet/LeaderWorkerSet/DaemonSet/Job),不引 discovery 客户端。
+func (r *podRouteResolver) getOwnerObj(ctx context.Context, ns, apiVersion, kind, name string, cache map[string]*ownerObj) (*ownerObj, error) {
+	key := apiVersion + "/" + kind + "/" + ns + "/" + name
+	if o, ok := cache[key]; ok {
+		return o, nil
+	}
+	plural := strings.ToLower(kind) + "s"
+	var u string
+	if strings.Contains(apiVersion, "/") { // 有组:/apis/<group>/<version>/...
+		u = fmt.Sprintf("%s/apis/%s/namespaces/%s/%s/%s", r.apiBase, apiVersion, ns, plural, name)
+	} else { // 核心组(apiVersion="v1"):/api/v1/...
+		u = fmt.Sprintf("%s/api/%s/namespaces/%s/%s/%s", r.apiBase, apiVersion, ns, plural, name)
+	}
+	body, err := r.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var obj ownerObj
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, fmt.Errorf("decode %s/%s: %w", kind, name, err)
+	}
+	cache[key] = &obj
+	return &obj, nil
 }
 
 // get:带 SA token 的 k8s REST GET(token 每次现读,支持轮转)。
