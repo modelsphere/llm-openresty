@@ -55,6 +55,14 @@ routeDiscovery:
   intervalSeconds: 30
   openrestyService: ""          # 多 openresty 时只统计 nginx.service 指本 openresty 的 route;空=全要
 
+# bodylog_service_replicas_desired(期望副本数)的 ownerRef 上溯要 get 顶层工作负载。
+# pods / apps 组(ReplicaSet+Deployment+StatefulSet)在 rbac.yaml 里写死;顶层若是 CRD
+# (LeaderWorkerSet、以及将来别的自定义工作负载)必须在这里补,否则那一层 403、该 service 没有 desired。
+desiredReplicas:
+  extraOwnerApiGroups:
+    - apiGroup: leaderworkerset.x-k8s.io
+      resources: [ "leaderworkersets" ]
+
 # 让集群内 kube-prometheus-stack 抓 exporter 的 :port(需 prometheus-operator)。
 serviceMonitor:
   enabled: true

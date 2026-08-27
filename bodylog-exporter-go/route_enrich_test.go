@@ -264,3 +264,107 @@ func TestObserveRouteLabel(t *testing.T) {
 		t.Errorf("未命中 series = %v,想要 service=unknown route=unknown model=qwen", lbl2)
 	}
 }
+
+// esWithPods:带 targetRef 的 EndpointSlice —— 期望副本数要靠它拿到一个 pod 名做上溯入口。
+// 每个 spec 形如 "ip|podName",带 "!" 后缀=未就绪。
+func esWithPods(specs ...string) string {
+	var eps []string
+	for _, s := range specs {
+		ready := "true"
+		if strings.HasSuffix(s, "!") {
+			ready, s = "false", strings.TrimSuffix(s, "!")
+		}
+		ip, pod, _ := strings.Cut(s, "|")
+		eps = append(eps, `{"addresses":["`+ip+`"],"conditions":{"ready":`+ready+
+			`},"targetRef":{"kind":"Pod","name":"`+pod+`"}}`)
+	}
+	return `{"items":[{"endpoints":[` + strings.Join(eps, ",") + `]}]}`
+}
+
+func ownerJSON(apiVersion, kind, name string) string {
+	return `{"metadata":{"ownerReferences":[{"apiVersion":"` + apiVersion +
+		`","kind":"` + kind + `","name":"` + name + `","controller":true}]}}`
+}
+
+// 期望副本数必须来自【顶层】工作负载。
+//
+// 回归的是一个真实误报:LWS 滚动更新时,LWS 控制器按 maxSurge 把 leader StatefulSet 的
+// spec.replicas 抬高(实测 surge 中 sts=3 而 lws=2)。上溯若停在 StatefulSet 就会拿到 3,
+// 于是「就绪 2 < 总数 3」被判成降级 —— 而服务其实是满的。
+func TestDesiredReplicasWalksToTop(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/apis/routing.gpucluster.io/v1alpha1/modelroutes":
+			_, _ = w.Write([]byte(mrFullJSON))
+
+		// ── LWS 侧:pod → StatefulSet(surge 到 3) → LeaderWorkerSet(2) ──
+		case "/apis/discovery.k8s.io/v1/namespaces/kimi/endpointslices":
+			_, _ = w.Write([]byte(esWithPods("10.0.0.5|kimi-k25-0", "10.0.0.5|kimi-k25-1!")))
+		case "/api/v1/namespaces/kimi/pods/kimi-k25-0":
+			_, _ = w.Write([]byte(ownerJSON("apps/v1", "StatefulSet", "kimi-k25")))
+		case "/apis/apps/v1/namespaces/kimi/statefulsets/kimi-k25":
+			// spec.replicas=3 是被 surge 抬高的值,取到它就是 bug。
+			_, _ = w.Write([]byte(`{"metadata":{"ownerReferences":[{"apiVersion":"leaderworkerset.x-k8s.io/v1","kind":"LeaderWorkerSet","name":"kimi-k25","controller":true}]},"spec":{"replicas":3}}`))
+		case "/apis/leaderworkerset.x-k8s.io/v1/namespaces/kimi/leaderworkersets/kimi-k25":
+			_, _ = w.Write([]byte(`{"metadata":{},"spec":{"replicas":2}}`))
+
+		// ── Deployment 侧:pod → ReplicaSet(旧 RS 残值 7) → Deployment(20) ──
+		case "/apis/discovery.k8s.io/v1/namespaces/model-service/endpointslices":
+			_, _ = w.Write([]byte(esWithPods("10.0.0.5|fb-abc-1")))
+		case "/api/v1/namespaces/model-service/pods/fb-abc-1":
+			_, _ = w.Write([]byte(ownerJSON("apps/v1", "ReplicaSet", "fb-abc")))
+		case "/apis/apps/v1/namespaces/model-service/replicasets/fb-abc":
+			_, _ = w.Write([]byte(`{"metadata":{"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"fb","controller":true}]},"spec":{"replicas":7}}`))
+		case "/apis/apps/v1/namespaces/model-service/deployments/fb":
+			_, _ = w.Write([]byte(`{"metadata":{},"spec":{"replicas":20}}`))
+
+		default:
+			t.Errorf("未预期路径: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv)
+	r.refresh(context.Background())
+
+	if n := testutil.ToFloat64(r.replicasDesired.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 2 {
+		t.Errorf("kimi desired = %v, 想要 2(LWS 的值,不是被 surge 抬高的 StatefulSet 的 3)", n)
+	}
+	// 实际/就绪仍按 EndpointSlice 口径:2 个 endpoint、1 个就绪。降级判定看 ready(1) < desired(2) → 确实降级。
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 2 {
+		t.Errorf("kimi replicas(实际) = %v, 想要 2", n)
+	}
+	if n := testutil.ToFloat64(r.replicasDesired.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 20 {
+		t.Errorf("model-service desired = %v, 想要 20(Deployment 的值,不是旧 ReplicaSet 的 7)", n)
+	}
+}
+
+// 拿不到期望副本数时,不发这条 series —— 发 0 会被读成「缩容到零」,比缺点危险得多。
+func TestDesiredReplicasAbsentWhenUnknown(t *testing.T) {
+	const mr = `{"items":[{"spec":{"nginx":{"route":"bare"},"discovery":{"service":"ns/bare-svc"}}}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/apis/routing.gpucluster.io/v1alpha1/modelroutes":
+			_, _ = w.Write([]byte(mr))
+		case "/apis/discovery.k8s.io/v1/namespaces/ns/endpointslices":
+			_, _ = w.Write([]byte(esWithPods("10.0.0.5|bare-pod")))
+		case "/api/v1/namespaces/ns/pods/bare-pod":
+			_, _ = w.Write([]byte(`{"metadata":{}}`)) // 无 ownerReferences:裸 pod,没有期望副本数可言
+		default:
+			t.Errorf("未预期路径: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv)
+	r.refresh(context.Background())
+
+	if n := testutil.CollectAndCount(r.replicasDesired); n != 0 {
+		t.Errorf("desired series 数 = %d, 想要 0(裸 pod 查不到期望副本数就不该发点)", n)
+	}
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("ns/bare-svc", "bare")); n != 1 {
+		t.Errorf("实际副本数仍应正常上报, 得 %v", n)
+	}
+}
