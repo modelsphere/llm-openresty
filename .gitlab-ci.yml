@@ -1,14 +1,28 @@
-# 打 tag 自动 build openresty 镜像并 push 到 harbor
+# 打 tag 自动 build 镜像 + push helm chart 到 harbor。
 #
 # 参考同组 chat-engine 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置 harbor 鉴权,
 # CI 里不需要 docker login、也不需要配任何 HARBOR_ 变量,直接 docker build + docker push。
-# (已在 feat/openresty-k8s-image 上实测跑通:build FROM harbor openresty-base + push harbor 成功。)
 #
 # app 镜像 FROM harbor 的 openresty-base(见 Dockerfile / Dockerfile.base),纯 COPY 配置、不装东西,
 # 所以 public-buildx runner 够不到 docker.io/外网也能 build。
 #
-# 触发:仅打 git tag。产物 registry.example.com/llm/llm-openresty:<tag> (+ :latest)。
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
+#
+# ── tag 命名:三个组件可以分别发版 ──────────────────────────────────────────
+#
+#   openresty/v0.2.0   → 只出 llm-openresty 镜像 + openresty chart
+#   bodylog/v0.2.0     → 只出 bodylog-listener 镜像 + bodylog chart
+#   exporter/v0.2.0    → 只出 bodylog-exporter 镜像 + bodylog-exporter chart
+#   0.1.13             → 三个一起(无前缀,旧习惯,保留)
+#
+# 产物版本【剥掉前缀】:tag exporter/v0.2.0 → 镜像 :0.2.0 + chart version/appVersion 0.2.0。
+# 必须剥 —— Helm 的 chart version 要求合法 SemVer,带前缀会被直接拒。
+#
+# 为什么要分开:三个组件共用一个 tag 计数器时,改 exporter 也会给 bodylog/openresty
+# 各推一个内容完全相同的新版本号(线上 openresty 卡在 0.1.4 而 exporter 已到 0.1.12,
+# 就是这么错位的),并且把三个镜像的 :latest 一起挪走 —— 拿 latest 的地方会漂到没测过的构建。
+#
+# 注:tag 名里的 "/" 不受 push rule 的 branch_name_regex 约束(那条只管分支;本仓无 tag 规则)。
 
 stages: [build]
 
@@ -18,66 +32,84 @@ variables:
   EXPORTER_IMAGE: registry.example.com/llm/bodylog-exporter
   DOCKER_BUILDKIT: "0"             # 出简单 v2 manifest,containerd 直接拉(buildkit attestation manifest-list 拉取会卡)
 
-build:image:
+# VERSION = tag 剥掉 "<组件>/v" 前缀。无前缀的 tag 剥不掉任何东西,原样通过。
+# 三个 ${VAR#pattern} 都写上是因为一个 job 只会命中自己那个,其余是空操作。
+# before_script 与 script 在【同一个 shell】里跑,所以 VERSION 传得过去。
+.build-job:
   stage: build
   tags: [public-buildx]            # org 共享构建 runner(在线;docker 已 login harbor)
+  before_script:
+    - 'VERSION="${CI_COMMIT_TAG#openresty/v}"; VERSION="${VERSION#bodylog/v}"; VERSION="${VERSION#exporter/v}"'
+    - 'echo "tag=$CI_COMMIT_TAG → version=$VERSION"'
+
+# 各组件的触发条件。两条 rule:带自己前缀的 tag,或无前缀的 tag(三个一起)。
+# 都不匹配 → 该 job 不进 pipeline(所以 openresty/v* 那次根本不会去编 bodylog 的 CGO)。
+.on-openresty:
   rules:
-    - if: '$CI_COMMIT_TAG'         # 只在打 tag 时构建;其它 push 不触发
+    - if: '$CI_COMMIT_TAG =~ /^openresty\/v[0-9]/'
+    - if: '$CI_COMMIT_TAG =~ /^[0-9]/'
+.on-bodylog:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^bodylog\/v[0-9]/'
+    - if: '$CI_COMMIT_TAG =~ /^[0-9]/'
+.on-exporter:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^exporter\/v[0-9]/'
+    - if: '$CI_COMMIT_TAG =~ /^[0-9]/'
+
+build:openresty:
+  extends: [.build-job, .on-openresty]
   script:
-    - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
-    - docker push "$IMAGE:$CI_COMMIT_TAG"
+    - docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+    - docker push "$IMAGE:$VERSION"
     - docker push "$IMAGE:latest"
 
 # bodylog-listener 镜像:多阶段 FROM harbor golang:1.24 编 CGO(go-duckdb)→ harbor debian:12-slim。
 # 与 openresty 不同,bodylog 要真编译:go module 从阿里云 goproxy 拉(runner 需能到 mirrors.aliyun.com);
 # 若 runner 彻底离线,改 `go mod vendor` 入库 + Dockerfile 加 -mod=vendor。base(golang/debian)都在 harbor。
-# 实测:gpu-node 上多阶段 build 通过、镜像 duckdb 正常加载。
 build:bodylog:
-  stage: build
-  tags: [public-buildx]
-  rules:
-    - if: '$CI_COMMIT_TAG'
+  extends: [.build-job, .on-bodylog]
   script:
-    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$CI_COMMIT_TAG" -t "$BODYLOG_IMAGE:latest" .
-    - docker push "$BODYLOG_IMAGE:$CI_COMMIT_TAG"
+    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$VERSION" -t "$BODYLOG_IMAGE:latest" .
+    - docker push "$BODYLOG_IMAGE:$VERSION"
     - docker push "$BODYLOG_IMAGE:latest"
 
 # bodylog-exporter 镜像:纯 Go(CGO off)静态二进制,tail 明细 jsonl → Prometheus。
 # 构建上下文 = bodylog-exporter-go/(与 bodylog-listener 隔离,自带 go.mod/go.sum);module 走腾讯 goproxy。
 build:exporter:
-  stage: build
-  tags: [public-buildx]
-  rules:
-    - if: '$CI_COMMIT_TAG'
+  extends: [.build-job, .on-exporter]
   script:
-    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$CI_COMMIT_TAG" -t "$EXPORTER_IMAGE:latest" bodylog-exporter-go
-    - docker push "$EXPORTER_IMAGE:$CI_COMMIT_TAG"
+    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$VERSION" -t "$EXPORTER_IMAGE:latest" bodylog-exporter-go
+    - docker push "$EXPORTER_IMAGE:$VERSION"
     - docker push "$EXPORTER_IMAGE:latest"
 
 # helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
 # push-chart 自处理 harbor ChartMuseum 鉴权(cm-push 到 harbor-chart-repo = https://registry.example.com/chartrepo/llm)。
-# 本仓有【两个 chart】,分别对应两个镜像,一次 tag 一起推(git tag = 两镜像 tag = 两 chart 版本):
-#   - openresty chart:values.yaml image.tag 是【硬钉值】(非 "")→ 连同 chart version/appVersion 一起 sed 成本次 tag
-#   - bodylog   chart:values.yaml image.tag=""→回落 appVersion → 只 sed chart version/appVersion
-# 消费:helm repo add harbor-chart-repo https://registry.example.com/chartrepo/llm && helm upgrade ... openresty/bodylog --version <tag>
-build:chart:
-  stage: build
-  tags: [public-buildx]
-  rules:
-    - if: '$CI_COMMIT_TAG'
+# 三个 chart 各自一个 job:除了能分别触发,也不再是「第一个 push 失败带走后两个」。
+# 三个 chart 的 values.yaml 都是 image.tag="" → 回落 appVersion,所以只 sed chart 的 version/appVersion。
+.chart-job:
+  extends: .build-job
   variables:
     REGISTRY_PROJECT: llm
+
+chart:openresty:
+  extends: [.chart-job, .on-openresty]
   script:
-    # openresty chart(image.tag="" 回落 appVersion → 只改 chart version/appVersion,和其余 chart 一致)
-    - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" k8s/helm/openresty/Chart.yaml'
+    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/openresty/Chart.yaml'
     - export MODULE_NAME=openresty CHART_FOLDER=k8s/helm/openresty
     - push-chart
-    # bodylog chart(image.tag="" 回落 appVersion → 只改 chart version/appVersion)
-    - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" k8s/helm/bodylog/Chart.yaml'
+
+chart:bodylog:
+  extends: [.chart-job, .on-bodylog]
+  script:
+    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/bodylog/Chart.yaml'
     - export MODULE_NAME=bodylog CHART_FOLDER=k8s/helm/bodylog
     - push-chart
-    # bodylog-exporter chart(独立于 bodylog listener,复用 bodylog-exporter 镜像)
-    - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" k8s/helm/bodylog-exporter/Chart.yaml'
+
+# bodylog-exporter chart 独立于 bodylog listener,复用 bodylog-exporter 镜像。
+chart:exporter:
+  extends: [.chart-job, .on-exporter]
+  script:
+    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/bodylog-exporter/Chart.yaml'
     - export MODULE_NAME=bodylog-exporter CHART_FOLDER=k8s/helm/bodylog-exporter
     - push-chart
-    - 'echo "charts pushed: openresty + bodylog + bodylog-exporter ${CI_COMMIT_TAG} → ChartMuseum(harbor-chart-repo)"'

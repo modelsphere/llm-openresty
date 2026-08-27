@@ -242,7 +242,17 @@ kubectl apply -f deploy/exporter-standalone.yaml   # 换 ns/openresty Service �
 
 裸机 systemd 场景默认只 tail;要顺带 poll **同机**的 openresty,给 `bodylog-exporter.service` 的 Environment 加 `OPENRESTY_POLL_URL`(如 `http://127.0.0.1:18080`)+ `OPENRESTY_POLL_ROUTES`(裸机非 k8s、无 ModelRoute API → 用静态 route 列表)。
 
-CI:`openresty/.gitlab-ci.yml` 的 `build:exporter` 打 git tag 出镜像 `registry.example.com/llm/bodylog-exporter:<tag>`;`build:chart` 同 tag 出 bodylog chart(sidecar 镜像回落 appVersion)。
+CI:`openresty/.gitlab-ci.yml` 的 `build:exporter` + `chart:exporter`。**只发 exporter 用带前缀的 tag**:
+
+```bash
+git tag exporter/v0.2.0 && git push origin exporter/v0.2.0
+# → 镜像 registry.example.com/llm/bodylog-exporter:0.2.0 + bodylog-exporter chart 0.2.0
+#   (前缀被剥掉;openresty / bodylog 的 job 不进 pipeline,它们的 :latest 也不会被挪)
+```
+
+同理 `openresty/v*` / `bodylog/v*`;**无前缀的 tag(如 `0.1.13`)仍然三个组件一起发**。
+认不出的前缀(打错成 `exporters/v1`)一个 job 都不跑 —— 宁可什么都不发生。
+规则改动后跑 `test/verify_ci_tag_rules.py` 离线验一遍(哪些 job 会跑 + 版本剥成什么)。
 
 ---
 
