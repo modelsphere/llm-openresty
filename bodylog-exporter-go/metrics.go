@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -57,10 +58,12 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 	// service = ModelRoute discovery.service(ns/name,用户主聚合维度);route = nginx.route。
 	// 二者都随后端 pod 稳定(pod IP 漂移也不变),补上 bodylog backend/model 缺的 service 归属。
 	srbm := []string{"service", "route", "backend", "model"}
-	// ⚠️ ttft / outTokPerSec 需要 srbm + prompt_bucket,但【不要】写成 append(srbm, "prompt_bucket"):
-	//    append 在 cap>len 时【原地写入】并返回共享同一底层数组的 slice,两处 append 会互相覆盖。
-	//    当前 srbm 的 cap==len==4 恰好安全,但只要有人给 srbm 加元素或改成 make([]string,0,N),
-	//    就会静默出错(label 名串位)。故下面显式写字面量,重复是刻意的。
+	// srbmp = srbm + prompt_bucket(ttft / outTokPerSec 用)。
+	// ⚠️ 必须用 slices.Concat,【不要】写 append(srbm, "prompt_bucket"):append 在 cap>len 时
+	//    【原地写入】并返回共享同一底层数组的 slice,多处 append 会互相覆盖(label 名串位)。
+	//    当前 srbm 的 cap==len==4 恰好让 append 重新分配、侥幸安全,但只要有人给 srbm 加元素
+	//    或改成 make([]string,0,N) 就会静默出错。slices.Concat 语义即「返回新切片」,不依赖 cap。
+	srbmp := slices.Concat(srbm, []string{"prompt_bucket"})
 	ctr := func(name, help string, labels []string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	}
@@ -93,12 +96,12 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
 		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []string{"service", "route", "backend", "model", "stream"}),
 		// prompt_bucket:输入长度分档,用于“某 context 区间的 TTFT 分位数”。见 promptBucket()。
-		ttft: hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", []string{"service", "route", "backend", "model", "prompt_bucket"}),
+		ttft: hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", srbmp),
 		// 2026-08-26:分母从 rt 改为 rt-frt(扣除 prefill),仅流式 + 下限过滤,与 openresty 引擎
 		// 的 tps_limit_tps 口径对齐。详见 observe() 里的说明。历史数据与新数据不可比。
 		// prompt_bucket:同 ttft —— 解码速率同样随 context 变长而下降(KV 越长 attention 越贵),
 		// 分档后才能看出「长输入到底拖慢多少」。见 promptBucket()。
-		outTokPerSec: hist("bodylog_output_tok_per_second", "单请求解码速率 completion_tokens/(rt-frt)(tok/s,已扣 prefill;仅流式)", []string{"service", "route", "backend", "model", "prompt_bucket"}),
+		outTokPerSec: hist("bodylog_output_tok_per_second", "单请求解码速率 completion_tokens/(rt-frt)(tok/s,已扣 prefill;仅流式)", srbmp),
 		lines:        prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
 		offset:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
 		lastTs:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
