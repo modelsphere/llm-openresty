@@ -14,12 +14,12 @@ func TestPromptBucket(t *testing.T) {
 		tok  int64
 		want string
 	}{
-		{0, "0000k_0001k"}, {1023, "0000k_0001k"}, {1024, "0001k_0002k"},
+		{0, "unknown"}, {1, "0000k_0001k"}, {1023, "0000k_0001k"}, {1024, "0001k_0002k"},
 		{6 * 1024, "0006k_0008k"}, {6143, "0004k_0006k"},
 		{12 * 1024, "0012k_0016k"}, {16 * 1024, "0016k_0020k"},
 		{50 * 1024, "0048k_0064k"},
 		{256 * 1024, "0256k_0384k"}, {1024 * 1024, "1024k_inf"},
-		{2000 * 1024, "1024k_inf"}, {-5, "0000k_0001k"},
+		{2000 * 1024, "1024k_inf"}, {-5, "unknown"},
 	}
 	for _, c := range cases {
 		if got := promptBucket(c.tok); got != c.want {
@@ -46,7 +46,7 @@ func TestNativeOnly(t *testing.T) {
 	}
 	for _, mf := range mfs {
 		n := mf.GetName()
-		if n != "bodylog_ttft_seconds" && n != "bodylog_output_tok_per_second" {
+		if n != "bodylog_ttft_seconds" && n != "bodylog_output_tok_per_second" && n != "bodylog_rt_seconds" {
 			continue
 		}
 		for _, mm := range mf.GetMetric() {
@@ -60,8 +60,9 @@ func TestNativeOnly(t *testing.T) {
 			if len(h.GetBucket()) != 0 {
 				t.Errorf("仍在发经典桶: %d 个", len(h.GetBucket()))
 			}
-			if lbls["prompt_bucket"] != "0006k_0008k" {
-				t.Errorf("prompt_bucket=%q, want 0006k_0008k", lbls["prompt_bucket"])
+			// rt_seconds 不带 prompt_bucket(只去经典桶),其余两个必须落对档
+			if n != "bodylog_rt_seconds" && lbls["prompt_bucket"] != "0006k_0008k" {
+				t.Errorf("%s: prompt_bucket=%q, want 0006k_0008k", n, lbls["prompt_bucket"])
 			}
 		}
 	}

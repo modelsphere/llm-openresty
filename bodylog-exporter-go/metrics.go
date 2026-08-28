@@ -57,6 +57,10 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 	// service = ModelRoute discovery.service(ns/name,用户主聚合维度);route = nginx.route。
 	// 二者都随后端 pod 稳定(pod IP 漂移也不变),补上 bodylog backend/model 缺的 service 归属。
 	srbm := []string{"service", "route", "backend", "model"}
+	// ⚠️ ttft / outTokPerSec 需要 srbm + prompt_bucket,但【不要】写成 append(srbm, "prompt_bucket"):
+	//    append 在 cap>len 时【原地写入】并返回共享同一底层数组的 slice,两处 append 会互相覆盖。
+	//    当前 srbm 的 cap==len==4 恰好安全,但只要有人给 srbm 加元素或改成 make([]string,0,N),
+	//    就会静默出错(label 名串位)。故下面显式写字面量,重复是刻意的。
 	ctr := func(name, help string, labels []string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	}
@@ -282,9 +286,17 @@ var promptBucketLabels = func() []string {
 }()
 
 // promptBucket 返回 tok 所属档位的 label。按 1024 token = 1k 换算,区间左闭右开。
-// tok<=0(无 usage / 未采到)归入首档,与 promptTok counter 的 >0 过滤口径不同 ——
-// 这里不能丢样本,否则 TTFT 直方图会少掉这批请求。
+//
+// tok<=0 归入独立的 "unknown" 档,【不能】混进首档 0000k_0001k:
+// 这批是 usage 缺失的请求 —— 2026-08-28 实测 1911 条中 status={400:1883, 429:27, 200:1}、
+// finish_reason 全为 null,即【失败请求】,压根没做推理,frt 反映的是错误返回耗时,
+// 与「输入长度→TTFT」无关。若混入首档:该档 42% 是这批噪声,把 TTFT p80 从真实的
+// 0.11s 拉到 1.37s(12x 失真),而首档恰是最密集的档(占全部请求 18.9%)。
+// 单列 unknown 而非直接丢弃:样本不丢,且这批本身是有用信号(400/429 突增可观测)。
 func promptBucket(tok int64) string {
+	if tok <= 0 {
+		return "unknown"
+	}
 	k := tok / 1024
 	for i, hi := range promptBucketBounds {
 		if k < hi {
