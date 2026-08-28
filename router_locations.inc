@@ -24,11 +24,12 @@
     # 正好撞上,使 bodylog 里 `#body > max_req` 的截断分支成为死代码(body 一超 2m 就已经落文件了);
     # 调到 4m 后 2~4MB 的请求 get_body_data() 能拿到完整内容,bodylog 改为【真截断】到前 2MB,
     # 比记空串有用。>4m 仍落文件、仍记空串。
-    # 10m:与下游 CART 的 max_body_size 默认值对齐(超过它请求照样被 CART 拒,openresty
-    # 放宽无意义)。原为 50m —— 那 40m 空间从未真正可用,反而让超大 body 白走一遍
-    # 「落临时文件 + reqtransform 阻塞式读回」的昂贵路径。10m ≈ 2.5M token。
+    # max_body 维持 50m,【不】跟 dispatch(:8080)的 10m 一致 —— 两处职责不同:
+    #   · 经 dispatch 进来的流量已被那里的 10m 挡在最外层(与下游 CART 的 10m 对齐,早拒早止损);
+    #   · 这里的 50m 只对【内网直连 per-model 端口】(18082-18086 等)的调用方生效,属既有行为,
+    #     不随本次改动收紧,给那类场景保留余量。
     client_body_buffer_size 4m;
-    client_max_body_size    10m;
+    client_max_body_size    50m;
 
     # stream responses without accumulating — minimize SSE chunk coalescing
     postpone_output 0;
