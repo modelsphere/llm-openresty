@@ -17,8 +17,14 @@
     set_real_ip_from unix:;
     real_ip_header    X-Real-IP;
 
-    # allow up to 1m JSON body fully in memory (get_body_data works up to this size)
-    client_body_buffer_size 2m;
+    # client_body_buffer_size 决定 ngx.req.get_body_data() 能读到多大 body —— 超过则 nginx 把
+    # body 写临时文件、get_body_data() 返回 nil,bodylog 拿不到内容(只能标 req_body_truncated,
+    # 内容记成空串,见 lua/bodylog.lua 的 else 分支)。
+    # 2m→4m:与 dispatch(:8080)对齐。副作用是【正向】的 —— 此前 2m 与 _G.bodylog_max_req(2MB)
+    # 正好撞上,使 bodylog 里 `#body > max_req` 的截断分支成为死代码(body 一超 2m 就已经落文件了);
+    # 调到 4m 后 2~4MB 的请求 get_body_data() 能拿到完整内容,bodylog 改为【真截断】到前 2MB,
+    # 比记空串有用。>4m 仍落文件、仍记空串。
+    client_body_buffer_size 4m;
     client_max_body_size    50m;
 
     # stream responses without accumulating — minimize SSE chunk coalescing
