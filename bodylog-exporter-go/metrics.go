@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,12 +60,20 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 	ctr := func(name, help string, labels []string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	}
-	hist := func(name, help string, buckets []float64, labels []string) *prometheus.HistogramVec {
+	// native-only:不传 Buckets。client_golang v1.20.5 histogram.go:563 只有
+	// `len(upperBounds)==0 && NativeHistogramBucketFactor<=1` 才补 DefBuckets,
+	// 这里 factor=1.1>1 → 空 Buckets 即“无经典桶”,不会 fallback(见其 Buckets 字段文档)。
+	// 2026-08-28 去掉经典桶双发,原因:Prometheus CR 开了 scrapeClassicHistograms,
+	// 双发会真被抓进 TSDB —— 实测 bodylog_ttft_seconds_bucket 1540 series vs
+	// native 154 series(12x 膨胀)。现有告警/面板全部是裸名 native 写法
+	// (histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))),
+	// 全库无一处引用 _bucket/_sum/_count,故去掉无影响。
+	// ⚠️ 若将来 Prometheus 关掉 native histogram,这三个直方图会【没有任何桶】。
+	hist := func(name, help string, labels []string) *prometheus.HistogramVec {
 		return prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: name, Help: help,
-			Buckets:                         buckets, // 经典桶:双发,保留兼容/回退(Prometheus 关 native 时仍能用)
-			NativeHistogramBucketFactor:     1.1,     // 指数 native:每桶 ~10% 宽,高分辨率 → p95/p99 更准
-			NativeHistogramMaxBucketNumber:  160,     // 桶数上限,防高基数/异常值撑爆
+			NativeHistogramBucketFactor:     1.1, // 指数 native:每桶 ~10% 宽,高分辨率 → p95/p99 更准
+			NativeHistogramMaxBucketNumber:  160, // 桶数上限,防高基数/异常值撑爆
 			NativeHistogramMinResetDuration: time.Hour,
 		}, labels)
 	}
@@ -78,15 +87,18 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		reqBytes:      ctr("bodylog_req_bytes_total", "请求体字节累计", srbm),
 		respBytes:     ctr("bodylog_resp_bytes_total", "响应体字节累计", srbm),
 		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
-		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300}, []string{"service", "route", "backend", "model", "stream"}),
-		ttft:          hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 3, 5, 10}, srbm),
+		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []string{"service", "route", "backend", "model", "stream"}),
+		// prompt_bucket:输入长度分档,用于“某 context 区间的 TTFT 分位数”。见 promptBucket()。
+		ttft: hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", []string{"service", "route", "backend", "model", "prompt_bucket"}),
 		// 2026-08-26:分母从 rt 改为 rt-frt(扣除 prefill),仅流式 + 下限过滤,与 openresty 引擎
 		// 的 tps_limit_tps 口径对齐。详见 observe() 里的说明。历史数据与新数据不可比。
-		outTokPerSec:  hist("bodylog_output_tok_per_second", "单请求解码速率 completion_tokens/(rt-frt)(tok/s,已扣 prefill;仅流式)", []float64{5, 10, 20, 30, 50, 80, 120, 200, 400}, srbm),
-		lines:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
-		offset:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
-		lastTs:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
-		recovers:      prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
+		// prompt_bucket:同 ttft —— 解码速率同样随 context 变长而下降(KV 越长 attention 越贵),
+		// 分档后才能看出「长输入到底拖慢多少」。见 promptBucket()。
+		outTokPerSec: hist("bodylog_output_tok_per_second", "单请求解码速率 completion_tokens/(rt-frt)(tok/s,已扣 prefill;仅流式)", []string{"service", "route", "backend", "model", "prompt_bucket"}),
+		lines:        prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
+		offset:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
+		lastTs:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
+		recovers:     prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
 	}
 	reg.MustRegister(
 		m.requests, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
@@ -182,7 +194,7 @@ func (m *metrics) observe(d detailRecord) {
 	//    实测 800 条明细里 stream=nil 的无一呈流式形态(frt<0.8*rt),故按非流式处理。
 	// 代价:req_body 未采到的【真流式】请求会漏记 TTFT(样本变少,不会算错);当前为 0 条。
 	if d.Frt > 0 && d.Stream != nil && *d.Stream {
-		m.ttft.WithLabelValues(service, route, backend, model).Observe(d.Frt)
+		m.ttft.WithLabelValues(service, route, backend, model, promptBucket(d.PromptTokens)).Observe(d.Frt)
 	}
 	// 解码速率 = completion_tokens / 解码耗时(rt - frt),**分母必须扣掉 prefill**。
 	// 此前分母用 rt(含 prefill),后果:
@@ -198,7 +210,7 @@ func (m *metrics) observe(d detailRecord) {
 	// ⚠️ 语义变更:改动前后的历史数据不可比,依赖它的告警阈值需要按新口径重定。
 	if d.Stream != nil && *d.Stream && d.CompletionTokens >= 16 {
 		if decode := d.Rt - d.Frt; decode >= 0.5 {
-			m.outTokPerSec.WithLabelValues(service, route, backend, model).
+			m.outTokPerSec.WithLabelValues(service, route, backend, model, promptBucket(d.PromptTokens)).
 				Observe(float64(d.CompletionTokens) / decode)
 		}
 	}
@@ -224,4 +236,60 @@ func parseTsSeconds(candidates ...string) float64 {
 		}
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// prompt_bucket:把 prompt_tokens 落到固定档位,作为 TTFT 直方图的一个 label,
+// 用来回答「某 context 区间内的 TTFT p80/p95」这类问题。
+//
+// 为什么要预先定档(而不是让查询方随便切):Prometheus 是聚合时序库,存不了
+// 「每条请求」。切分维度必须在【写入时】就是 label,查询时只能合并相邻档(变粗),
+// 不能拆分(变细)。所以边界要一次定够。
+//
+// ⚠️ 边界定了就【不要改】:改档位 = 旧 label 值停更、新值从零开始,跨改动点的
+//
+//	histogram_quantile 结果不可信。需要任意区间/任意分位 → 查明细 parquet:
+//	  SELECT quantile_cont(first_chunk_t, 0.8) FROM read_parquet('.../<date>.parquet')
+//	  WHERE prompt_tokens BETWEEN 6144 AND 12288 AND model='...' AND stream;
+//	明细保留 365 天(listener detailsKeepDays),那才是无损的事件存储。
+//
+// 边界选取:1k..1024k 覆盖 K3 的 1M context;含 6/16/32/64/128/256k 等业务关注点,
+// 便于查询时用正则合并,例如 6~16K:
+//
+//	histogram_quantile(0.8, sum(rate(bodylog_ttft_seconds{
+//	  prompt_bucket=~"0006k_0008k|0008k_0010k|0010k_0012k|0012k_0016k"}[5m])))
+//
+// 末档 1024k_inf 是溢出哨兵:正常应为空,非空 = 有请求超过模型 context 上限。
+//
+// 基数:26 档 × 146 srbm 组合 ≈ 3.8k series(native histogram 一条 series 装整个
+// 直方图,不像经典桶按 le 展开)。参照同集群 node_cpu_seconds_total 39.7k、
+// apiserver_request_duration_seconds_bucket 13.4k,量级安全。
+var promptBucketBounds = []int64{
+	1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64,
+	80, 96, 128, 160, 192, 256, 384, 512, 768, 1024,
+}
+
+// promptBucketLabels:与 promptBucketBounds 对应的 label 值,左闭右开 [lo, hi)。
+// 4 位零填充保证 Grafana/PromQL 里【字典序 == 数值序】(否则 "96k" 会排到 "128k" 之后)。
+var promptBucketLabels = func() []string {
+	ls := make([]string, 0, len(promptBucketBounds)+1)
+	lo := int64(0)
+	for _, hi := range promptBucketBounds {
+		ls = append(ls, fmt.Sprintf("%04dk_%04dk", lo, hi))
+		lo = hi
+	}
+	return append(ls, fmt.Sprintf("%04dk_inf", lo))
+}()
+
+// promptBucket 返回 tok 所属档位的 label。按 1024 token = 1k 换算,区间左闭右开。
+// tok<=0(无 usage / 未采到)归入首档,与 promptTok counter 的 >0 过滤口径不同 ——
+// 这里不能丢样本,否则 TTFT 直方图会少掉这批请求。
+func promptBucket(tok int64) string {
+	k := tok / 1024
+	for i, hi := range promptBucketBounds {
+		if k < hi {
+			return promptBucketLabels[i]
+		}
+	}
+	return promptBucketLabels[len(promptBucketLabels)-1]
 }
