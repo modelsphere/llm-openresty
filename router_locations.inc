@@ -17,17 +17,11 @@
     set_real_ip_from unix:;
     real_ip_header    X-Real-IP;
 
-    # client_body_buffer_size 决定 ngx.req.get_body_data() 能读到多大 body —— 超过则 nginx 把
-    # body 写临时文件、get_body_data() 返回 nil,bodylog 拿不到内容(只能标 req_body_truncated,
-    # 内容记成空串,见 lua/bodylog.lua 的 else 分支)。
-    # 2m→4m:与 dispatch(:8080)对齐。副作用是【正向】的 —— 此前 2m 与 _G.bodylog_max_req(2MB)
-    # 正好撞上,使 bodylog 里 `#body > max_req` 的截断分支成为死代码(body 一超 2m 就已经落文件了);
-    # 调到 4m 后 2~4MB 的请求 get_body_data() 能拿到完整内容,bodylog 改为【真截断】到前 2MB,
-    # 比记空串有用。>4m 仍落文件、仍记空串。
-    # max_body 维持 50m,【不】跟 dispatch(:8080)的 10m 一致 —— 两处职责不同:
-    #   · 经 dispatch 进来的流量已被那里的 10m 挡在最外层(与下游 CART 的 10m 对齐,早拒早止损);
-    #   · 这里的 50m 只对【内网直连 per-model 端口】(18082-18086 等)的调用方生效,属既有行为,
-    #     不随本次改动收紧,给那类场景保留余量。
+    # buffer 决定 get_body_data() 能读到多大 body:超过则 nginx 写临时文件、返回 nil,
+    # bodylog 记不到内容(见 lua/bodylog.lua else 分支)。2m→4m 后 2~4MB 的请求能被
+    # bodylog 按 _G.bodylog_max_req 真截断,而非记空串。
+    # max_body 维持 50m:经 dispatch(:8080) 的流量已被那里的 10m 挡住,这里只对内网直连
+    # per-model 端口生效,属既有行为不收紧。
     client_body_buffer_size 4m;
     client_max_body_size    50m;
 

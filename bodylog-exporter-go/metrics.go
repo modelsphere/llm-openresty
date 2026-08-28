@@ -58,24 +58,16 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 	// service = ModelRoute discovery.service(ns/name,用户主聚合维度);route = nginx.route。
 	// 二者都随后端 pod 稳定(pod IP 漂移也不变),补上 bodylog backend/model 缺的 service 归属。
 	srbm := []string{"service", "route", "backend", "model"}
-	// srbmp = srbm + prompt_bucket(ttft / outTokPerSec 用)。
-	// ⚠️ 必须用 slices.Concat,【不要】写 append(srbm, "prompt_bucket"):append 在 cap>len 时
-	//    【原地写入】并返回共享同一底层数组的 slice,多处 append 会互相覆盖(label 名串位)。
-	//    当前 srbm 的 cap==len==4 恰好让 append 重新分配、侥幸安全,但只要有人给 srbm 加元素
-	//    或改成 make([]string,0,N) 就会静默出错。slices.Concat 语义即「返回新切片」,不依赖 cap。
+	// srbmp = srbm + prompt_bucket。用 slices.Concat 而非 append(srbm, ...):append 在 cap>len
+	// 时原地写入并返回共享底层数组的 slice,多处 append 会互相覆盖(当前 cap==len 只是侥幸安全)。
 	srbmp := slices.Concat(srbm, []string{"prompt_bucket"})
 	ctr := func(name, help string, labels []string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	}
-	// native-only:不传 Buckets。client_golang v1.20.5 histogram.go:563 只有
-	// `len(upperBounds)==0 && NativeHistogramBucketFactor<=1` 才补 DefBuckets,
-	// 这里 factor=1.1>1 → 空 Buckets 即“无经典桶”,不会 fallback(见其 Buckets 字段文档)。
-	// 2026-08-28 去掉经典桶双发,原因:Prometheus CR 开了 scrapeClassicHistograms,
-	// 双发会真被抓进 TSDB —— 实测 bodylog_ttft_seconds_bucket 1540 series vs
-	// native 154 series(12x 膨胀)。现有告警/面板全部是裸名 native 写法
-	// (histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))),
-	// 全库无一处引用 _bucket/_sum/_count,故去掉无影响。
-	// ⚠️ 若将来 Prometheus 关掉 native histogram,这三个直方图会【没有任何桶】。
+	// native-only:不传 Buckets 即无经典桶(client_golang 仅在 factor<=1 时才补 DefBuckets)。
+	// 起因:Prometheus 开了 scrapeClassicHistograms,双发会真进 TSDB(实测 12x series 膨胀);
+	// 全库告警/面板都是裸名 native 写法,无一处引用 _bucket/_sum/_count。
+	// ⚠️ 若 Prometheus 关掉 native histogram,这三个直方图将没有任何桶。
 	hist := func(name, help string, labels []string) *prometheus.HistogramVec {
 		return prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: name, Help: help,
@@ -245,32 +237,22 @@ func parseTsSeconds(candidates ...string) float64 {
 	return 0
 }
 
-// ---------------------------------------------------------------------------
-// prompt_bucket:把 prompt_tokens 落到固定档位,作为 TTFT 直方图的一个 label,
-// 用来回答「某 context 区间内的 TTFT p80/p95」这类问题。
+// prompt_bucket:把 prompt_tokens 落到固定档位,作为 TTFT / OTPS 的 label,用于回答
+// 「某 context 区间的 TTFT p80」这类问题。
 //
-// 为什么要预先定档(而不是让查询方随便切):Prometheus 是聚合时序库,存不了
-// 「每条请求」。切分维度必须在【写入时】就是 label,查询时只能合并相邻档(变粗),
-// 不能拆分(变细)。所以边界要一次定够。
+// 为什么必须预先定档:Prometheus 存不了「每条请求」,切分维度必须在写入时就是 label,
+// 查询时只能合并相邻档(变粗)、不能拆分(变细)。
+// ⚠️ 边界上线后【不要改】:改档位 = 旧 label 停更、新值从零、跨改动点的 histogram_quantile
 //
-// ⚠️ 边界定了就【不要改】:改档位 = 旧 label 值停更、新值从零开始,跨改动点的
-//
-//	histogram_quantile 结果不可信。需要任意区间/任意分位 → 查明细 parquet:
+//	不可信。需要任意区间/分位请查明细 parquet(保留 365 天):
 //	  SELECT quantile_cont(first_chunk_t, 0.8) FROM read_parquet('.../<date>.parquet')
-//	  WHERE prompt_tokens BETWEEN 6144 AND 12288 AND model='...' AND stream;
-//	明细保留 365 天(listener detailsKeepDays),那才是无损的事件存储。
+//	  WHERE prompt_tokens BETWEEN 6144 AND 12288 AND stream;
 //
-// 边界选取:1k..1024k 覆盖 K3 的 1M context;含 6/16/32/64/128/256k 等业务关注点,
-// 便于查询时用正则合并,例如 6~16K:
+// 边界含 6/16/32/64/128/256k 等业务关注点,查询时用正则合并,如 6~16K:
 //
-//	histogram_quantile(0.8, sum(rate(bodylog_ttft_seconds{
-//	  prompt_bucket=~"0006k_0008k|0008k_0010k|0010k_0012k|0012k_0016k"}[5m])))
+//	prompt_bucket=~"0006k_0008k|0008k_0010k|0010k_0012k|0012k_0016k"
 //
-// 末档 1024k_inf 是溢出哨兵:正常应为空,非空 = 有请求超过模型 context 上限。
-//
-// 基数:26 档 × 146 srbm 组合 ≈ 3.8k series(native histogram 一条 series 装整个
-// 直方图,不像经典桶按 le 展开)。参照同集群 node_cpu_seconds_total 39.7k、
-// apiserver_request_duration_seconds_bucket 13.4k,量级安全。
+// 末档 1024k_inf 是溢出哨兵(超模型 context 上限)。空档不产生 series,零成本。
 var promptBucketBounds = []int64{
 	1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64,
 	80, 96, 128, 160, 192, 256, 384, 512, 768, 1024,
@@ -288,14 +270,10 @@ var promptBucketLabels = func() []string {
 	return append(ls, fmt.Sprintf("%04dk_inf", lo))
 }()
 
-// promptBucket 返回 tok 所属档位的 label。按 1024 token = 1k 换算,区间左闭右开。
-//
-// tok<=0 归入独立的 "unknown" 档,【不能】混进首档 0000k_0001k:
-// 这批是 usage 缺失的请求 —— 2026-08-28 实测 1911 条中 status={400:1883, 429:27, 200:1}、
-// finish_reason 全为 null,即【失败请求】,压根没做推理,frt 反映的是错误返回耗时,
-// 与「输入长度→TTFT」无关。若混入首档:该档 42% 是这批噪声,把 TTFT p80 从真实的
-// 0.11s 拉到 1.37s(12x 失真),而首档恰是最密集的档(占全部请求 18.9%)。
-// 单列 unknown 而非直接丢弃:样本不丢,且这批本身是有用信号(400/429 突增可观测)。
+// promptBucket 返回 tok 所属档位的 label,按 1024 token = 1k 换算,区间左闭右开。
+// tok<=0 单列 "unknown",【不能】混进首档:这批是 usage 缺失的失败请求(实测 status 多为 400/429、
+// finish_reason 全 null),frt 反映的是错误返回耗时;混入会让首档 42% 是噪声、TTFT p80 从
+// 0.11s 虚高到 1.37s。单列而非丢弃 —— 样本不丢,且 400/429 突增本身是信号。
 func promptBucket(tok int64) string {
 	if tok <= 0 {
 		return "unknown"
