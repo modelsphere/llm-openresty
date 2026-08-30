@@ -17,8 +17,12 @@
     set_real_ip_from unix:;
     real_ip_header    X-Real-IP;
 
-    # allow up to 1m JSON body fully in memory (get_body_data works up to this size)
-    client_body_buffer_size 2m;
+    # buffer 决定 get_body_data() 能读到多大 body:超过则 nginx 写临时文件、返回 nil,
+    # bodylog 记不到内容(见 lua/bodylog.lua else 分支)。2m→4m 后 2~4MB 的请求能被
+    # bodylog 按 _G.bodylog_max_req 真截断,而非记空串。
+    # max_body 维持 50m:经 dispatch(:8080) 的流量已被那里的 10m 挡住,这里只对内网直连
+    # per-model 端口生效,属既有行为不收紧。
+    client_body_buffer_size 4m;
     client_max_body_size    50m;
 
     # stream responses without accumulating — minimize SSE chunk coalescing
