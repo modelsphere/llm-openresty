@@ -162,6 +162,11 @@ type ttftStatusResp struct {
 	EwmaMs map[string]*float64 `json:"ewma_ms"`
 }
 
+// openresty 限流的 reason 全集,与 _429_status 的 by_reason 字段一致。
+// 用于每轮预初始化 counter,让「零 429」表现为恒 0 的曲线而不是空 vector(见 pollOnce)。
+// 新增限流维度时要同步加进来,否则那一维在无事发生时又会退化成空 vector。
+var rejectReasons = []string{"concurrency", "ttft", "tps"}
+
 type rejectStatusResp struct {
 	ByRoute map[string]map[string]float64 `json:"by_route"`
 }
@@ -272,6 +277,25 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			p.pollErr("429_status", "*", err)
 			ok = false
 		} else {
+			// ⚠️ 先把「当前所有 route x 所有 reason」的 series 预初始化成 0。
+			//
+			// 不这么做的话:counter 在第一次 Add 之前【不存在】,而 openresty 只在真发生 429 时
+			// 才往 by_route 里放条目 —— 于是「一次 429 都没有」表现为【空 vector】,与「采集断了」
+			// 完全无法区分(实测 2026-08-31:openresty 重建后 by_route={},该指标整个消失)。
+			// 空 vector 的后果比"值为 0"严重得多:
+			//   - sum()/rate() 套上去仍是空,**不会**变成 0;
+			//   - 基于它的告警表达式返回空 → 永远不触发(不是判为 0 不告警,是根本没值可判);
+			//   - 面板空白,看起来像监控挂了。
+			// 对照:同一次 poll 的 adaptive_cc_rej 是 gauge、每轮 Set(0),所以恒有 series。
+			//
+			// 放在每轮而不是启动时一次:route 是动态发现的,新 route 上线也要补零。
+			// Add(0) 对已存在的 series 无副作用(counter 不倒退),对不存在的则创建出来。
+			for _, route := range routes {
+				service := p.serviceOf(route)
+				for _, reason := range rejectReasons {
+					p.m.rejected.WithLabelValues(service, route, reason).Add(0)
+				}
+			}
 			for route, byReason := range rj.ByRoute {
 				service := p.serviceOf(route)
 				for reason, cur := range byReason {
