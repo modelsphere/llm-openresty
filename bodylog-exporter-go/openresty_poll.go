@@ -290,6 +290,30 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			//
 			// 放在每轮而不是启动时一次:route 是动态发现的,新 route 上线也要补零。
 			// Add(0) 对已存在的 series 无副作用(counter 不倒退),对不存在的则创建出来。
+			//
+			// ── 一个刻意的取舍:route 是【动态】标签,却仍用了「预初始化」这个本该给
+			//    【编译期已知的有限标签】用的手法。不是疏忽,是权衡后的选择,记在这里免得
+			//    下一个人以为是漏了。
+			//
+			// 严格的标准做法是两段叠加:
+			//    reason(3 个值,编译期已知) → 预初始化;
+			//    route (动态发现)          → 只导出当前存在的,消失的用 Delete 摘掉,
+			//                                让 Prometheus 的 staleness 机制生效。
+			// 本代码库对 gauge 正是这么做的(resettable + 每轮 Reset)。counter 不能 Reset
+			// (会破坏单调性),对应手段是 DeleteLabelValues。
+			//
+			// 这里【不做】那一步,因为代价大于收益:
+			//  · 残留的表现只是「一条恒 0 的平线」,当前无任何消费方(告警规则里零引用);
+			//  · 残留有界且自愈 —— client_golang 把子指标常驻内存、会一直导出(实测:停止
+			//    Add 后仍被 Collect,只有 Delete 能摘),但 exporter 随 chart 升级重启即清空;
+			//  · route 极少增删(ModelRoute 是稳定对象,不是 pod);
+			//  · 而 Delete 会在 route 短暂重建(如 MR 先删后建)时丢掉累计值,increase() 跨
+			//    该点少算 —— 为清一条无人看的平线,换来真实数据的不连续,不划算。
+			//  · 另外 refresh() 在 apiserver 出错时【保留上次映射】而不是清空,所以抖动本身
+			//    不会让 route 消失 —— 这也让 Delete 能挽回的场景进一步变窄。
+			//
+			// 【什么时候该回来补上 Delete】:route 变得频繁增删(如按租户动态建 ModelRoute),
+			// 或有告警/扩缩容开始消费本指标 —— 那时恒 0 的平线会变成误导。
 			for _, route := range routes {
 				service := p.serviceOf(route)
 				for _, reason := range rejectReasons {
