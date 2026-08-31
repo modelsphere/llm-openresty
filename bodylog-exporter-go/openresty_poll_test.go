@@ -87,3 +87,61 @@ func TestPollerServiceUnknown(t *testing.T) {
 		t.Errorf("svcFn=nil 时 rejected{service=unknown,reason=ttft} = %v, 想要 2", v)
 	}
 }
+
+// 零 429 时,openresty_rejected_total 必须仍有 series(值 0),不能是空 vector。
+//
+// 回归的是一个真实故障(2026-08-31):openresty pod 重建后 _429_status 的 by_route 变成 {},
+// exporter 只遍历 by_route → 一次 Add 都不调 → counter 在第一次 Add 前【不存在】→ 整个指标
+// 从 Prometheus 消失。而空 vector 与「限流为 0」无法区分,后果比"值为 0"严重得多:
+// sum()/rate() 套上去仍是空(不会变成 0),基于它的告警表达式返回空 → 永远不触发。
+func TestPollerRejectedZeroInitialized(t *testing.T) {
+	// by_route 为空 = 从未发生过 429,正是故障当时的现场
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/r1/_route_state":
+			_, _ = w.Write([]byte(`{"route":"r1","active_level":2,"limit":100,"healthy_peers_in_level":1,"by_priority":{}}`))
+		case "/r1/_tps_status":
+			_, _ = w.Write([]byte(`{"active":true,"ewma_tps":{"_":1.0}}`))
+		case "/r1/_ttft_status":
+			_, _ = w.Write([]byte(`{"active":false,"ewma_ms":{"_":1.0}}`))
+		case "/r1/_429_status":
+			_, _ = w.Write([]byte(`{"by_route":{}}`)) // ← 空
+		default:
+			t.Errorf("未预期路径: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	reg := prometheus.NewRegistry()
+	m := newORMetrics(reg)
+	p := newTestPoller(srv, m, func(string) string { return "ns/svc" })
+	p.pollOnce(context.Background())
+
+	if n := testutil.CollectAndCount(m.rejected); n != len(rejectReasons) {
+		t.Fatalf("rejected series 数 = %d, 想要 %d(每个 reason 一条,值 0)", n, len(rejectReasons))
+	}
+	for _, reason := range rejectReasons {
+		if v := testutil.ToFloat64(m.rejected.WithLabelValues("ns/svc", "r1", reason)); v != 0 {
+			t.Errorf("reason=%s 的值 = %v, 想要 0", reason, v)
+		}
+	}
+}
+
+// 预初始化不能把真实计数抹掉:有 429 时仍应累加出正确的值。
+func TestPollerRejectedStillCounts(t *testing.T) {
+	srv := newMockOpenresty(t)
+	defer srv.Close()
+
+	reg := prometheus.NewRegistry()
+	m := newORMetrics(reg)
+	p := newTestPoller(srv, m, func(string) string { return "ns/svc" })
+	p.pollOnce(context.Background())
+
+	// mock 返回 concurrency=10 / tps=0 / ttft=2
+	for reason, want := range map[string]float64{"concurrency": 10, "tps": 0, "ttft": 2} {
+		if v := testutil.ToFloat64(m.rejected.WithLabelValues("ns/svc", "r1", reason)); v != want {
+			t.Errorf("reason=%s 的值 = %v, 想要 %v", reason, v, want)
+		}
+	}
+}

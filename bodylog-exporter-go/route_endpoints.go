@@ -53,10 +53,10 @@ type podRouteResolver struct {
 	routes []string             // poll 用的 route 列表(按 nginxService 过滤 + 去重排序)
 	svc    map[string]string    // route → discovery.service(poll 打 service label 用,含所有 route)
 
-	up            prometheus.Gauge
-	pods          prometheus.Gauge
-	routesG       prometheus.Gauge
-	errs          prometheus.Counter
+	up              prometheus.Gauge
+	pods            prometheus.Gauge
+	routesG         prometheus.Gauge
+	errs            prometheus.Counter
 	replicas        *prometheus.GaugeVec // {service, route} → 后端 pod 总数(含未就绪)
 	replicasReady   *prometheus.GaugeVec // {service, route} → 就绪后端 pod 数
 	replicasDesired *prometheus.GaugeVec // {service, route} → 期望副本数(工作负载 spec.replicas)
