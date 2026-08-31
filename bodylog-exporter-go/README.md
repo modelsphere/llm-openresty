@@ -27,9 +27,38 @@
 | `bodylog_req_bytes_total` | counter | — | 请求体字节累计 |
 | `bodylog_resp_bytes_total` | counter | — | 响应体字节累计 |
 | `bodylog_finish_reason_total` | counter | `finish_reason` | 按停止原因计数 |
-| `bodylog_rt_seconds` | **histogram** | `stream` | 总响应时间(秒);桶 `0.1 .25 .5 1 2 5 10 20 30 60 120 300` |
-| `bodylog_ttft_seconds` | **histogram** | — | 首 token 时间/TTFT(秒,**仅流式**);桶 `.05 .1 .2 .5 1 2 3 5 10` |
-| `bodylog_output_tok_per_second` | **histogram** | — | **单请求生成速率** `completion_tokens/rt`(tok/s);桶 `5 10 20 30 50 80 120 200 400` |
+| `bodylog_rt_seconds` | **histogram**(native-only) | `stream` | 总响应时间(秒) |
+| `bodylog_ttft_seconds` | **histogram**(native-only) | **`prompt_bucket`** | 首 token 时间/TTFT(秒,**仅流式**) |
+| `bodylog_output_tok_per_second` | **histogram**(native-only) | **`prompt_bucket`** | **单请求解码速率** `completion_tokens/(rt-frt)`(tok/s,**已扣 prefill**;仅流式,且 `ctok>=16` + 解码时长 `>=0.5s`) |
+
+> **⚠️ 2026-08-31(exporter 0.2.0)起,三个 histogram 改为 native-only** —— 不再双发经典桶,
+> `bodylog_*_bucket` / `_sum` / `_count` 这些 series **不再产生**。求分位数必须用**裸名、不带 `le`**:
+> `histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`。
+> 起因:Prometheus 侧开了 `scrapeClassicHistograms`,双发会真被抓进 TSDB(实测 12x series 膨胀)。
+
+#### `prompt_bucket`:按输入长度分档(ttft / output_tok_per_second)
+
+回答「某 context 区间的 TTFT p80」这类问题。**26 档 + `unknown`**,左闭右开,4 位零填充保证字典序 == 数值序:
+
+```
+0000k_0001k 0001k_0002k 0002k_0003k 0003k_0004k 0004k_0006k 0006k_0008k
+0008k_0010k 0010k_0012k 0012k_0016k 0016k_0020k 0020k_0024k 0024k_0032k
+0032k_0040k 0040k_0048k 0048k_0064k 0064k_0080k 0080k_0096k 0096k_0128k
+0128k_0160k 0160k_0192k 0192k_0256k 0256k_0384k 0384k_0512k 0512k_0768k
+0768k_1024k 1024k_inf   unknown
+```
+
+- 边界含 6/16/32/64/128/256k 等业务关注点,查询时用正则**合并相邻档**(只能变粗、不能变细):
+  ```promql
+  # 6~16K 输入的 TTFT p80
+  histogram_quantile(0.8, sum(rate(bodylog_ttft_seconds{
+    model="kimi-k2.5", prompt_bucket=~"0006k_0008k|0008k_0010k|0010k_0012k|0012k_0016k"}[5m])))
+  ```
+- **`unknown`** = `prompt_tokens<=0`(usage 缺失)。实测这批多是 `status` 400/429 的**失败请求**,
+  `frt` 反映的是错误返回耗时,与输入长度无关 —— 单列出来避免污染首档(混入会让首档 TTFT p80 从 0.11s 虚高到 1.37s)。
+- `1024k_inf` 是溢出哨兵(超模型 context 上限),正常应为空。空档不产生 series,零成本。
+- ⚠️ **档位边界上线后不可再改**:改档位 = 旧 label 停更、新值从零、跨改动点的 `histogram_quantile` 不可信。
+  需要任意区间/任意分位 → 查明细 parquet(保留 365 天),见 `metrics.go` 注释里的 DuckDB 示例。
 
 ### 服务副本数(富化,维度 `service` / `route`)
 
@@ -92,6 +121,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 - **`status_class`**:`2xx` / `4xx` / `5xx` / `other`(429 归 `4xx`;精确 429 分 reason 见 `openresty_rejected_total`)。
 - **`stream`**:`true` / `false` / `unknown`(请求未声明 stream 时)。
 - **`finish_reason`**:停止原因串(如 `stop`/`length`/`tool_calls`);为空不计。
+- **`prompt_bucket`**:输入长度档位(仅 `bodylog_ttft_seconds` / `bodylog_output_tok_per_second`)。取值见上方档位表;`prompt_tokens<=0` → `unknown`。
 
 ### 富化:podIP→service/route(单一发现器)
 
@@ -265,9 +295,9 @@ git tag exporter/v0.2.0 && git push origin exporter/v0.2.0
 sum by(service)(rate(bodylog_requests_total{backend!="(none)"}[1m]))
 sum by(service)(rate(bodylog_completion_tokens_total[1m]))
 
-# 每 service TTFT p95 / RT p95(秒)—— histogram 先按 (service,le) 聚合
-histogram_quantile(0.95, sum by(service,le)(rate(bodylog_ttft_seconds_bucket[5m])))
-histogram_quantile(0.95, sum by(service,le)(rate(bodylog_rt_seconds_bucket[5m])))
+# 每 service TTFT p95 / RT p95(秒)—— native histogram:裸名、不带 _bucket/le
+histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))
+histogram_quantile(0.95, sum by(service)(rate(bodylog_rt_seconds[5m])))
 
 # 每 service 错误率
 sum by(service)(rate(bodylog_requests_total{status_class=~"4xx|5xx",backend!="(none)"}[5m]))
@@ -282,7 +312,7 @@ sum by(service)(rate(openresty_rejected_total[1m]))
 sum by(service,reason)(rate(openresty_rejected_total[1m]))
 
 # 单请求生成速率 p50(每条请求 completion/rt 的分布)
-histogram_quantile(0.5, sum by(service,le)(rate(bodylog_output_tok_per_second_bucket[5m])))
+histogram_quantile(0.5, sum by(service)(rate(bodylog_output_tok_per_second[5m])))
 
 # 更细:某 service 下每个 backend(pod)QPS —— pod 扩缩时按 service 聚合更稳
 sum by(backend)(rate(bodylog_requests_total{service="model-service/fallback-model-service-01"}[1m]))
@@ -291,7 +321,9 @@ sum by(backend)(rate(bodylog_requests_total{service="model-service/fallback-mode
 time() - bodylog_exporter_last_ts_seconds
 ```
 
-> histogram 是**双发**(经典桶 `_bucket`/`le` + native 指数桶)。经典查询到处可用;若 Prometheus 开了 native 且需要更准 p99,可用不带 `_bucket`/`le` 的形式:`histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`。用哪种先在 Prometheus 里查 `count(<metric>_bucket)`(经典在)/ `<metric>`(裸名返回 histogram 型=native 在)。
+> histogram 为 **native-only**(2026-08-31 起,exporter 0.2.0):不再双发经典桶,`_bucket`/`_sum`/`_count` 不再产生。
+> 分位数用裸名:`histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`;
+> 均值用 `histogram_sum(...)/histogram_count(...)`。⚠️ 前提是 Prometheus 侧支持 native histogram —— 若关闭,这三个直方图将没有任何桶。
 
 ### 自动扩缩容(LLMScaler `metrics` 片段)
 
@@ -301,7 +333,7 @@ metrics:
     query: 'avg(sum by(backend)(rate(bodylog_requests_total{model="qwen",backend!="(none)"}[1m])))'
     target: "<单 pod QPS 预算>"
   - name: ttft-p95           # 饱和护栏,NaN 兜底 0
-    query: 'histogram_quantile(0.95, sum by(le)(rate(bodylog_ttft_seconds_bucket{model="qwen"}[2m]))) or vector(0)'
+    query: 'histogram_quantile(0.95, sum(rate(bodylog_ttft_seconds{model="qwen"}[2m]))) or vector(0)'
     target: "2"
 ```
 
