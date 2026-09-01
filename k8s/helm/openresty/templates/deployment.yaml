@@ -34,10 +34,18 @@ spec:
         - name: openresty
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.bodylog.host }}
-          env:                                  # bodylog-listener 地址(openresty 发帧目标);空则用镜像默认(生产 gateway-host)
+          {{- if or .Values.bodylog.host .Values.slo.enabled }}
+          env:
+            {{- if .Values.bodylog.host }}
+            # bodylog-listener 地址(openresty 发帧目标);空则用镜像默认(生产 gateway-host)
             - { name: BODYLOG_LISTENER_HOST, value: {{ .Values.bodylog.host | quote }} }
             - { name: BODYLOG_LISTENER_PORT, value: {{ .Values.bodylog.port | quote }} }
+            {{- end }}
+            {{- if .Values.slo.enabled }}
+            # SLO_CONFIG_PATH 未设 = 引擎不起 loader、全部用静态阈值(裸机 ts24/ts31/gw10 就是这样)。
+            # 设了才会去读 CRD 下发的 slo.json。
+            - { name: SLO_CONFIG_PATH, value: "{{ .Values.slo.mountPath }}/{{ .Values.slo.key }}" }
+            {{- end }}
           {{- end }}
           {{- if gt (int .Values.preStop.sleepSeconds) 0 }}
           lifecycle:
@@ -54,6 +62,14 @@ spec:
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
             - name: route-sock                                                # 路径路由 dispatch 的 unix socket(与 reload 共享,供清孤儿)
               mountPath: /usr/local/openresty/nginx/sock
+            {{- if .Values.slo.enabled }}
+            # ⚠️ SLO 用【独立的 volume + mountPath】,绝不能挂进 reload sidecar 的 /watch ——
+            #    那个目录一变 sidecar 就 SIGHUP nginx。挂错了每次改 SLO 阈值都会连带一次 reload,
+            #    「免 reload 下发」的整个设计就白做了。引擎侧靠 timer 读文件,不需要 reload。
+            - name: slo
+              mountPath: {{ .Values.slo.mountPath }}
+              readOnly: true
+            {{- end }}
           {{- if .Values.probes.enabled }}
           startupProbe:                     # 慢启动预算:admin 口 /healthz 起来前不判 live/ready(最多 ~60s)
             httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
@@ -97,6 +113,12 @@ spec:
             name: {{ .Values.configMapName }}
         - name: route-sock                     # 路径路由 dispatch unix socket(emptyDir,per-pod;openresty 建、reload 清孤儿)
           emptyDir: {}
+        {{- if .Values.slo.enabled }}
+        - name: slo                            # CRD 下发的 SLO(autoconfig 写);optional=CM 还没建也能起
+          configMap:
+            name: {{ .Values.slo.configMapName }}
+            optional: true
+        {{- end }}
       {{- if or .Values.affinity .Values.ha.enabled }}
       affinity:
         {{- if .Values.affinity }}

@@ -76,6 +76,20 @@ fullnameOverride: ""
 # 故指向其 in-cluster Service。host 空=用镜像默认(session_base.conf 的 os.getenv or "10.0.0.1" 主集群生产)。
 # ⚠️ 必须用【完整 FQDN】(bodylog.<ns>.svc.cluster.local):nginx cosocket resolver 不套 search 域,
 #    裸 Service 名(bodylog / bodylog.llm-route.svc)解析不了 → 帧静默丢(2026-08-18 迁移时踩过)。
+# SLO:autoconfig 把 LLMSLORequirement(inference.x-k8s.io)翻译成 slo.json 写进这个 ConfigMap,
+# openresty 的 loader timer 每几秒读一次 → 限流阈值/分位数免 reload 生效。
+# enabled=false(默认)= 不挂、不设 SLO_CONFIG_PATH → 引擎不起 loader,全部用 conf 里的静态阈值。
+#
+# ⚠️ 这个 ConfigMap 用【独立 volume】挂在 mountPath,**绝不能是 reload sidecar 的 /watch**
+#    —— 挂进去每次 SLO 变更都会触发一次 openresty reload,免 reload 的意义就没了。
+# ConfigMap 本体不由本 chart 创建(autoconfig 只更新不创建),需另行建好;
+# volume 用 optional:true,所以 CM 还没建时 pod 照样能起(引擎读不到文件 → 回落静态)。
+slo:
+  enabled: false
+  configMapName: openresty-slo
+  key: slo.json
+  mountPath: /etc/openresty/slo
+
 bodylog:
   host: "bodylog.llm-route.svc.cluster.local"  # in-cluster bodylog(llm-route);FQDN 必须(nginx resolver 需要)
   port: 9999
