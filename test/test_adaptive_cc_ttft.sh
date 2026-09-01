@@ -54,6 +54,14 @@ http {
         local a = ngx.req.get_uri_args(); local rt = a.route or "r"
         local ts = ngx.shared.ttft_stat; local tp = ngx.shared.tps_stat
         local o  = _G.__route_opts[rt]
+        -- 路由未注册时 o 为 nil,ttft_ewma_key 会在 opts.route_name 上抛错 → 一个难懂的 500。
+        -- 本 harness 的两条路由是 init 期 eager 注册的,所以现在不会命中;显式挡一道是为了
+        -- 将来改成懒注册(per-model conf 那种 set_by_lua 首请求注册)时给出明确的失败。
+        if not o then
+            ngx.status = 500
+            ngx.say("route not registered: ", rt)
+            return
+        end
         local ttft_m = require "ttft"; local tps_m = require "tps"
         if a.ttft then ts:set(ttft_m.ttft_ewma_key(o, false, "p80"), tonumber(a.ttft), 60) end
         if a.tps  then tp:set(tps_m.tps_ewma_key(o, false, "p80"),  tonumber(a.tps),  60) end
