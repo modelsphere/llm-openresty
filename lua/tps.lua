@@ -17,11 +17,13 @@ local util = require "util"
 
 function M.tps_dict_if_on(opts)
     if not _G.TPS_ENABLED then return nil end
-    -- ⚠️ 这行**曾经**是 opt-in 闸门(没配下限 = 整特性对本路由关)。2026-08-25 给 _G.TPS_LIMIT_TPS
-    --    设了全局默认 20 之后,register_route 会把它填进每条路由 → 这里几乎恒为真,**不再是闸门**。
-    --    现在真正能关掉本特性的只剩:_G.TPS_ENABLED=false(全局)、/_tps_toggle?on=0(每路由热关)、
-    --    或显式把 factory 的 tps_limit_tps 设为 false/nil 并同时清掉全局默认。保留这行是兜底。
-    if not opts.tps_limit_tps then return nil end
+    -- opt-in 闸门:两种声明方式**任一**都算开启 —— 静态下限 tps_limit_tps,或多指标表 tps_metrics。
+    -- ⚠️ 这里必须认 tps_metrics:否则「只配 tps_metrics 不配 tps_limit_tps」会让整条 TPS 链路
+    --    (采样/判定/AIMD)静默短路,指标表写了等于没写,而且不报错。
+    -- ⚠️ 另注:2026-08-25 给 _G.TPS_LIMIT_TPS 设了全局默认 20 后,register_route 会把它填进每条
+    --    路由 → 本行几乎恒为真、**实际不再是闸门**。真正能关掉本特性的只剩 _G.TPS_ENABLED=false、
+    --    /_tps_toggle?on=0,或显式把 tps_limit_tps 设 false 并同时清掉全局默认。保留是兜底。
+    if not (opts.tps_limit_tps or opts.tps_metrics) then return nil end
     local td = ngx.shared[opts.tps_dict]
     if not td then return nil end
     if td:get((opts.route_name or "?") .. ":__off") then return nil end
@@ -49,7 +51,7 @@ end
 
 -- 解析本请求该用的 TPS 下限(tokens/sec):override > tps_limit_by_model[model] > opts.tps_limit_tps。
 -- model 显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model —— 与 tps_key_prefix 一致。
--- 在线 override(见 /_tps_limit)。抽出来的理由同 ttft_override_for:它在优先级链里压过声明表。
+-- 在线 override(见 /_tps_limit)。注意它在链里**排在声明表之后**(见 ttft_metrics 的注释)。
 function M.tps_override_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -62,7 +64,7 @@ function M.tps_override_for(opts, model)
     return td:get((opts.route_name or "?") .. ":limit_override")
 end
 
--- 只看静态那一段(不查 override、不查声明表)。理由同 ttft_static_limit_for。
+-- 只看静态那一段(不查 override、不查声明表)。用途同 ttft_static_limit_for。
 function M.tps_static_limit_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -74,54 +76,52 @@ function M.tps_static_limit_for(opts, model)
     return opts.tps_limit_tps
 end
 
-function M.tps_limit_for(opts, model)
-    local m = model
-    if m == nil then m = ngx.ctx.req_model end
-    local ovr = M.tps_override_for(opts, m)
-    if ovr then return ovr end
-    return M.tps_static_limit_for(opts, m)
-end
+-- (原 M.tps_limit_for 已删,理由同 ttft.lua 里 ttft_limit_for 的说明:
+--  顺序与重排后的优先级链不符,且已无调用者。用 M.tps_metrics 取生效值。)
 
--- 本路由/模型生效的指标列表。与 ttft_metrics 同构,唯一差别是 **q 的方向**:
--- OTPS 的 `p80` = 「80% 请求 OTPS ≥ threshold」→ 要取分布的**低尾 P20** → q = 0.2。
+-- 本路由/模型生效的指标列表。与 ttft_metrics 同构(含优先级顺序与其中的取舍,见那边的注释),
+-- 唯一差别是 **q 的方向**:OTPS 的 `p80` = 「80% 请求 OTPS ≥ threshold」→ 取分布的**低尾 P20** → q = 0.2。
 -- (TTFT 的 `p80` = 「80% 请求 ≤ threshold」→ 取高尾 P80 → q = 0.8。)
 -- 方向换算由写指标表的一方做,util.window_stat 只认「取第 q 分位」这一个原语。
 -- q 写字面量 0.2,不写 1-0.8(= 0.19999999999999996)—— 纯卫生,实测不影响判定。
--- 优先级链同 ttft_metrics:override > 声明表 > 静态 > _G;第二返回值是来源。
 function M.tps_metrics(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
+    if opts.tps_metrics then return opts.tps_metrics, "declared" end
     local ovr = M.tps_override_for(opts, m)
     if ovr then return { { metric = "p80", q = 0.2, threshold = ovr } }, "override" end
-    return M.tps_metrics_beneath(opts, m)
+    return { { metric = "p80", q = 0.2, threshold = M.tps_static_limit_for(opts, m) } }, "static"
 end
 
--- 优先级链去掉 override 那一层。只给 /_tps_status 用,同 ttft_metrics_beneath。
--- opts.tps_metrics 的 q 已是**低尾方向**(otps p80 → q=0.2),换算由写表的一方做。
-function M.tps_metrics_beneath(opts, model)
-    local m = model
-    if m == nil then m = ngx.ctx.req_model end
-    if opts.tps_metrics then return opts.tps_metrics, "declared" end
-    return { { metric = "p80", q = 0.2, threshold = M.tps_static_limit_for(opts, m) } }, "static"
+-- 同 ttft_override_effective:声明了指标表时 override 被压住。
+-- 同 ttft_override_effective:从来源推导,不复制优先级判断。
+function M.tps_override_effective(opts, model)
+    local _, src = M.tps_metrics(opts, model)
+    return src == "override"
 end
 
 -- 违约判定(access 的 TPS-429 与 timers 的 AIMD 共用)。方向与 TTFT 相反:EWMA **低于**下限才是过载。
 -- ⚠️ strict 参数保留一个**既有的不对称**,不要"顺手统一":
 --     access.lua 用 `<=`(strict=false,默认),timers.lua 的 AIMD 用 `<`(strict=true)。
 --     两者本来就不同,统一会改变边界行为(ewma 恰等于阈值时)。
+-- 返回的 has_threshold = 「本路由/模型到底有没有可判定的阈值」,供 timers 的 AIMD 当门用。
+-- 由**这里**产出而不是让调用方另外解析一次:阈值来源现在有三层(override / 指标表 / 静态),
+-- 调用方各自再解析一遍必然口径分叉 —— timers 以前就是拿 tps_limit_for(只看静态+override)当门,
+-- 于是「只声明了 tps_metrics」的路由会 ta.hit=true 却整段 AIMD 被跳过。
 function M.tps_assess(opts, td, model, strict)
     local ms = M.tps_metrics(opts, model)
-    local first
+    local first, has_thr
     for i, mt in ipairs(ms) do
         local ew = td:get(M.tps_ewma_key(opts, model, mt.metric))
         if i == 1 then first = ew end
+        if mt.threshold then has_thr = true end
         if ew and mt.threshold
            and ((strict and ew < mt.threshold) or ((not strict) and ew <= mt.threshold)) then
-            return { ewma = first, hit = true,
+            return { ewma = first, hit = true, has_threshold = true,
                      hit_ewma = ew, hit_limit = mt.threshold, hit_metric = mt.metric }
         end
     end
-    return { ewma = first, hit = false }
+    return { ewma = first, hit = false, has_threshold = has_thr }
 end
 
 -- 样本(tokens/sec) → 直方图桶号(1..#buckets+1,最后一个是 overflow)。同 ttft_bucket_index。

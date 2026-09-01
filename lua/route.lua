@@ -68,6 +68,12 @@ function _G.register_route(name, opts_factory)
     -- 可以是外部工具渲染的,也可以在 conf 里手写 —— 对引擎完全等价。
     -- 在这里校验一次(每 reload 一次),而不是每请求校验:热路径上只读已经过关的表。
     -- 不合法 → 置 nil 回落静态,不让整条路由注册失败(阈值配错不该断流)。
+    --
+    -- ⚠️⚠️ **这两行必须早于所有读 opts.*_metrics 的代码**,顺序有语义:
+    --   下面的 adaptive_cc 闸门(`opts.tps_limit_tps or opts.tps_metrics`)以及运行时的
+    --   tps_dict_if_on 都拿它当「有没有声明」的依据。若校验被挪到闸门之后,一张非法的
+    --   tps_metrics(如 q=1.5)会把 AIMD 打开,而判定时它已被丢弃 → has_threshold 为 nil
+    --   → AIMD 每 tick 空转,cc 靠 TTL 老化到 min,静默降容量且无告警。
     opts.ttft_metrics = util.validate_metrics(opts.ttft_metrics, "ttft", name)
     opts.tps_metrics  = util.validate_metrics(opts.tps_metrics,  "tps",  name)
     -- 新格式 peers_by_model：按 model 分组的子池。把 opts.peers 建成所有子池的并集
@@ -216,9 +222,12 @@ function _G.register_route(name, opts_factory)
     -- adaptive_cc=true 时:复用 TPS EWMA 当反馈信号,每 adaptive_cc_interval 调一次池并发上限——
     --   EWMA < 阈值(tps_limit_tps/by_model/override)→ ×dec(减);>= → ×inc(增);clamp 在 [min,静态max]。
     --   max=运行时静态 limit(不配);min 不配则按 model 从静态 max 派生(×min_frac)。开了则跳过 TPS-429。
-    -- 默认模式:配了 tps_limit_tps 且未显式指定 adaptive_cc → 按全局 _G.ADAPTIVE_CC_DEFAULT 定(默认 true=自适应)。
-    -- 显式 adaptive_cc=false → 硬熔断;显式 true → 自适应。没配 tps_limit_tps → 保持 nil(无 tps 限流)。
-    if opts.adaptive_cc == nil and opts.tps_limit_tps then
+    -- 默认模式:声明了 OTPS 阈值(静态 tps_limit_tps **或**多指标表 tps_metrics)且未显式指定
+    -- adaptive_cc → 按全局 _G.ADAPTIVE_CC_DEFAULT 定(默认 true=自适应)。
+    -- 显式 adaptive_cc=false → 硬熔断;显式 true → 自适应。两种都没声明 → 保持 nil(无 tps 限流)。
+    -- ⚠️ 必须与 tps.tps_dict_if_on 的闸门口径一致:一处认 tps_metrics 另一处不认的话,
+    --    「只配 tps_metrics」的路由会走进硬 429 而不是 AIMD,与配了静态阈值的路由行为不一致。
+    if opts.adaptive_cc == nil and (opts.tps_limit_tps or opts.tps_metrics) then
         opts.adaptive_cc = _G.ADAPTIVE_CC_DEFAULT and true or nil
     elseif opts.adaptive_cc == false then
         opts.adaptive_cc = nil                                       -- 显式关 = 走硬熔断(与"未开"同路径)

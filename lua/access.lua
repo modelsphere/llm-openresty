@@ -168,6 +168,8 @@ function _G.do_route(opts)
     local hit_ttft   = a.ttft_hit and a.ttft_hit.hit
     local ttft_ewma  = hit_ttft and a.ttft_hit.hit_ewma  or a.ttft_ewma
     local ttft_limit = hit_ttft and a.ttft_hit.hit_limit or nil
+    -- 触发的是哪条指标。多指标(OR)时,光看 ttft_limit 只能反推,两条阈值相同就完全分不出来。
+    local ttft_metric = hit_ttft and a.ttft_hit.hit_metric or "-"
     -- ttft_429_disabled:独立开关关掉硬 429(EWMA 测量 + cc 收缩仍在),TTFT 高只软控不硬拒。
     if hit_ttft and not is_probe and not ttft.ttft_429_disabled(opts) and not ttft.ttft_allow_probe(opts) then
         ngx.status = 429
@@ -175,8 +177,10 @@ function _G.do_route(opts)
         ngx.header["Content-Type"] = "application/json"
         ngx.header["Retry-After"]  = "1"
         ngx.say(string.format(
-            [[{"error":"ttft limit exceeded","trigger":"ttft_ewma","ttft_ewma":%.1f,"ttft_limit":%d,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s"}]],
-            ttft_ewma, ttft_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name))
+            -- metric **追加在末尾**,不插中间:遵循「只增字段,不改名、不删、不重排」——
+            -- 429 body 是对外契约,虽然没有测试断言精确形状,但下游可能按位置解析。
+            [[{"error":"ttft limit exceeded","trigger":"ttft_ewma","ttft_ewma":%.1f,"ttft_limit":%d,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s","metric":"%s"}]],
+            ttft_ewma, ttft_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name, ttft_metric))
         return ngx.exit(429)
     end
     -- ── TPS 主限流(opt-in:tps_limit_tps 未配 → tps_dict_if_on nil → a.tps_ewma nil → 跳过)──
@@ -186,14 +190,15 @@ function _G.do_route(opts)
     local hit_tps   = (not opts.adaptive_cc) and a.tps_hit and a.tps_hit.hit
     local tps_ewma  = hit_tps and a.tps_hit.hit_ewma  or a.tps_ewma
     local tps_limit = hit_tps and a.tps_hit.hit_limit or nil
+    local tps_metric = hit_tps and a.tps_hit.hit_metric or "-"   -- 同 TTFT:多指标时指出触发那一条
     if hit_tps and not is_probe and not tps.tps_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":tps",1,0) end end
         ngx.header["Content-Type"] = "application/json"
         ngx.header["Retry-After"]  = "1"
         ngx.say(string.format(
-            [[{"error":"tps limit exceeded","trigger":"tps_ewma","tps_ewma":%.1f,"tps_limit":%.1f,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s"}]],
-            tps_ewma, tps_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name))
+            [[{"error":"tps limit exceeded","trigger":"tps_ewma","tps_ewma":%.1f,"tps_limit":%.1f,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s","metric":"%s"}]],
+            tps_ewma, tps_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name, tps_metric))
         return ngx.exit(429)
     end
     -- 通过容量后才做带锁选址(与 dbg 共用 pick_from)

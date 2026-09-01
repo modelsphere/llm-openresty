@@ -153,12 +153,6 @@ function M.do_adaptive_cc_loop(opts)
     local CC_TTL = opts.adaptive_cc_ttl
     local rname = opts.route_name or "?"
 
-    -- 解析某 model 的 TPS 阈值(override > by_model > route)。以前这里手抄了一份 tps_limit_for,
-    -- 现在直接调 helper 传显式 model(timer 无 ngx.ctx)—— 逻辑等价,且不会再各自漂移。
-    local function thr_for(model)
-        return tps.tps_limit_for(opts, model)
-    end
-
     -- TTFT 过载信号(方案②):后端首 token 慢(TTFT EWMA 超阈值)也算过载 → 让 cc 收。
     -- 只对开了 TTFT 限流的路由生效(TTFT_ENABLED + ttft_dict + 未热关 + 有 limit),否则返 false →
     -- 行为与纯 TPS adaptive_cc 完全一致(向后兼容)。timer 无 ngx.ctx,用显式 model 构造 key/阈值,
@@ -189,10 +183,11 @@ function M.do_adaptive_cc_loop(opts)
         local maxcc = route.compute_static_max_cc(opts, model)
         if maxcc <= 0 then return end
         local mincc = route.derive_mincc(opts, maxcc)
-        -- ⚠️ 这里**只用来判断"本路由到底有没有阈值"**,不再参与比较 —— 过载判定已经走
-        --    ta.hit(tps_assess 遍历声明的指标列表做 OR)和 ttft_over。名字写成 has_threshold
-        --    以免误以为下面还在拿它跟 EWMA 比。
-        local has_threshold = thr_for(model) ~= nil
+        -- ⚠️ 只用来判断"本路由到底有没有可判定的阈值",不参与比较 —— 过载判定走 ta.hit
+        --    (tps_assess 遍历声明的指标列表做 OR)和 ttft_over。
+        -- 取自 tps_assess 而不是 thr_for:后者只看「静态 + override」,漏掉指标表 →
+        --    「只声明了 tps_metrics」的路由会 ta.hit=true 却整段 AIMD 被跳过(静默冻结 cc)。
+        local has_threshold = ta.has_threshold
         local cur = td:get(pre .. "adaptive_cc") or mincc   -- 首次/过期 → 从 min 起步(慢启动,健康则 ×inc 爬升)
         -- 修复1:读+清零本区间被压抑需求(并发 429 数)。>0 = 需求超过 cc、被拒的量 rt_sum 看不到。
         local rej = td:get(pre .. "rej") or 0

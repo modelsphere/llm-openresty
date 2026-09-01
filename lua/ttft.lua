@@ -54,7 +54,7 @@ end
 -- model 同 ttft_key_prefix:显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model。
 -- 在线 override(共享字典,跨 worker 一致;免 reload,见 /_ttft_limit)。
 --   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)。
--- 单独抽出来是因为它在优先级链里**压过声明表** —— 线上出事时能立刻手工压住。
+-- 单独抽出来供 /_ttft_limit 展示与 ttft_metrics 使用;注意它在链里**排在声明表之后**。
 function M.ttft_override_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -67,8 +67,8 @@ function M.ttft_override_for(opts, model)
     return td:get((opts.route_name or "?") .. ":limit_override")
 end
 
--- 只看静态那一段(不查 override、不查声明表)。抽出来是为了让「被 override 遮住的
--- 底下是什么」可算 —— 若直接复用 ttft_limit_for,override 在时会把自己再返回一遍。
+-- 只看静态那一段(不查 override、不查声明表):ttft_metrics 的 static 分支用它,
+-- 端点的 shadowed_limit_ms(override 生效时报出它盖住的静态值)也用它。
 function M.ttft_static_limit_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -80,43 +80,48 @@ function M.ttft_static_limit_for(opts, model)
     return opts.ttft_limit_ms
 end
 
-function M.ttft_limit_for(opts, model)
-    local m = model
-    if m == nil then m = ngx.ctx.req_model end
-    local ovr = M.ttft_override_for(opts, m)
-    if ovr then return ovr end
-    return M.ttft_static_limit_for(opts, m)
-end
+-- (原 M.ttft_limit_for 已删:它的顺序是 override > static,与重排后的
+--  declared > override > static **不一致**,对声明了指标表的路由会返回错误的"生效阈值"。
+--  重构后它已无调用者 —— 一个没人用、所以没人发现它撒谎的导出函数,是最危险的那种死代码。
+--  要"当前生效阈值"请用 M.ttft_metrics(opts, model),它是唯一真相点。)
 
 -- 本路由/模型生效的**指标列表**:{ {metric=, q=, threshold=}, ... };第二返回值是来源(供 dbg 标注)。
--- 优先级链:**手工 override > 路由声明的指标表 > 静态单阈值 > _G 全局默认**。
---   * override 压过声明表:留应急口子,线上出事能立刻手工压住;
---   * 没声明指标表 → 回落静态,**与本特性引入前逐字节一致**。
+--
+-- 优先级链:**声明的指标表 > 手工 override > 静态单阈值 > _G 全局默认**
+--
+-- ⚠️ 2026-09-01 把 override 从链首降到声明表之下。理由:声明表是权威配置(k8s 上由 operator 从
+--    LLMSLORequirement 渲染),不该被谁在**某一台** openresty 上手工压住而无人知晓 —— 生产有三处
+--    实例,压了一台其余两台行为不同,而且从 CRD 侧完全看不出来。
+--    override 保留是因为**裸机(ts24/ts31/gateway-host)没有 CRD**,那里它是唯一的免 reload 调阈值手段。
+--
+-- 顺带解掉一个真实的耦合:重排之后**指标集合不再依赖 override** ——
+--   有声明表 → 用声明表;没有 → 恒为 p80(override 与静态都是 p80)。
+--   记录侧(ttft_record 也调本函数决定折叠哪些指标)于是不会因为设/清 override 而切换 EWMA key。
+--   旧顺序下会:设 override → 记录切到只折 p80、声明的 p95/avg 停更;清掉 → 再切回去。
+--   两次切换各带来一个冷启动空窗,期间**保护完全关闭**(2026-09-01 在 k8s 实测:设 override 后
+--   连发 20 全部 200,直到跨过一个 20s 折叠窗口才开始拒)。
+--
 -- ⚠️ 判定必须遍历**这张声明表**,而不是遍历 dict 里现存的 EWMA key ——
 --    否则删掉某个指标后,它残留的 EWMA 还会继续拒人最多 ttft_ttl 秒。
--- threshold 可能是 nil(路由没配阈值):此时**照样记 EWMA**(dbg 可见、AIMD 可读),只是不参与判定
--- —— 与改动前「ttft_record 不看有没有阈值」的行为一致。
+-- threshold 可能是 nil(路由没配阈值):此时**照样记 EWMA**(dbg 可见、AIMD 可读),只是不参与判定。
 function M.ttft_metrics(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
+    if opts.ttft_metrics then return opts.ttft_metrics, "declared" end
     local ovr = M.ttft_override_for(opts, m)
     if ovr then return { { metric = "p80", q = 0.8, threshold = ovr } }, "override" end
-    return M.ttft_metrics_beneath(opts, m)
+    return { { metric = "p80", q = 0.8, threshold = M.ttft_static_limit_for(opts, m) } }, "static"
 end
 
--- 优先级链去掉 override 那一层(路由声明的多指标表 > 静态单阈值)。
--- source 叫 "declared" 而不是按来源命名:这一层就是 **factory opts 里声明的指标表**,
--- 引擎不知道也不关心是谁写进去的 —— 外部工具渲染、或直接在 conf 里手写,完全等价。
--- 只给 /_ttft_status 用:override 生效时把「底下本来会用什么」一并显示出来,
--- 否则看板上只剩一个手工值,分不清底下那层声明了没有、声明的是多少。
---
--- opts.ttft_metrics 与 ttft_limit_ms 等其它调优项**走同一条通道**(改 conf → reload)。
--- 已在 register_route 里用 util.validate_metrics 校验过,这里直接用。
-function M.ttft_metrics_beneath(opts, model)
-    local m = model
-    if m == nil then m = ngx.ctx.req_model end
-    if opts.ttft_metrics then return opts.ttft_metrics, "declared" end
-    return { { metric = "p80", q = 0.8, threshold = M.ttft_static_limit_for(opts, m) } }, "static"
+-- override 是否**实际生效**。声明了指标表时 override 被压住 —— 端点要如实说,否则运维设完看到
+-- 回显的 limit_override_ms 会以为压住了,实际没有(这正是"端点撒谎"最容易伤人的地方)。
+-- 从 ttft_metrics 的来源推导,**不要**另写一遍 `opts.ttft_metrics == nil` 之类的判断:
+-- 那等于把优先级链复制第二份,链再改一次(比如将来加 ranges 层)就会有一处漏改,
+-- 表现为端点报的 effective 与实际判定不符 —— 又是一次"端点撒谎"。
+-- 只在 dbg 端点调用,多一次解析无所谓。
+function M.ttft_override_effective(opts, model)
+    local _, src = M.ttft_metrics(opts, model)
+    return src == "override"
 end
 
 -- 样本 → 直方图桶号(1..#buckets+1,最后一个是 overflow)
@@ -178,7 +183,9 @@ end
 -- ── 违约判定(access 的 TTFT-429 与 timers 的 AIMD 共用同一入口)────────────────
 -- 遍历**声明的**指标列表,任一 EWMA 超阈值即违约(OR)。返回:
 --   { ewma = <第一条指标的 EWMA,供展示/back-compat>,
---     hit = bool, hit_ewma / hit_limit / hit_metric = 触发那一条的值(供 429 响应体 + dbg) }
+--     hit = bool, hit_ewma / hit_limit / hit_metric = 触发那一条的值 }
+--   hit_metric 进 429 响应体的 "metric" 字段(access.lua)—— 多指标 OR 时,
+--   光看 hit_limit 只能反推是哪条,两条阈值相同就分不出来。
 -- 单指标(P0 默认)时 ewma == hit_ewma、hit_limit == 旧的 ttft_limit → 429 响应体逐字节不变。
 -- ⚠️ strict 保留一个**既有的不对称**,不要"顺手统一":
 --     access.lua 的 TTFT-429 用 `>=`(strict=false,默认);timers.lua 的 ttft_overloaded 用 `>`(strict=true)。
