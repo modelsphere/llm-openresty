@@ -49,7 +49,7 @@ end
 
 -- 解析本请求该用的 TPS 下限(tokens/sec):override > tps_limit_by_model[model] > opts.tps_limit_tps。
 -- model 显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model —— 与 tps_key_prefix 一致。
--- 在线 override(见 /_tps_limit)。抽出来的理由同 ttft_override_for:它在优先级链里压过 CRD。
+-- 在线 override(见 /_tps_limit)。抽出来的理由同 ttft_override_for:它在优先级链里压过声明表。
 function M.tps_override_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -62,7 +62,7 @@ function M.tps_override_for(opts, model)
     return td:get((opts.route_name or "?") .. ":limit_override")
 end
 
--- 只看 factory opts 的那一段(不查 override、不查 CRD)。理由同 ttft_static_limit_for。
+-- 只看静态那一段(不查 override、不查声明表)。理由同 ttft_static_limit_for。
 function M.tps_static_limit_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -83,11 +83,11 @@ function M.tps_limit_for(opts, model)
 end
 
 -- 本路由/模型生效的指标列表。与 ttft_metrics 同构,唯一差别是 **q 的方向**:
--- CRD 的 `otps: p80` = 「80% 请求 OTPS ≥ threshold」→ 要取分布的**低尾 P20** → q = 0.2。
+-- OTPS 的 `p80` = 「80% 请求 OTPS ≥ threshold」→ 要取分布的**低尾 P20** → q = 0.2。
 -- (TTFT 的 `p80` = 「80% 请求 ≤ threshold」→ 取高尾 P80 → q = 0.8。)
--- 方向换算只在这里/下发侧做一次,util.window_stat 只认「取第 q 分位」这一个原语。
+-- 方向换算由写指标表的一方做,util.window_stat 只认「取第 q 分位」这一个原语。
 -- q 写字面量 0.2,不写 1-0.8(= 0.19999999999999996)—— 纯卫生,实测不影响判定。
--- 优先级链同 ttft_metrics:override > CRD > factory opts > _G;第二返回值是来源。
+-- 优先级链同 ttft_metrics:override > 声明表 > 静态 > _G;第二返回值是来源。
 function M.tps_metrics(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -97,11 +97,11 @@ function M.tps_metrics(opts, model)
 end
 
 -- 优先级链去掉 override 那一层。只给 /_tps_status 用,同 ttft_metrics_beneath。
--- opts.tps_metrics 的 q 已是**低尾方向**(CRD 的 otps p80 → q=0.2),换算在 autoconfig 侧做。
+-- opts.tps_metrics 的 q 已是**低尾方向**(otps p80 → q=0.2),换算由写表的一方做。
 function M.tps_metrics_beneath(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    if opts.tps_metrics then return opts.tps_metrics, "crd" end
+    if opts.tps_metrics then return opts.tps_metrics, "declared" end
     return { { metric = "p80", q = 0.2, threshold = M.tps_static_limit_for(opts, m) } }, "static"
 end
 

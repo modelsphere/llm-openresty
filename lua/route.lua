@@ -64,7 +64,8 @@ function _G.register_route(name, opts_factory)
         return nil
     end
     opts.route_name = name
-    -- SLO 指标表(autoconfig 从 LLMSLORequirement 渲染进来;裸机/未配 = nil → 走静态单指标)。
+    -- 路由声明的指标表(未配 = nil → 走静态单阈值)。谁写进来的引擎不关心:
+    -- 可以是外部工具渲染的,也可以在 conf 里手写 —— 对引擎完全等价。
     -- 在这里校验一次(每 reload 一次),而不是每请求校验:热路径上只读已经过关的表。
     -- 不合法 → 置 nil 回落静态,不让整条路由注册失败(阈值配错不该断流)。
     opts.ttft_metrics = util.validate_metrics(opts.ttft_metrics, "ttft", name)

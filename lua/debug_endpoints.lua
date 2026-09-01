@@ -109,7 +109,7 @@ function _G.dbg_ttft_status(opts)
         end
         for _, m in ipairs(models) do
             local key = (m == false) and "_" or m
-            local mlist, msrc = ttft.ttft_metrics(opts, m)   -- msrc: override|crd|static
+            local mlist, msrc = ttft.ttft_metrics(opts, m)   -- msrc: override|declared|static
             local list = {}   -- 纯数组:混入字符串 key 会让 cjson 编成对象,source 挂外层 wrapper
             for _, mt in ipairs(mlist) do
                 list[#list+1] = { metric = mt.metric, q = mt.q,
@@ -122,7 +122,7 @@ function _G.dbg_ttft_status(opts)
             --    若这里也出现 `"_":[`,head -1 可能取到它,数字部分为空 → ewma 假报空。
             --    数组形状下只有 "model":"_",不会产生裸的 `"<model>":` 键。
             -- source=="override" 时补一份「被盖住的那层」:否则看板上只剩手工值,
-            -- 分不清 CRD 到底下发没下发、下发了多少(运维忘删 override 就是这么被埋住的)。
+            -- 分不清底下那层声明了没有、声明的是多少(运维忘删 override 就是这么被埋住的)。
             local shadow
             if msrc == "override" then
                 local bl, bsrc = ttft.ttft_metrics_beneath(opts, m)
@@ -150,7 +150,7 @@ function _G.dbg_ttft_status(opts)
         probe_per_window      = opts.ttft_probe_per_window,
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
         -- ↓ 新增(只增不改不重排,回归套件依赖既有字段)
-        metrics               = mstat,                        -- 每模型指标列表 + source(override|crd|static)
+        metrics               = mstat,                        -- 每模型指标列表 + source(override|declared|static)
         dict_capacity         = td and td:capacity() or nil,  -- 容量观测:直方图 key 数随模型/指标增长,
         dict_free_space       = td and td:free_space() or nil,--   一旦 LRU 淘汰 ewin/fd 锁会静默坏掉折叠
     }))
@@ -220,8 +220,8 @@ end
 -- GET  /_ttft_limit?ms=0 [&model=X]  → 清除 override(回落静态默认)
 -- 注意:override 存共享字典、无 TTL,会跨 reload 存活;改 conf 默认值要同时清 override 才生效。
 -- 手工 override 的存活时长。**默认过期**是刻意的:
---   lua_shared_dict 跨 reload 存活,而 override 在优先级链里压过 CRD —— 无 TTL 的话,
---   半夜应急设的一个值会让该 route 的 CRD 下发**静默失效数月**,而且看不出来。
+--   lua_shared_dict 跨 reload 存活,而 override 压过声明表 —— 无 TTL 的话,半夜应急设的
+--   一个值会让该 route 声明的阈值**静默失效数月**,而且从任何端点都看不出来。
 --   给它一个自动回落的期限,让"忘了删"从一个长期故障退化成一段有限的偏离。
 -- ?ttl=0 显式表示永不过期(真需要长期钉住时用),响应里会标出来。
 local OVERRIDE_TTL_DEFAULT = 7200   -- 2h
@@ -268,7 +268,7 @@ function _G.dbg_ttft_limit(opts)
         end
         if n == 0 then td:delete(k) else td:set(k, n, ttl) end
     end
-    -- override 生效时,把它盖住的那一层(CRD / 静态)也报出来 —— 否则看不出 CRD 下发没下发。
+    -- override 生效时,把它盖住的那一层(声明表 / 静态)也报出来 —— 否则看不出底下是什么。
     local beneath, bsrc = ttft.ttft_metrics_beneath(opts, model or false)
     ngx.say(cjson_dbg.encode({
         route             = opts.route_name, ok = true,
@@ -276,10 +276,10 @@ function _G.dbg_ttft_limit(opts)
         limit_override_ms = td:get(k) or nil,             -- 当前 override(nil=未设,回落静态)
         static_limit_ms   = opts.ttft_limit_ms or nil,    -- 路由级静态默认
         static_by_model   = opts.ttft_limit_by_model or nil,
-        priority          = "override > CRD(LLMSLORequirement) > 静态per-model > 静态route",
+        priority          = "override > declared(路由声明的指标表) > 静态per-model > 静态route",
         -- ↓ 新增(只增不改不重排)
         override_ttl_s    = override_ttl_of(td, k),       -- 剩余秒数(0=永不过期;nil=未设 override)
-        shadowed_source   = (td:get(k) ~= nil) and bsrc or nil,          -- override 盖住的是 crd 还是 static
+        shadowed_source   = (td:get(k) ~= nil) and bsrc or nil,          -- override 盖住的是 declared 还是 static
         shadowed_limit_ms = (td:get(k) ~= nil) and beneath[1] and beneath[1].threshold or nil,
     }))
 end
@@ -335,7 +335,7 @@ function _G.dbg_tps_status(opts)
         for _, m in ipairs(models) do
             local key = (m == false) and "_" or m
             local pre = (m == false) and rp or (rp .. m .. ":")
-            local mlist, msrc = tps.tps_metrics(opts, m)     -- msrc: override|crd|static
+            local mlist, msrc = tps.tps_metrics(opts, m)     -- msrc: override|declared|static
             local list = {}   -- 纯数组,理由同 /_ttft_status
             for _, mt in ipairs(mlist) do
                 list[#list+1] = { metric = mt.metric, q = mt.q,
@@ -391,7 +391,7 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_rej       = adaptive_cc_rej,     -- 本区间被压抑需求(并发429数);>0 → 下tick 快涨到 desired
         adaptive_cc_interval  = opts.adaptive_cc and opts.adaptive_cc_interval or nil,
         -- ↓ 新增(只增不改不重排)
-        metrics               = mstat,                        -- 每模型指标列表 + source(override|crd|static)
+        metrics               = mstat,                        -- 每模型指标列表 + source(override|declared|static)
         dict_capacity         = td and td:capacity() or nil,
         dict_free_space       = td and td:free_space() or nil,
     }))
@@ -514,7 +514,7 @@ function _G.dbg_tps_limit(opts)
     -- factory 配 tps_limit_tps,光设 override 不会生效(采样/判定整链短路)——显式 enforcing + warning,
     -- 避免运维设了 override 以为已保护、实际放行(与 TTFT 默认开不同,TTFT 无此陷阱)。
     local opted_in = opts.tps_limit_tps and true or false
-    -- override 生效时,把它盖住的那一层(CRD / 静态)也报出来 —— 同 /_ttft_limit。
+    -- override 生效时,把它盖住的那一层(声明表 / 静态)也报出来 —— 同 /_ttft_limit。
     local beneath, bsrc = tps.tps_metrics_beneath(opts, model or false)
     ngx.say(cjson_dbg.encode({
         route              = opts.route_name, ok = true,
@@ -526,10 +526,10 @@ function _G.dbg_tps_limit(opts)
         limit_override_tps = td:get(k) or nil,             -- 当前 override(nil=未设,回落静态)
         static_limit_tps   = opts.tps_limit_tps or nil,    -- 路由级静态默认
         static_by_model    = opts.tps_limit_by_model or nil,
-        priority           = "override > CRD(LLMSLORequirement) > 静态per-model > 静态route",
+        priority           = "override > declared(路由声明的指标表) > 静态per-model > 静态route",
         -- ↓ 新增(只增不改不重排)
         override_ttl_s     = override_ttl_of(td, k),       -- 剩余秒数(0=永不过期;nil=未设 override)
-        shadowed_source    = (td:get(k) ~= nil) and bsrc or nil,           -- override 盖住的是 crd 还是 static
+        shadowed_source    = (td:get(k) ~= nil) and bsrc or nil,           -- override 盖住的是 declared 还是 static
         shadowed_limit_tps = (td:get(k) ~= nil) and beneath[1] and beneath[1].threshold or nil,
     }))
 end

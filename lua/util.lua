@@ -61,7 +61,7 @@ function M.window_quantile(td, pre, w, buckets, q)
     return b[n] * 2
 end
 
--- 窗口均值(CRD 的 `avg` 指标)。直方图算不出均值,故 record 时额外累计 sum/cnt 两个 key。
+-- 窗口均值(`avg` 指标)。直方图算不出均值,故 record 时额外累计 sum/cnt 两个 key。
 -- 空窗同样返 nil(语义与 window_quantile 对齐)。
 function M.window_avg(td, pre, w)
     local cnt = td:get(pre .. "h:" .. w .. ":cnt") or 0
@@ -69,7 +69,7 @@ function M.window_avg(td, pre, w)
     return (td:get(pre .. "h:" .. w .. ":sum") or 0) / cnt
 end
 
--- 按 CRD 的 metric 名从窗口取值:"avg" 走均值,"pNN" 走分位(q 由调用方给,
+-- 按 metric 名从窗口取值:"avg" 走均值,"pNN" 走分位(q 由调用方给,
 -- 因为 TTFT 的 q=coverage 而 OTPS 的 q=1-coverage,方向换算不在引擎内做)。
 function M.window_stat(td, pre, w, buckets, metric, q)
     if metric == "avg" then return M.window_avg(td, pre, w) end
@@ -89,12 +89,12 @@ function M.opts_missing(opts)
 end
 
 -- ── SLO 指标表校验 ────────────────────────────────────────────────────────────
--- factory opts 里的 ttft_metrics / tps_metrics(由 autoconfig 从 LLMSLORequirement 渲染进
--- session_route_<route>.conf,也可手写)长这样:
+-- factory opts 里的 ttft_metrics / tps_metrics 长这样(在 session_route_<route>.conf 的
+-- register_route 返回表里声明;外部工具渲染或人手写都行):
 --     { { metric = "p80", q = 0.8, threshold = 20000 }, ... }
 --
--- q 已经是**引擎直接用的取分位系数** —— TTFT q=coverage、OTPS q=1-coverage 的方向换算在
--- autoconfig 侧做,引擎不做方向判断(单一真相点,免得两边各写一遍导致某边写反)。
+-- q 已经是**引擎直接用的取分位系数**:引擎只认「取第 q 分位」这一个原语,不做方向判断。
+-- (TTFT 越大越坏、OTPS 越大越好,方向换算由写这张表的一方负责,单一真相点。)
 --
 -- 在 register_route 里调**一次**(每 reload 一次),不在热路径上。
 -- 任何一条不合法 → 整份丢弃 + ERR 日志 + 回落静态单指标。
@@ -104,7 +104,7 @@ function M.validate_metrics(list, kind, route)
     if list == nil then return nil end
     local bad = function(msg)
         ngx.log(ngx.ERR, "[", route or "?", "] ", kind, "_metrics ", msg,
-                " —— 整份丢弃,回落静态阈值(检查 ModelRoute 的 slo 段 / autoconfig 渲染)")
+                " —— 整份丢弃,回落静态阈值(检查这条路由的 conf)")
         return nil
     end
     if type(list) ~= "table" or #list == 0 then return bad("不是非空数组") end

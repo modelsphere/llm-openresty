@@ -40,8 +40,8 @@ end
 
 -- EWMA key:`<route>[:<model>]:<range>:<metric>:ewma`。
 --   <range>  恒为 "all"(ranges 未实现,预留段 —— 将来启用只换这一段,不动 key 布局);
---   <metric> 是 CRD 的 type 字面量("p80"/"p50"/"avg"),**按语义命名而非数组下标** ——
---            CRD 里 metrics[] 重排或中间插一项时,下标方案会让 p50 的历史 EWMA 被当成 p95 用满一个 TTL;
+--   <metric> 是指标名("p80"/"p50"/"avg"),**按语义命名而非数组下标** ——
+--            指标表重排或中间插一项时,下标方案会让 p50 的历史 EWMA 被当成 p95 用满一个 TTL;
 --            语义命名下 metric 一变 key 就变,旧值天然隔离、靠 TTL 自然过期。
 function M.ttft_ewma_key(opts, model, metric)
     return M.ttft_key_prefix(opts, model) .. "all:" .. (metric or "p80") .. ":ewma"
@@ -54,7 +54,7 @@ end
 -- model 同 ttft_key_prefix:显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model。
 -- 在线 override(共享字典,跨 worker 一致;免 reload,见 /_ttft_limit)。
 --   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)。
--- 单独抽出来是因为它在优先级链里**压过 CRD** —— 线上出事时能立刻手工压住,不用等 operator。
+-- 单独抽出来是因为它在优先级链里**压过声明表** —— 线上出事时能立刻手工压住。
 function M.ttft_override_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
@@ -67,7 +67,7 @@ function M.ttft_override_for(opts, model)
     return td:get((opts.route_name or "?") .. ":limit_override")
 end
 
--- 只看 factory opts 的那一段(不查 override、不查 CRD)。抽出来是为了让「被 override 遮住的
+-- 只看静态那一段(不查 override、不查声明表)。抽出来是为了让「被 override 遮住的
 -- 底下是什么」可算 —— 若直接复用 ttft_limit_for,override 在时会把自己再返回一遍。
 function M.ttft_static_limit_for(opts, model)
     local m = model
@@ -89,9 +89,9 @@ function M.ttft_limit_for(opts, model)
 end
 
 -- 本路由/模型生效的**指标列表**:{ {metric=, q=, threshold=}, ... };第二返回值是来源(供 dbg 标注)。
--- 优先级链:**手工 override > CRD 下发 > factory opts > _G 全局默认**。
---   * override 压过 CRD:留应急口子,线上出事不用等 operator;
---   * CRD 未覆盖本 route(或裸机根本没有 CRD)→ 回落静态,**与接 CRD 前逐字节一致**。
+-- 优先级链:**手工 override > 路由声明的指标表 > 静态单阈值 > _G 全局默认**。
+--   * override 压过声明表:留应急口子,线上出事能立刻手工压住;
+--   * 没声明指标表 → 回落静态,**与本特性引入前逐字节一致**。
 -- ⚠️ 判定必须遍历**这张声明表**,而不是遍历 dict 里现存的 EWMA key ——
 --    否则删掉某个指标后,它残留的 EWMA 还会继续拒人最多 ttft_ttl 秒。
 -- threshold 可能是 nil(路由没配阈值):此时**照样记 EWMA**(dbg 可见、AIMD 可读),只是不参与判定
@@ -104,17 +104,18 @@ function M.ttft_metrics(opts, model)
     return M.ttft_metrics_beneath(opts, m)
 end
 
--- 优先级链去掉 override 那一层(CRD 渲染来的多指标表 > 静态单阈值)。
+-- 优先级链去掉 override 那一层(路由声明的多指标表 > 静态单阈值)。
+-- source 叫 "declared" 而不是按来源命名:这一层就是 **factory opts 里声明的指标表**,
+-- 引擎不知道也不关心是谁写进去的 —— 外部工具渲染、或直接在 conf 里手写,完全等价。
 -- 只给 /_ttft_status 用:override 生效时把「底下本来会用什么」一并显示出来,
--- 否则看板上只剩一个手工值,分不清 CRD 到底下发没下发、下发的是多少。
+-- 否则看板上只剩一个手工值,分不清底下那层声明了没有、声明的是多少。
 --
--- opts.ttft_metrics 由 autoconfig 从 LLMSLORequirement 渲染进 session_route_<route>.conf,
--- 与 ttft_limit_ms 等其它调优项**走同一条通道**(改 CRD → operator 重写 conf → reload sidecar
--- SIGHUP)。已在 register_route 里校验过,这里直接用。
+-- opts.ttft_metrics 与 ttft_limit_ms 等其它调优项**走同一条通道**(改 conf → reload)。
+-- 已在 register_route 里用 util.validate_metrics 校验过,这里直接用。
 function M.ttft_metrics_beneath(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    if opts.ttft_metrics then return opts.ttft_metrics, "crd" end
+    if opts.ttft_metrics then return opts.ttft_metrics, "declared" end
     return { { metric = "p80", q = 0.8, threshold = M.ttft_static_limit_for(opts, m) } }, "static"
 end
 
