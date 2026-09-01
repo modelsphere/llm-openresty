@@ -122,7 +122,14 @@ function _G.dbg_ttft_status(opts)
             --    `grep -o '"_":[0-9.]*'` 直接在原始 JSON 文本里捞,而 [0-9.]* 能匹配零个字符 ——
             --    若这里也出现 `"_":[`,head -1 可能取到它,数字部分为空 → ewma 假报空。
             --    数组形状下只有 "model":"_",不会产生裸的 `"<model>":` 键。
-            mstat[#mstat+1] = { model = key, source = msrc, items = list }
+            -- source=="override" 时补一份「被盖住的那层」:否则看板上只剩手工值,
+            -- 分不清 CRD 到底下发没下发、下发了多少(运维忘删 override 就是这么被埋住的)。
+            local shadow
+            if msrc == "override" then
+                local bl, bsrc = ttft.ttft_metrics_beneath(opts, m)
+                shadow = { source = bsrc, threshold_ms = bl[1] and bl[1].threshold or nil }
+            end
+            mstat[#mstat+1] = { model = key, source = msrc, items = list, shadowed = shadow }
         end
     end
     local active = ttft.ttft_dict_if_on(opts) and true or false
@@ -252,6 +259,28 @@ end
 -- GET  /_ttft_limit?ms=45000&model=X → 设某模型阈值(仅 peers_by_model 路由)
 -- GET  /_ttft_limit?ms=0 [&model=X]  → 清除 override(回落静态默认)
 -- 注意:override 存共享字典、无 TTL,会跨 reload 存活;改 conf 默认值要同时清 override 才生效。
+-- 手工 override 的存活时长。**默认过期**是刻意的:
+--   lua_shared_dict 跨 reload 存活,而 override 在优先级链里压过 CRD —— 无 TTL 的话,
+--   半夜应急设的一个值会让该 route 的 CRD 下发**静默失效数月**,而且看不出来。
+--   给它一个自动回落的期限,让"忘了删"从一个长期故障退化成一段有限的偏离。
+-- ?ttl=0 显式表示永不过期(真需要长期钉住时用),响应里会标出来。
+local OVERRIDE_TTL_DEFAULT = 7200   -- 2h
+
+-- 返回 ttl(秒), 错误字符串;ttl==0 表示永久
+local function parse_override_ttl(arg_ttl)
+    if arg_ttl == nil then return OVERRIDE_TTL_DEFAULT end
+    local n = tonumber(arg_ttl)
+    if not n or n < 0 then return nil, "ttl must be >= 0 (0 = 永不过期)" end
+    return n
+end
+
+-- shared dict 的 :ttl() 对「无过期时间」的 key 返回 0,与我们的 0 语义一致,直接透传。
+local function override_ttl_of(td, k)
+    if td:get(k) == nil then return nil end
+    local t = td:ttl(k)
+    return t or nil
+end
+
 function _G.dbg_ttft_limit(opts)
     if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
@@ -264,22 +293,34 @@ function _G.dbg_ttft_limit(opts)
     local model = ngx.var.arg_model
     local k = (opts.route_name or "?") .. ":" .. (model and (model .. ":") or "") .. "limit_override"
     local ms = ngx.var.arg_ms
+    local ttl, terr = parse_override_ttl(ngx.var.arg_ttl)
+    if terr then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ ok = false, error = terr }))
+        return
+    end
     if ms then
         local n = tonumber(ms)
         if not n or n < 0 then
             ngx.status = 400
-            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?ms=0 清除 | ?ms=<正整数> 设阈值 [&model=X]" }))
+            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?ms=0 清除 | ?ms=<正整数> 设阈值 [&model=X] [&ttl=秒,默认7200,0=永久]" }))
             return
         end
-        if n == 0 then td:delete(k) else td:set(k, n) end
+        if n == 0 then td:delete(k) else td:set(k, n, ttl) end
     end
+    -- override 生效时,把它盖住的那一层(CRD / 静态)也报出来 —— 否则看不出 CRD 下发没下发。
+    local beneath, bsrc = ttft.ttft_metrics_beneath(opts, model or false)
     ngx.say(cjson_dbg.encode({
         route             = opts.route_name, ok = true,
         model             = model or nil,
         limit_override_ms = td:get(k) or nil,             -- 当前 override(nil=未设,回落静态)
         static_limit_ms   = opts.ttft_limit_ms or nil,    -- 路由级静态默认
         static_by_model   = opts.ttft_limit_by_model or nil,
-        priority          = "override > 静态per-model > 静态route",
+        priority          = "override > CRD(LLMSLORequirement) > 静态per-model > 静态route",
+        -- ↓ 新增(只增不改不重排)
+        override_ttl_s    = override_ttl_of(td, k),       -- 剩余秒数(0=永不过期;nil=未设 override)
+        shadowed_source   = (td:get(k) ~= nil) and bsrc or nil,          -- override 盖住的是 crd 还是 static
+        shadowed_limit_ms = (td:get(k) ~= nil) and beneath[1] and beneath[1].threshold or nil,
     }))
 end
 
@@ -342,7 +383,13 @@ function _G.dbg_tps_status(opts)
                                   ewma_tps = td:get(tps.tps_ewma_key(opts, m, mt.metric)) }
             end
             ewmas[key]   = list[1] and list[1].ewma_tps or nil
-            mstat[#mstat+1] = { model = key, source = msrc, items = list }   -- 数组形状,理由同 /_ttft_status
+            local shadow   -- override 盖住的那层,理由同 /_ttft_status
+            if msrc == "override" then
+                local bl, bsrc = tps.tps_metrics_beneath(opts, m)
+                shadow = { source = bsrc, threshold_tps = bl[1] and bl[1].threshold or nil }
+            end
+            -- 数组形状,理由同 /_ttft_status
+            mstat[#mstat+1] = { model = key, source = msrc, items = list, shadowed = shadow }
             nousage[key] = td:get(pre .. "nousage") or 0
         end
     end
@@ -484,19 +531,27 @@ function _G.dbg_tps_limit(opts)
     local model = ngx.var.arg_model
     local k = (opts.route_name or "?") .. ":" .. (model and (model .. ":") or "") .. "limit_override"
     local arg_tps = ngx.var.arg_tps   -- ⚠️ 不能命名 tps:会遮蔽顶层 `local tps = require "tps"`(下方 tps.tps_dict_if_on)
+    local ttl, terr = parse_override_ttl(ngx.var.arg_ttl)
+    if terr then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ ok = false, error = terr }))
+        return
+    end
     if arg_tps then
         local n = tonumber(arg_tps)
         if not n or n < 0 then
             ngx.status = 400
-            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?tps=0 清除 | ?tps=<正数> 设下限 [&model=X]" }))
+            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?tps=0 清除 | ?tps=<正数> 设下限 [&model=X] [&ttl=秒,默认7200,0=永久]" }))
             return
         end
-        if n == 0 then td:delete(k) else td:set(k, n) end
+        if n == 0 then td:delete(k) else td:set(k, n, ttl) end
     end
     -- ⚠️ opt-in 陷阱:TPS 是静态 opt-in(tps_dict_if_on 会先查 opts.tps_limit_tps)。若路由没在
     -- factory 配 tps_limit_tps,光设 override 不会生效(采样/判定整链短路)——显式 enforcing + warning,
     -- 避免运维设了 override 以为已保护、实际放行(与 TTFT 默认开不同,TTFT 无此陷阱)。
     local opted_in = opts.tps_limit_tps and true or false
+    -- override 生效时,把它盖住的那一层(CRD / 静态)也报出来 —— 同 /_ttft_limit。
+    local beneath, bsrc = tps.tps_metrics_beneath(opts, model or false)
     ngx.say(cjson_dbg.encode({
         route              = opts.route_name, ok = true,
         model              = model or nil,
@@ -507,7 +562,11 @@ function _G.dbg_tps_limit(opts)
         limit_override_tps = td:get(k) or nil,             -- 当前 override(nil=未设,回落静态)
         static_limit_tps   = opts.tps_limit_tps or nil,    -- 路由级静态默认
         static_by_model    = opts.tps_limit_by_model or nil,
-        priority           = "override > 静态per-model > 静态route",
+        priority           = "override > CRD(LLMSLORequirement) > 静态per-model > 静态route",
+        -- ↓ 新增(只增不改不重排)
+        override_ttl_s     = override_ttl_of(td, k),       -- 剩余秒数(0=永不过期;nil=未设 override)
+        shadowed_source    = (td:get(k) ~= nil) and bsrc or nil,           -- override 盖住的是 crd 还是 static
+        shadowed_limit_tps = (td:get(k) ~= nil) and beneath[1] and beneath[1].threshold or nil,
     }))
 end
 

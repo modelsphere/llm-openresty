@@ -59,17 +59,24 @@ function M.tps_override_for(opts, model)
     return td:get((opts.route_name or "?") .. ":limit_override")
 end
 
-function M.tps_limit_for(opts, model)
+-- 只看 factory opts 的那一段(不查 override、不查 CRD)。理由同 ttft_static_limit_for。
+function M.tps_static_limit_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    local ovr = M.tps_override_for(opts, m)
-    if ovr then return ovr end
     local bym = opts.tps_limit_by_model
     if bym and opts.peers_by_model then
         local v = bym[m or ""]
         if v then return v end
     end
     return opts.tps_limit_tps
+end
+
+function M.tps_limit_for(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    local ovr = M.tps_override_for(opts, m)
+    if ovr then return ovr end
+    return M.tps_static_limit_for(opts, m)
 end
 
 -- 本路由/模型生效的指标列表。与 ttft_metrics 同构,唯一差别是 **q 的方向**:
@@ -83,9 +90,16 @@ function M.tps_metrics(opts, model)
     if m == nil then m = ngx.ctx.req_model end
     local ovr = M.tps_override_for(opts, m)
     if ovr then return { { metric = "p80", q = 0.2, threshold = ovr } }, "override" end
+    return M.tps_metrics_beneath(opts, m)
+end
+
+-- 优先级链去掉 override 那一层(CRD > factory opts > _G)。只给 /_tps_status 用,同 ttft_metrics_beneath。
+function M.tps_metrics_beneath(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
     local ms = slo.metrics_for(opts.route_name, m, "otps")
     if ms then return ms, "crd" end
-    return { { metric = "p80", q = 0.2, threshold = M.tps_limit_for(opts, m) } }, "static"
+    return { { metric = "p80", q = 0.2, threshold = M.tps_static_limit_for(opts, m) } }, "static"
 end
 
 -- 违约判定(access 的 TPS-429 与 timers 的 AIMD 共用)。方向与 TTFT 相反:EWMA **低于**下限才是过载。

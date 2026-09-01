@@ -68,17 +68,25 @@ function M.ttft_override_for(opts, model)
     return td:get((opts.route_name or "?") .. ":limit_override")
 end
 
-function M.ttft_limit_for(opts, model)
+-- 只看 factory opts 的那一段(不查 override、不查 CRD)。抽出来是为了让「被 override 遮住的
+-- 底下是什么」可算 —— 若直接复用 ttft_limit_for,override 在时会把自己再返回一遍。
+function M.ttft_static_limit_for(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    local ovr = M.ttft_override_for(opts, m)
-    if ovr then return ovr end
     local bym = opts.ttft_limit_by_model
     if bym and opts.peers_by_model then
         local v = bym[m or ""]
         if v then return v end
     end
     return opts.ttft_limit_ms
+end
+
+function M.ttft_limit_for(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    local ovr = M.ttft_override_for(opts, m)
+    if ovr then return ovr end
+    return M.ttft_static_limit_for(opts, m)
 end
 
 -- 本路由/模型生效的**指标列表**:{ {metric=, q=, threshold=}, ... };第二返回值是来源(供 dbg 标注)。
@@ -94,9 +102,18 @@ function M.ttft_metrics(opts, model)
     if m == nil then m = ngx.ctx.req_model end
     local ovr = M.ttft_override_for(opts, m)
     if ovr then return { { metric = "p80", q = 0.8, threshold = ovr } }, "override" end
+    return M.ttft_metrics_beneath(opts, m)
+end
+
+-- 优先级链去掉 override 那一层(CRD > factory opts > _G)。
+-- 只给 /_ttft_status 用:override 生效时把「底下本来会用什么」一并显示出来,
+-- 否则看板上只剩一个手工值,分不清 CRD 到底下发没下发、下发的是多少。
+function M.ttft_metrics_beneath(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
     local ms = slo.metrics_for(opts.route_name, m, "ttft")
     if ms then return ms, "crd" end
-    return { { metric = "p80", q = 0.8, threshold = M.ttft_limit_for(opts, m) } }, "static"
+    return { { metric = "p80", q = 0.8, threshold = M.ttft_static_limit_for(opts, m) } }, "static"
 end
 
 -- 样本 → 直方图桶号(1..#buckets+1,最后一个是 overflow)
