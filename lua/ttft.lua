@@ -6,7 +6,6 @@
 local M = {}
 
 local util = require "util"
-local slo  = require "slo"   -- CRD 下发的 SLO(未接/裸机时恒空 → 全部回落静态,行为不变)
 
 -- ══════════════════════════════════════════════════════════════════════
 -- TTFT 限流辅助：EWMA key 派生 + 半开探测令牌窗口
@@ -105,14 +104,17 @@ function M.ttft_metrics(opts, model)
     return M.ttft_metrics_beneath(opts, m)
 end
 
--- 优先级链去掉 override 那一层(CRD > factory opts > _G)。
+-- 优先级链去掉 override 那一层(CRD 渲染来的多指标表 > 静态单阈值)。
 -- 只给 /_ttft_status 用:override 生效时把「底下本来会用什么」一并显示出来,
 -- 否则看板上只剩一个手工值,分不清 CRD 到底下发没下发、下发的是多少。
+--
+-- opts.ttft_metrics 由 autoconfig 从 LLMSLORequirement 渲染进 session_route_<route>.conf,
+-- 与 ttft_limit_ms 等其它调优项**走同一条通道**(改 CRD → operator 重写 conf → reload sidecar
+-- SIGHUP)。已在 register_route 里校验过,这里直接用。
 function M.ttft_metrics_beneath(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    local ms = slo.metrics_for(opts.route_name, m, "ttft")
-    if ms then return ms, "crd" end
+    if opts.ttft_metrics then return opts.ttft_metrics, "crd" end
     return { { metric = "p80", q = 0.8, threshold = M.ttft_static_limit_for(opts, m) } }, "static"
 end
 

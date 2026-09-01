@@ -88,5 +88,44 @@ function M.opts_missing(opts)
     return true
 end
 
+-- ── SLO 指标表校验 ────────────────────────────────────────────────────────────
+-- factory opts 里的 ttft_metrics / tps_metrics(由 autoconfig 从 LLMSLORequirement 渲染进
+-- session_route_<route>.conf,也可手写)长这样:
+--     { { metric = "p80", q = 0.8, threshold = 20000 }, ... }
+--
+-- q 已经是**引擎直接用的取分位系数** —— TTFT q=coverage、OTPS q=1-coverage 的方向换算在
+-- autoconfig 侧做,引擎不做方向判断(单一真相点,免得两边各写一遍导致某边写反)。
+--
+-- 在 register_route 里调**一次**(每 reload 一次),不在热路径上。
+-- 任何一条不合法 → 整份丢弃 + ERR 日志 + 回落静态单指标。
+-- **不半份生效**:半份比不生效更危险,某个指标悄悄用了默认值,没人会发现。
+-- **不让路由注册失败**:阈值配错不该把整条路由打死(那是断流),回落静态是安全的降级。
+function M.validate_metrics(list, kind, route)
+    if list == nil then return nil end
+    local bad = function(msg)
+        ngx.log(ngx.ERR, "[", route or "?", "] ", kind, "_metrics ", msg,
+                " —— 整份丢弃,回落静态阈值(检查 ModelRoute 的 slo 段 / autoconfig 渲染)")
+        return nil
+    end
+    if type(list) ~= "table" or #list == 0 then return bad("不是非空数组") end
+    local out = {}
+    for i, m in ipairs(list) do
+        if type(m) ~= "table" then return bad("[" .. i .. "] 不是对象") end
+        local name = m.metric
+        if type(name) ~= "string" or name == "" then
+            return bad("[" .. i .. "] metric 缺失或非字符串")
+        end
+        -- avg 没有分位含义,不校验 q;pNN 必须带 0<q<1
+        if name ~= "avg" and (type(m.q) ~= "number" or m.q <= 0 or m.q >= 1) then
+            return bad("[" .. i .. "] metric=" .. name .. " 需要 0<q<1,得到 " .. tostring(m.q))
+        end
+        if type(m.threshold) ~= "number" or m.threshold < 0 then
+            return bad("[" .. i .. "] threshold 缺失或为负: " .. tostring(m.threshold))
+        end
+        out[i] = { metric = name, q = m.q, threshold = m.threshold }
+    end
+    return out
+end
+
 return M
 

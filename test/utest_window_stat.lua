@@ -41,10 +41,8 @@ end
 
 -- ttft.lua 顶层 require 的模块都要先手动装进 package.loaded ——
 -- 单测用 loadfile 直接装载,不走 lua_package_path,require 找不到文件会直接报错。
--- (P1 给 ttft.lua 新增了 require "slo",这里漏了就整个单测挂掉。)
 local util = assert(loadfile(LUA .. "/util.lua"))()
 package.loaded.util = util
-package.loaded.slo = assert(loadfile(LUA .. "/slo.lua"))()
 local ttft = assert(loadfile(LUA .. "/ttft.lua"))()
 
 local pass, fail = 0, 0
@@ -144,6 +142,34 @@ eq("E6 折叠后窗口0 的 key 全部清理", select(1, td:keys_matching("^t:h:
 eq("E7 窗口1 已开始入账", select(1, td:keys_matching("^t:h:1:")), 3)
 
 ngx.now = real_now
+
+-- ══════════════════════════════════════════════════════════════════════
+-- 4) validate_metrics:CRD 渲染进 opts 的指标表校验(register_route 里每 reload 跑一次)
+--    坏输入必须**整份丢弃**回落静态,而不是半份生效 —— 半份生效时某个指标悄悄用了
+--    默认值,线上没有任何迹象。
+-- ══════════════════════════════════════════════════════════════════════
+local logged = 0
+ngx.log = function() logged = logged + 1 end
+
+eq("V1 nil 原样返回(未配 = 走静态,不算错、不打日志)", util.validate_metrics(nil, "ttft", "r"), nil)
+
+local good = util.validate_metrics({ { metric = "p80", q = 0.8, threshold = 20000 },
+                                     { metric = "avg", threshold = 5000 } }, "ttft", "r")
+eq("V2 合法表通过", good and #good, 2)
+eq("V3 avg 不要求 q", good and good[2].q, nil)
+
+logged = 0
+eq("V4 空数组丢弃", util.validate_metrics({}, "ttft", "r"), nil)
+eq("V5 q 越界(=1)丢弃", util.validate_metrics({ { metric = "p80", q = 1, threshold = 1 } }, "ttft", "r"), nil)
+eq("V6 q 缺失丢弃",     util.validate_metrics({ { metric = "p80", threshold = 1 } }, "ttft", "r"), nil)
+eq("V7 threshold 非数丢弃", util.validate_metrics({ { metric = "p80", q = 0.8, threshold = "20s" } }, "ttft", "r"), nil)
+eq("V8 metric 名缺失丢弃", util.validate_metrics({ { q = 0.8, threshold = 1 } }, "ttft", "r"), nil)
+eq("V9 每次失败都打了 ERR 日志(V4-V8 共 5 次;否则线上静默回落无从发现)", logged, 5)
+
+-- 一条坏的就整份丢,不留下前面那条好的
+eq("V10 混合表整份丢弃(不半份生效)",
+   util.validate_metrics({ { metric = "p80", q = 0.8, threshold = 1 },
+                           { metric = "p95", q = 9,   threshold = 1 } }, "ttft", "r"), nil)
 
 print(string.format(
     "================ window_stat / 多指标折叠 单测: PASS=%d FAIL=%d ================", pass, fail))

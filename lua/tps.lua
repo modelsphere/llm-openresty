@@ -6,7 +6,6 @@
 local M = {}
 
 local util = require "util"
-local slo  = require "slo"   -- CRD 下发的 SLO(未接/裸机时恒空 → 全部回落静态,行为不变)
 
 -- ══════════════════════════════════════════════════════════════════════
 -- TPS 限流(解码速率)辅助:与 TTFT 同构,差三处——P20 低尾 / ewma<=下限 / opt-in。
@@ -93,12 +92,12 @@ function M.tps_metrics(opts, model)
     return M.tps_metrics_beneath(opts, m)
 end
 
--- 优先级链去掉 override 那一层(CRD > factory opts > _G)。只给 /_tps_status 用,同 ttft_metrics_beneath。
+-- 优先级链去掉 override 那一层。只给 /_tps_status 用,同 ttft_metrics_beneath。
+-- opts.tps_metrics 的 q 已是**低尾方向**(CRD 的 otps p80 → q=0.2),换算在 autoconfig 侧做。
 function M.tps_metrics_beneath(opts, model)
     local m = model
     if m == nil then m = ngx.ctx.req_model end
-    local ms = slo.metrics_for(opts.route_name, m, "otps")
-    if ms then return ms, "crd" end
+    if opts.tps_metrics then return opts.tps_metrics, "crd" end
     return { { metric = "p80", q = 0.2, threshold = M.tps_static_limit_for(opts, m) } }, "static"
 end
 

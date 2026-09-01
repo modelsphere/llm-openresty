@@ -8,7 +8,6 @@ local util         = require "util"
 local route        = require "route"
 local ttft         = require "ttft"
 local tps          = require "tps"
-local slo          = require "slo"
 local bodylog      = require "bodylog"
 local reqtransform = require "reqtransform"
 
@@ -152,48 +151,9 @@ function _G.dbg_ttft_status(opts)
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
         -- ↓ 新增(只增不改不重排,回归套件依赖既有字段)
         metrics               = mstat,                        -- 每模型指标列表 + source(override|crd|static)
-        slo_version           = slo.status().version,         -- CRD 下发版本(nil=未接 CRD → 走静态)
         dict_capacity         = td and td:capacity() or nil,  -- 容量观测:直方图 key 数随模型/指标增长,
         dict_free_space       = td and td:free_space() or nil,--   一旦 LRU 淘汰 ewin/fd 锁会静默坏掉折叠
     }))
-end
-
--- ══════════════════════════════════════════════════════════════════════
--- GET  /_slo_conf         → 当前生效的 SLO(CRD 下发)状态 + 已解析的表
--- POST /_slo_conf <json>  → 手动注入一份,仅 127.0.0.1。注入后置 pinned,直到**文件内容真的变了**
---                           才让 loader 夺回控制权,否则会被下一个 tick 抹掉。
--- ⚠️ GET/POST 都是 **per-worker 语义**(SLO 数据在 module-local table,生产 worker 数 20):
---    POST 只改一个 worker;GET 也只反映**接住这次请求的那个 worker**,多次 GET 可能不一致。
---    → 仅用于调试和单 worker 的回归注入;生产应急改阈值请用 /_ttft_limit / /_tps_limit
---      (写 shared dict、全 worker 一致,且优先级在 CRD 之上)。
--- 全局 endpoint,不吃 opts(SLO 数据是整实例一份,按 route 名查)。
--- ══════════════════════════════════════════════════════════════════════
-function _G.dbg_slo_conf()
-    ngx.header["Content-Type"] = "application/json"
-    if ngx.req.get_method() == "POST" then
-        -- 与其它写类 endpoint 一致:只允许本机(location 里已 allow 127.0.0.1 的除外,这里再兜一层)
-        local ip = ngx.var.remote_addr
-        if ip ~= "127.0.0.1" and ip ~= "::1" then
-            ngx.status = 403
-            ngx.say([[{"error":"POST /_slo_conf 仅允许 127.0.0.1"}]])
-            return
-        end
-        ngx.req.read_body()
-        local body = ngx.req.get_body_data()
-        if not body then
-            local fp = ngx.req.get_body_file()          -- body 过大被落盘时从文件读
-            if fp then local f = io.open(fp, "r"); if f then body = f:read("*a"); f:close() end end
-        end
-        local ok, err = slo.apply_post(body or "")
-        if not ok then
-            ngx.status = 400
-            ngx.say(cjson_dbg.encode({ error = "注入失败(未改动现有数据)", detail = err }))
-            return
-        end
-        ngx.say(cjson_dbg.encode({ ok = true, status = slo.status() }))
-        return
-    end
-    ngx.say(cjson_dbg.encode({ status = slo.status(), data = slo.dump() }))
 end
 
 -- POST /_ttft_toggle?on=0 → 关本路由 TTFT(写 ttft_dict 的 "__off",免 reload);
@@ -427,7 +387,6 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_interval  = opts.adaptive_cc and opts.adaptive_cc_interval or nil,
         -- ↓ 新增(只增不改不重排)
         metrics               = mstat,                        -- 每模型指标列表 + source(override|crd|static)
-        slo_version           = slo.status().version,
         dict_capacity         = td and td:capacity() or nil,
         dict_free_space       = td and td:free_space() or nil,
     }))

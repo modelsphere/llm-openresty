@@ -64,6 +64,11 @@ function _G.register_route(name, opts_factory)
         return nil
     end
     opts.route_name = name
+    -- SLO 指标表(autoconfig 从 LLMSLORequirement 渲染进来;裸机/未配 = nil → 走静态单指标)。
+    -- 在这里校验一次(每 reload 一次),而不是每请求校验:热路径上只读已经过关的表。
+    -- 不合法 → 置 nil 回落静态,不让整条路由注册失败(阈值配错不该断流)。
+    opts.ttft_metrics = util.validate_metrics(opts.ttft_metrics, "ttft", name)
+    opts.tps_metrics  = util.validate_metrics(opts.tps_metrics,  "tps",  name)
     -- 新格式 peers_by_model：按 model 分组的子池。把 opts.peers 建成所有子池的并集
     -- （health probe / dict / 容量统计基于 opts.peers，需覆盖全部 peer），
     -- 同时建 opts.peer_keys_by_model 供 do_route 按 body.model 选子池。

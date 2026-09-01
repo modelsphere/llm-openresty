@@ -14,7 +14,6 @@
 --   被 eager 加载(否则没人 require 它们 → _G 入口点不注册)。各模块自身的 require 负责按需拉依赖。
 
 require "util"
-require "slo"
 require "reqtransform"
 require "bodylog"
 require "route"
