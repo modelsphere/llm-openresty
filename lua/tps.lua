@@ -17,7 +17,11 @@ local util = require "util"
 
 function M.tps_dict_if_on(opts)
     if not _G.TPS_ENABLED then return nil end
-    if not opts.tps_limit_tps then return nil end   -- opt-in:没配下限 = 整特性对本路由关
+    -- ⚠️ 这行**曾经**是 opt-in 闸门(没配下限 = 整特性对本路由关)。2026-08-25 给 _G.TPS_LIMIT_TPS
+    --    设了全局默认 20 之后,register_route 会把它填进每条路由 → 这里几乎恒为真,**不再是闸门**。
+    --    现在真正能关掉本特性的只剩:_G.TPS_ENABLED=false(全局)、/_tps_toggle?on=0(每路由热关)、
+    --    或显式把 factory 的 tps_limit_tps 设为 false/nil 并同时清掉全局默认。保留这行是兜底。
+    if not opts.tps_limit_tps then return nil end
     local td = ngx.shared[opts.tps_dict]
     if not td then return nil end
     if td:get((opts.route_name or "?") .. ":__off") then return nil end

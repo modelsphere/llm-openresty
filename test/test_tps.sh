@@ -44,6 +44,9 @@ http {
   init_worker_by_lua_block {
     math.randomseed(ngx.now()*1000 + ngx.worker.pid())
     _G.TPS_BUCKETS = {5,10,20,40,80,150,300}   -- 测试用小桶(溢出>300→P20代表=600)
+    -- ⚠️ 显式钉住全局默认下限,别继承 session_base.conf —— 否则生产一改这里就红(AC6 那次的教训)。
+    --    值取 20(= 2026-08-25 生产值),TP19 据此验「未配 tps_limit_tps 的路由继承全局默认」。
+    _G.TPS_LIMIT_TPS = 20
     local mk={{"127.0.0.1",28911,"m1"},{"127.0.0.1",28912,"m2"},{"127.0.0.1",28913,"m3"}}
     local C={default_max=50,bodylog_default_enabled=false,health_check_interval=5,tps_window=3,tps_ttl=8,tps_probe_window=3,tps_probe_per_window=5,tps_min_decode_s=0.3,adaptive_cc=false}  -- 本套件专测硬熔断;全局默认已翻自适应,显式 false 保持硬熔断
     local function R(x) local t={} for k,v in pairs(C) do t[k]=v end for k,v in pairs(x) do t[k]=v end return t end
@@ -174,10 +177,21 @@ expire; for i in 1 2 3 4 5; do fire $S 10 10 >/dev/null; done; vd=$(ev $S)
 expire; align; for i in 1 2 3 4 5 6; do ( fire $S 50 20 x '"decoy_ct":99999' >/dev/null ) & done; wait; sleep 4; fire $S 50 20 x '"decoy_ct":99999' >/dev/null; sleep 1
 v=$(ev $S); awk "BEGIN{exit !($v>0 && $v<=80)}" && ok "TP18 gmatch 末匹配:decoy99999 被忽略,用真 token → ewma=$v(<=80,非溢出600)" || no "TP18 ewma=$v(若~600=误用 decoy)"
 
-# TP19 opt-in 未配 tps_limit_tps:不限流 + /_tps_status active=false + /_tps_limit warning
-expire; estab $NO 50 20 2>/dev/null; r=$(burst $NO 8 50 20); act=$(curl -s "$NO/_tps_status"|python3 -c 'import sys,json;print(json.load(sys.stdin)["active"])')
-warn=$(curl -s "$NO/_tps_limit"|python3 -c 'import sys,json;print("warning" in json.load(sys.stdin))')
-{ ! echo "$r"|grep -q 429 && [ "$act" = "False" ] && [ "$warn" = "True" ]; } && ok "TP19 opt-in off:不限流($r),active=$act,limit warning=$warn" || no "TP19 r=$r act=$act warn=$warn"
+# TP19 未配 tps_limit_tps 的路由 → **继承全局默认**(2026-08-25 起 _G.TPS_LIMIT_TPS=20)。
+# 本用例原本测的是「opt-in off:不配就整特性关」—— 那个语义已被有意废除(给全局默认是为了解开
+# 「adaptive_cc 在 register 期决定、而 CRD 那时还没加载」的鸡生蛋),故改为验继承是否正确。
+# 只断言配置(确定性,不受解码速率抖动影响);限流行为本身由 TP2-TP13 在 route "s" 上覆盖。
+# 「关掉整特性」现在只剩 _G.TPS_ENABLED=false 与 /_tps_toggle?on=0(后者由 TP10 覆盖)。
+read act lim src < <(curl -s "$NO/_tps_status" | python3 -c \
+  "import sys,json;d=json.load(sys.stdin);print(d['active'], d.get('tps_limit_tps'), d.get('tps_limit_source'))")
+{ [ "$act" = "True" ] && [ "$lim" = "20" ] && [ "$src" = "global_default" ]; } \
+  && ok "TP19 未配路由继承全局默认:active=$act limit=$lim source=$src" \
+  || no "TP19 act=$act lim=$lim src=$src(期望 True/20/global_default)"
+
+# TP19b 显式配了阈值的路由,source 必须是 route 而不是 global_default ——
+# 不能靠比数值判断来源(route "s" 若哪天配成 20 就会跟全局默认撞上,详见 route.lua 的 tps_limit_explicit)
+src_s=$(curl -s "$S/_tps_status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('tps_limit_source'))")
+[ "$src_s" = "route" ] && ok "TP19b 显式配置的路由 source=route" || no "TP19b source=$src_s(期望 route)"
 
 echo ""
 echo "================ TPS 套件: PASS=$P FAIL=$F ================"

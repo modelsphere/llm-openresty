@@ -189,12 +189,15 @@ function M.do_adaptive_cc_loop(opts)
         local maxcc = route.compute_static_max_cc(opts, model)
         if maxcc <= 0 then return end
         local mincc = route.derive_mincc(opts, maxcc)
-        local thr = thr_for(model)
+        -- ⚠️ 这里**只用来判断"本路由到底有没有阈值"**,不再参与比较 —— 过载判定已经走
+        --    ta.hit(tps_assess 遍历声明的指标列表做 OR)和 ttft_over。名字写成 has_threshold
+        --    以免误以为下面还在拿它跟 EWMA 比。
+        local has_threshold = thr_for(model) ~= nil
         local cur = td:get(pre .. "adaptive_cc") or mincc   -- 首次/过期 → 从 min 起步(慢启动,健康则 ×inc 爬升)
         -- 修复1:读+清零本区间被压抑需求(并发 429 数)。>0 = 需求超过 cc、被拒的量 rt_sum 看不到。
         local rej = td:get(pre .. "rej") or 0
         if rej > 0 then td:delete(pre .. "rej") end
-        if thr then
+        if has_threshold then
             local conc = td:get(pre .. "rt_sum") or 0
             local mid  = (opts.adaptive_cc_pressure_frac + opts.adaptive_cc_slack_frac) / 2
             local ABS  = opts.adaptive_cc_abs or 0

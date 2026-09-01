@@ -360,7 +360,12 @@ function _G.dbg_tps_status(opts)
         global_enabled        = _G.TPS_ENABLED and true or false,
         dict_declared         = td and true or false,
         runtime_off           = (td and td:get(rp .. "__off")) and true or false,
-        opt_in                = opts.tps_limit_tps and true or false,   -- 没配 tps_limit_tps = 整特性关
+        -- ⚠️ 2026-08-25 起 _G.TPS_LIMIT_TPS 有了全局默认(20),opt_in **恒为 true**,不再能回答
+        --    「这条路由是不是有人显式配过阈值」。要区分请看下面的 tps_limit_source。字段保留是为了
+        --    不破坏既有消费者(回归套件依赖字段集不变)。
+        opt_in                = opts.tps_limit_tps and true or false,
+        tps_limit_source      = (opts.tps_limit_tps == nil and "none")
+                                or (opts.tps_limit_explicit and "route" or "global_default"),
         active                = active,
         tps_limit_tps         = opts.tps_limit_tps or nil,             -- 路由级默认下限
         tps_limit_by_model    = opts.tps_limit_by_model or nil,        -- 每模型覆盖(peers_by_model)

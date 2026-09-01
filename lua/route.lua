@@ -182,6 +182,11 @@ function _G.register_route(name, opts_factory)
     -- tps_limit_tps 默认 nil(=opt-in:没配则 tps_dict_if_on 返 nil → 全链路短路,零行为变化);
     -- dict 默认共享 "tps_stat";其余节奏参数对位 TTFT。tps_min_tokens 滤短响应(decode_time≈0 噪声)。
     opts.tps_dict                  = opts.tps_dict                  or "tps_stat"
+    -- 记下阈值是路由自己配的还是继承全局默认。_G.TPS_LIMIT_TPS 从 nil 改成 20 之后,
+    -- 「opts.tps_limit_tps 非 nil」不再等于「有人显式配过」,而排查时这两件事必须能分开
+    -- (供 /_tps_status 的 tps_limit_source)。不能靠比较数值判断 —— 路由显式配的值可能
+    -- 恰好等于全局默认(model-service-0.1 就是 20)。
+    opts.tps_limit_explicit        = (opts.tps_limit_tps ~= nil)
     opts.tps_limit_tps             = opts.tps_limit_tps             or _G.TPS_LIMIT_TPS
     opts.tps_ewma_alpha            = opts.tps_ewma_alpha            or 0.3
     if opts.tps_ewma_alpha < 0 or opts.tps_ewma_alpha > 1 then
