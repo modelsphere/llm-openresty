@@ -40,7 +40,10 @@ variables:
   tags: [public-buildx]            # org 共享构建 runner(在线;docker 已 login harbor)
   before_script:
     - 'VERSION="${CI_COMMIT_TAG#openresty/v}"; VERSION="${VERSION#bodylog/v}"; VERSION="${VERSION#exporter/v}"'
-    - 'echo "tag=$CI_COMMIT_TAG → version=$VERSION"'
+    # 预发布 tag(SemVer 的 "-" 后缀,如 0.1.14-slo-rc1)**不动 :latest** —— RC 是拿去测试集群
+    # 验证用的,不该变成「没指定版本时默认拿到的那个」。正式版照旧同时推 :latest。
+    - 'case "$VERSION" in *-*) PRERELEASE=1 ;; *) PRERELEASE= ;; esac'
+    - 'echo "tag=$CI_COMMIT_TAG → version=$VERSION prerelease=${PRERELEASE:-0}"'
 
 # 各组件的触发条件。两条 rule:带自己前缀的 tag,或无前缀的 tag(三个一起)。
 # 都不匹配 → 该 job 不进 pipeline(所以 openresty/v* 那次根本不会去编 bodylog 的 CGO)。
@@ -60,9 +63,10 @@ variables:
 build:openresty:
   extends: [.build-job, .on-openresty]
   script:
-    - docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+    - docker build -t "$IMAGE:$VERSION" .
     - docker push "$IMAGE:$VERSION"
-    - docker push "$IMAGE:latest"
+    # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
+    - if [ -z "$PRERELEASE" ]; then docker tag "$IMAGE:$VERSION" "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
 
 # bodylog-listener 镜像:多阶段 FROM harbor golang:1.24 编 CGO(go-duckdb)→ harbor debian:12-slim。
 # 与 openresty 不同,bodylog 要真编译:go module 从阿里云 goproxy 拉(runner 需能到 mirrors.aliyun.com);
@@ -70,18 +74,20 @@ build:openresty:
 build:bodylog:
   extends: [.build-job, .on-bodylog]
   script:
-    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$VERSION" -t "$BODYLOG_IMAGE:latest" .
+    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$VERSION" .
     - docker push "$BODYLOG_IMAGE:$VERSION"
-    - docker push "$BODYLOG_IMAGE:latest"
+    # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
+    - if [ -z "$PRERELEASE" ]; then docker tag "$BODYLOG_IMAGE:$VERSION" "$BODYLOG_IMAGE:latest" && docker push "$BODYLOG_IMAGE:latest"; fi
 
 # bodylog-exporter 镜像:纯 Go(CGO off)静态二进制,tail 明细 jsonl → Prometheus。
 # 构建上下文 = bodylog-exporter-go/(与 bodylog-listener 隔离,自带 go.mod/go.sum);module 走腾讯 goproxy。
 build:exporter:
   extends: [.build-job, .on-exporter]
   script:
-    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$VERSION" -t "$EXPORTER_IMAGE:latest" bodylog-exporter-go
+    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
     - docker push "$EXPORTER_IMAGE:$VERSION"
-    - docker push "$EXPORTER_IMAGE:latest"
+    # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
+    - if [ -z "$PRERELEASE" ]; then docker tag "$EXPORTER_IMAGE:$VERSION" "$EXPORTER_IMAGE:latest" && docker push "$EXPORTER_IMAGE:latest"; fi
 
 # helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
 # push-chart 自处理 harbor ChartMuseum 鉴权(cm-push 到 harbor-chart-repo = https://registry.example.com/chartrepo/llm)。
