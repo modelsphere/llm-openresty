@@ -102,6 +102,17 @@ expire; estab $S "800 800 800 800 800 800" 800   # EWMA→1200>400 限流
 b=$(burst $S 12 800); c2=$(echo "$b"|grep -o "[0-9]* 200"|grep -o "^[0-9]*"); c4=$(echo "$b"|grep -o "[0-9]* 429"|grep -o "^[0-9]*")
 [ "${c2:-0}" = "5" ] && [ "${c4:-0}" -gt 0 ] && ok "T5 限流+探测:200=$c2(=probe 5) 429=$c4" || no "T5 burst=$b"
 
+# T5b 429 响应体带 metric(触发的是哪条指标)。单指标时恒为 "p80",多指标 OR 下才真正有用 ——
+# 光看 ttft_limit 只能反推是哪条,两条阈值相同就完全分不出来。
+# hit_metric 引擎一直算着,以前从没往外送(注释却写着"供 429 响应体"),这条守住它别再退化。
+bb=$(curl -s --max-time 10 -X POST "$S/v1/chat/completions" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $KEY" -d '{"model":"x","stream":true,"messages":[],"max_tokens":1,"__pf":800}' 2>/dev/null)
+case "$bb" in
+  *'"error":"ttft limit exceeded"'*'"metric":"p80"'*) ok "T5b 429 body 带 metric=p80" ;;
+  *'"error":"ttft limit exceeded"'*) no "T5b 429 body 缺 metric 字段: $(echo "$bb"|head -c 160)" ;;
+  *) echo "   (T5b 未拿到 429 body,探测配额未耗尽?跳过)" ;;
+esac
+
 # T6 窗口边界折叠(burst 后 EWMA 未折,跨窗后才出现)
 expire; align; for i in 1 2 3 4 5 6; do ( fire $S 800 >/dev/null ) & done; wait
 e1=$(ewj $S)   # 窗口未关

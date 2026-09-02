@@ -5,6 +5,8 @@
 
 local M = {}
 
+local util = require "util"
+
 -- ══════════════════════════════════════════════════════════════════════
 -- TTFT 限流辅助：EWMA key 派生 + 半开探测令牌窗口
 -- ══════════════════════════════════════════════════════════════════════
@@ -24,41 +26,102 @@ end
 
 -- key 前缀:"<route>:" +(peers_by_model 时再加 "<model>:")。所有路由共用一份 ttft_stat dict,
 -- 故必须带 route 前缀防跨路由串;peers_by_model 再按 model 子池隔离。EWMA / 探测计数共用此前缀。
-local function ttft_key_prefix(opts)
+-- model 显式传(timer 逐 model,无 ngx.ctx)优先;不传(请求路径)回落 ngx.ctx.req_model。
+-- 唯一构造点 —— 与 tps.tps_key_prefix 对齐,导出供 timers 复用(以前 timers 手搓前缀,必然与真实 schema 分叉)。
+function M.ttft_key_prefix(opts, model)
     local p = (opts.route_name or "?") .. ":"
     if opts.peers_by_model then
-        p = p .. (ngx.ctx.req_model or "?") .. ":"
+        local m = model
+        if m == nil then m = ngx.ctx.req_model end
+        p = p .. (m or "?") .. ":"
     end
     return p
 end
 
--- EWMA key:新格式 "<model>:ewma",老格式 "ewma"(do_log_release / assess_pool / dbg 共用)。
-function M.ttft_ewma_key(opts)
-    return ttft_key_prefix(opts) .. "ewma"
+-- EWMA key:`<route>[:<model>]:<range>:<metric>:ewma`。
+--   <range>  恒为 "all"(ranges 未实现,预留段 —— 将来启用只换这一段,不动 key 布局);
+--   <metric> 是指标名("p80"/"p50"/"avg"),**按语义命名而非数组下标** ——
+--            指标表重排或中间插一项时,下标方案会让 p50 的历史 EWMA 被当成 p95 用满一个 TTL;
+--            语义命名下 metric 一变 key 就变,旧值天然隔离、靠 TTL 自然过期。
+function M.ttft_ewma_key(opts, model, metric)
+    return M.ttft_key_prefix(opts, model) .. "all:" .. (metric or "p80") .. ":ewma"
 end
 
 -- 解析本请求该用的 TTFT 阈值(ms):优先级
 --   ① peers_by_model 路由 + 配了 ttft_limit_by_model[<model>] → 该模型专属阈值
 --   ② opts.ttft_limit_ms(路由级默认;register_route 里已 fallback 到全局 _G.TTFT_LIMIT_MS)
 -- 这样同一 peers_by_model 路由内每个模型可配不同阈值(机型/模型基线不同)。
-function M.ttft_limit_for(opts)
-    -- 在线 override(共享字典,跨 worker 一致,优先级最高;免 reload,见 /_ttft_limit)
-    --   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)
+-- model 同 ttft_key_prefix:显式传优先(timer 无 ngx.ctx),不传回落 ngx.ctx.req_model。
+-- 在线 override(共享字典,跨 worker 一致;免 reload,见 /_ttft_limit)。
+--   peers_by_model:先查 <route>:<model>:limit_override,再查 <route>:limit_override(整路由)。
+-- 单独抽出来供 /_ttft_limit 展示与 ttft_metrics 使用;注意它在链里**排在声明表之后**。
+function M.ttft_override_for(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
     local td = ngx.shared[opts.ttft_dict]
-    if td then
-        if opts.peers_by_model then
-            local mo = td:get((opts.route_name or "?") .. ":" .. (ngx.ctx.req_model or "") .. ":limit_override")
-            if mo then return mo end
-        end
-        local ro = td:get((opts.route_name or "?") .. ":limit_override")
-        if ro then return ro end
+    if not td then return nil end
+    if opts.peers_by_model then
+        local mo = td:get((opts.route_name or "?") .. ":" .. (m or "") .. ":limit_override")
+        if mo then return mo end
     end
+    return td:get((opts.route_name or "?") .. ":limit_override")
+end
+
+-- 只看静态那一段(不查 override、不查声明表):ttft_metrics 的 static 分支用它,
+-- 端点的 shadowed_limit_ms(override 生效时报出它盖住的静态值)也用它。
+function M.ttft_static_limit_for(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
     local bym = opts.ttft_limit_by_model
     if bym and opts.peers_by_model then
-        local v = bym[ngx.ctx.req_model or ""]
+        local v = bym[m or ""]
         if v then return v end
     end
     return opts.ttft_limit_ms
+end
+
+-- (原 M.ttft_limit_for 已删:它的顺序是 override > static,与重排后的
+--  declared > override > static **不一致**,对声明了指标表的路由会返回错误的"生效阈值"。
+--  重构后它已无调用者 —— 一个没人用、所以没人发现它撒谎的导出函数,是最危险的那种死代码。
+--  要"当前生效阈值"请用 M.ttft_metrics(opts, model),它是唯一真相点。)
+
+-- 本路由/模型生效的**指标列表**:{ {metric=, q=, threshold=}, ... };第二返回值是来源(供 dbg 标注)。
+--
+-- 优先级链:**声明的指标表 > 手工 override > 静态单阈值 > _G 全局默认**
+--
+-- ⚠️ 2026-09-01 把 override 从链首降到声明表之下。理由:声明表是权威配置(k8s 上由 operator 从
+--    LLMSLORequirement 渲染),不该被谁在**某一台** openresty 上手工压住而无人知晓 —— 生产有三处
+--    实例,压了一台其余两台行为不同,而且从 CRD 侧完全看不出来。
+--    override 保留是因为**裸机(ts24/ts31/gateway-host)没有 CRD**,那里它是唯一的免 reload 调阈值手段。
+--
+-- 顺带解掉一个真实的耦合:重排之后**指标集合不再依赖 override** ——
+--   有声明表 → 用声明表;没有 → 恒为 p80(override 与静态都是 p80)。
+--   记录侧(ttft_record 也调本函数决定折叠哪些指标)于是不会因为设/清 override 而切换 EWMA key。
+--   旧顺序下会:设 override → 记录切到只折 p80、声明的 p95/avg 停更;清掉 → 再切回去。
+--   两次切换各带来一个冷启动空窗,期间**保护完全关闭**(2026-09-01 在 k8s 实测:设 override 后
+--   连发 20 全部 200,直到跨过一个 20s 折叠窗口才开始拒)。
+--
+-- ⚠️ 判定必须遍历**这张声明表**,而不是遍历 dict 里现存的 EWMA key ——
+--    否则删掉某个指标后,它残留的 EWMA 还会继续拒人最多 ttft_ttl 秒。
+-- threshold 可能是 nil(路由没配阈值):此时**照样记 EWMA**(dbg 可见、AIMD 可读),只是不参与判定。
+function M.ttft_metrics(opts, model)
+    local m = model
+    if m == nil then m = ngx.ctx.req_model end
+    if opts.ttft_metrics then return opts.ttft_metrics, "declared" end
+    local ovr = M.ttft_override_for(opts, m)
+    if ovr then return { { metric = "p80", q = 0.8, threshold = ovr } }, "override" end
+    return { { metric = "p80", q = 0.8, threshold = M.ttft_static_limit_for(opts, m) } }, "static"
+end
+
+-- override 是否**实际生效**。声明了指标表时 override 被压住 —— 端点要如实说,否则运维设完看到
+-- 回显的 limit_override_ms 会以为压住了,实际没有(这正是"端点撒谎"最容易伤人的地方)。
+-- 从 ttft_metrics 的来源推导,**不要**另写一遍 `opts.ttft_metrics == nil` 之类的判断:
+-- 那等于把优先级链复制第二份,链再改一次(比如将来加 ranges 层)就会有一处漏改,
+-- 表现为端点报的 effective 与实际判定不符 —— 又是一次"端点撒谎"。
+-- 只在 dbg 端点调用,多一次解析无所谓。
+function M.ttft_override_effective(opts, model)
+    local _, src = M.ttft_metrics(opts, model)
+    return src == "override"
 end
 
 -- 样本 → 直方图桶号(1..#buckets+1,最后一个是 overflow)
@@ -68,23 +131,8 @@ local function ttft_bucket_index(ms)
     return #b + 1
 end
 
--- 从窗口 w 的直方图算 P80(累计越过 80% 的桶上界);空窗返 nil。
-local function ttft_window_p80(td, pre, w)
-    local b = _G.TTFT_BUCKETS_MS
-    local n = #b
-    local counts, total = {}, 0
-    for i = 1, n + 1 do
-        local c = td:get(pre .. "h:" .. w .. ":" .. i) or 0
-        counts[i] = c; total = total + c
-    end
-    if total == 0 then return nil end
-    local target, cum = total * 0.8, 0
-    for i = 1, n + 1 do
-        cum = cum + counts[i]
-        if cum >= target then return b[i] or (b[n] * 2) end   -- overflow 桶代表值 = 末桶×2
-    end
-    return b[n] * 2
-end
+-- 窗口统计量已抽到 util.window_stat(TTFT/TPS 共用),分位系数由 ttft_metrics 给。
+-- ⚠️ _G.TTFT_BUCKETS_MS 在**调用点现读**,不快照进 opts —— 保持「改 _G 免 reload 立即生效」。
 
 -- TTFT 样本入账:每 ttft_window 秒一个窗口,窗口内只对预定义桶 incr(原子,无锁);
 -- 跨入新窗口时 lazy 折叠已完成窗口——取该窗口 P80 折进 EWMA(α·P80 + (1-α)·旧)。
@@ -92,7 +140,7 @@ end
 function M.ttft_record(opts, td, sample_ms)
     local W   = opts.ttft_window
     local win = math.floor(ngx.now() / W)
-    local pre = ttft_key_prefix(opts)
+    local pre = M.ttft_key_prefix(opts)
     local ttl = opts.ttft_ttl
     local lastk = pre .. "ewin"
     local last = td:get(lastk)
@@ -105,21 +153,57 @@ function M.ttft_record(opts, td, sample_ms)
         -- 窗口数据本就过期,直接跳过(ewma 靠 TTL 自然衰减)。
         local horizon = math.ceil(ttl / W)
         if win - last > horizon then last = win - horizon end
+        local ms = M.ttft_metrics(opts)
         for w = last, win - 1 do
             if td:add(pre .. "fd:" .. w, 1, ttl) then -- 占位:本 worker 折窗口 w(锁活满折叠地平线=ttl)
-                local p80 = ttft_window_p80(td, pre, w)
-                if p80 then
-                    local old = td:get(pre .. "ewma")
-                    local a   = opts.ttft_ewma_alpha
-                    td:set(pre .. "ewma", old and (a * p80 + (1 - a) * old) or p80, ttl)
+                local a = opts.ttft_ewma_alpha
+                -- 直方图**只有一份**:N 个指标从同一份桶各算各的,分别折进各自的 EWMA。热路径开销≈0。
+                for _, mt in ipairs(ms) do
+                    local v = util.window_stat(td, pre, w, _G.TTFT_BUCKETS_MS, mt.metric, mt.q)
+                    if v then
+                        local k   = M.ttft_ewma_key(opts, nil, mt.metric)
+                        local old = td:get(k)
+                        td:set(k, old and (a * v + (1 - a) * old) or v, ttl)
+                    end
                 end
                 for b = 1, #_G.TTFT_BUCKETS_MS + 1 do td:delete(pre .. "h:" .. w .. ":" .. b) end
+                td:delete(pre .. "h:" .. w .. ":sum")   -- avg 的累计器,与桶同期清理(防孤儿泄漏)
+                td:delete(pre .. "h:" .. w .. ":cnt")
             end
         end
         td:set(lastk, win, ttl)
     end
     -- 第 4 参 init_ttl=ttl:给直方图桶设过期,ewin 空档过期/竞态漏折时孤儿桶自愈,不在共享字典里堆积
     td:incr(pre .. "h:" .. win .. ":" .. ttft_bucket_index(sample_ms), 1, 0, ttl)
+    -- avg 指标用:sum/cnt 与桶同 TTL(同样带 init_ttl,否则孤儿 key 泄漏)
+    td:incr(pre .. "h:" .. win .. ":sum", sample_ms, 0, ttl)
+    td:incr(pre .. "h:" .. win .. ":cnt", 1, 0, ttl)
+end
+
+-- ── 违约判定(access 的 TTFT-429 与 timers 的 AIMD 共用同一入口)────────────────
+-- 遍历**声明的**指标列表,任一 EWMA 超阈值即违约(OR)。返回:
+--   { ewma = <第一条指标的 EWMA,供展示/back-compat>,
+--     hit = bool, hit_ewma / hit_limit / hit_metric = 触发那一条的值 }
+--   hit_metric 进 429 响应体的 "metric" 字段(access.lua)—— 多指标 OR 时,
+--   光看 hit_limit 只能反推是哪条,两条阈值相同就分不出来。
+-- 单指标(P0 默认)时 ewma == hit_ewma、hit_limit == 旧的 ttft_limit → 429 响应体逐字节不变。
+-- ⚠️ strict 保留一个**既有的不对称**,不要"顺手统一":
+--     access.lua 的 TTFT-429 用 `>=`(strict=false,默认);timers.lua 的 ttft_overloaded 用 `>`(strict=true)。
+--     两者本来就不同(EWMA 恰等于阈值时:access 拒、AIMD 不收),统一会改变边界行为。
+--     tps_assess 有完全对称的一处(access `<=` vs AIMD `<`)。
+function M.ttft_assess(opts, td, model, strict)
+    local ms = M.ttft_metrics(opts, model)
+    local first
+    for i, mt in ipairs(ms) do
+        local ew = td:get(M.ttft_ewma_key(opts, model, mt.metric))
+        if i == 1 then first = ew end
+        if ew and mt.threshold
+           and ((strict and ew > mt.threshold) or ((not strict) and ew >= mt.threshold)) then
+            return { ewma = first, hit = true,
+                     hit_ewma = ew, hit_limit = mt.threshold, hit_metric = mt.metric }
+        end
+    end
+    return { ewma = first, hit = false }
 end
 
 -- 半开探测(circuit-breaker half-open)：限流态下不 100% 拒,每个时间窗口放行
@@ -133,7 +217,7 @@ function M.ttft_allow_probe(opts)
     local td = ngx.shared[opts.ttft_dict]
     if not td then return true end   -- dict 没声明(不该到这),稳妥放行
     local win = math.floor(ngx.now() / opts.ttft_probe_window)
-    local key = ttft_key_prefix(opts) .. "probe:" .. win
+    local key = M.ttft_key_prefix(opts) .. "probe:" .. win
     local n = td:incr(key, 1, 0)
     -- dict 满/OOM 时 incr 返 nil：fail-open(放行)而不是 `nil <= N` 崩成 500。
     -- dict 满本身是病态(EWMA set 也会失败→TTL 过期→自动退出限流态),放行无害。

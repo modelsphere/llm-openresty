@@ -163,8 +163,13 @@ function _G.do_route(opts)
     -- ── TTFT 主限流(按路由 opt-in:ttft_limit_ms 未配则整段跳过,行为零变化)──
     -- EWMA 超阈值进入限流态,但走半开探测:本窗口探测名额内的请求放行(继续测 TTFT),
     -- 其余 429。后端恢复 → 探测样本拉低 EWMA → 自动解除。
-    local ttft_limit = ttft.ttft_limit_for(opts)   -- 按模型解析(peers_by_model 可每模型不同)
-    local hit_ttft = ttft_limit and a.ttft_ewma and a.ttft_ewma >= ttft_limit
+    -- 判定已由 assess_pool 里的 ttft_assess 做完(遍历声明的指标列表 OR);这里只取结果。
+    -- 单指标(P0 默认)时 hit_ewma/hit_limit 就是旧的 a.ttft_ewma / ttft_limit_for → 响应体逐字节不变。
+    local hit_ttft   = a.ttft_hit and a.ttft_hit.hit
+    local ttft_ewma  = hit_ttft and a.ttft_hit.hit_ewma  or a.ttft_ewma
+    local ttft_limit = hit_ttft and a.ttft_hit.hit_limit or nil
+    -- 触发的是哪条指标。多指标(OR)时,光看 ttft_limit 只能反推,两条阈值相同就完全分不出来。
+    local ttft_metric = hit_ttft and a.ttft_hit.hit_metric or "-"
     -- ttft_429_disabled:独立开关关掉硬 429(EWMA 测量 + cc 收缩仍在),TTFT 高只软控不硬拒。
     if hit_ttft and not is_probe and not ttft.ttft_429_disabled(opts) and not ttft.ttft_allow_probe(opts) then
         ngx.status = 429
@@ -172,23 +177,28 @@ function _G.do_route(opts)
         ngx.header["Content-Type"] = "application/json"
         ngx.header["Retry-After"]  = "1"
         ngx.say(string.format(
-            [[{"error":"ttft limit exceeded","trigger":"ttft_ewma","ttft_ewma":%.1f,"ttft_limit":%d,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s"}]],
-            a.ttft_ewma, ttft_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name))
+            -- metric **追加在末尾**,不插中间:遵循「只增字段,不改名、不删、不重排」——
+            -- 429 body 是对外契约,虽然没有测试断言精确形状,但下游可能按位置解析。
+            [[{"error":"ttft limit exceeded","trigger":"ttft_ewma","ttft_ewma":%.1f,"ttft_limit":%d,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s","metric":"%s"}]],
+            ttft_ewma, ttft_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name, ttft_metric))
         return ngx.exit(429)
     end
     -- ── TPS 主限流(opt-in:tps_limit_tps 未配 → tps_dict_if_on nil → a.tps_ewma nil → 跳过)──
     -- 方向与 TTFT 相反:EWMA <= 下限 进入限流态(解码速率太低=后端过载),半开探测机制同 TTFT。
     -- ⚠️ 与自适应并发互斥:adaptive_cc=true 时该 EWMA 已用于动态调 limit(上面并发 gate),这里跳过硬 429。
-    local tps_limit = (not opts.adaptive_cc) and tps.tps_limit_for(opts) or nil
-    local hit_tps = tps_limit and a.tps_ewma and a.tps_ewma <= tps_limit
+    -- 同 TTFT:判定在 assess_pool 里做完(tps_assess strict=false → `<=`,与改动前一致)
+    local hit_tps   = (not opts.adaptive_cc) and a.tps_hit and a.tps_hit.hit
+    local tps_ewma  = hit_tps and a.tps_hit.hit_ewma  or a.tps_ewma
+    local tps_limit = hit_tps and a.tps_hit.hit_limit or nil
+    local tps_metric = hit_tps and a.tps_hit.hit_metric or "-"   -- 同 TTFT:多指标时指出触发那一条
     if hit_tps and not is_probe and not tps.tps_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":tps",1,0) end end
         ngx.header["Content-Type"] = "application/json"
         ngx.header["Retry-After"]  = "1"
         ngx.say(string.format(
-            [[{"error":"tps limit exceeded","trigger":"tps_ewma","tps_ewma":%.1f,"tps_limit":%.1f,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s"}]],
-            a.tps_ewma, tps_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name))
+            [[{"error":"tps limit exceeded","trigger":"tps_ewma","tps_ewma":%.1f,"tps_limit":%.1f,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s","metric":"%s"}]],
+            tps_ewma, tps_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level, opts.route_name, tps_metric))
         return ngx.exit(429)
     end
     -- 通过容量后才做带锁选址(与 dbg 共用 pick_from)

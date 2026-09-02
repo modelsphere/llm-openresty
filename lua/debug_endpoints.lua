@@ -98,12 +98,40 @@ function _G.dbg_ttft_status(opts)
     ngx.header["Content-Type"] = "application/json"
     local td = ngx.shared[opts.ttft_dict]   -- 原始 handle(用于展示,即便热关也能看 EWMA)
     local rp = (opts.route_name or "?") .. ":"   -- route 前缀(共享 dict)
-    local ewmas = {}
+    -- ewma_ms 保持老形状(model → 数值,单指标时取第一条),新增 metrics 展示完整指标列表。
+    local ewmas, mstat = {}, {}
     if td then
+        local models = {}
         if opts.peers_by_model then
-            for m in pairs(opts.peers_by_model) do ewmas[m] = td:get(rp .. m .. ":ewma") end
+            for m in pairs(opts.peers_by_model) do models[#models+1] = m end
         else
-            ewmas["_"] = td:get(rp .. "ewma")
+            models[1] = false
+        end
+        for _, m in ipairs(models) do
+            local key = (m == false) and "_" or m
+            local mlist, msrc = ttft.ttft_metrics(opts, m)   -- msrc: override|declared|static
+            local list = {}   -- 纯数组:混入字符串 key 会让 cjson 编成对象,source 挂外层 wrapper
+            for _, mt in ipairs(mlist) do
+                list[#list+1] = { metric = mt.metric, q = mt.q,
+                                  threshold_ms = mt.threshold,
+                                  ewma_ms = td:get(ttft.ttft_ewma_key(opts, m, mt.metric)) }
+            end
+            ewmas[key] = list[1] and list[1].ewma_ms or nil
+            -- ⚠️ metrics 用**数组**而不是「按 model 键的 map」:回归脚本 test_ttft.sh 的 ewv() 是
+            --    `grep -o '"_":[0-9.]*'` 直接在原始 JSON 文本里捞,而 [0-9.]* 能匹配零个字符 ——
+            --    若这里也出现 `"_":[`,head -1 可能取到它,数字部分为空 → ewma 假报空。
+            --    数组形状下只有 "model":"_",不会产生裸的 `"<model>":` 键。
+            -- shadowed:override 生效时报出它盖住的静态值(override 现在只压静态那一层)。
+            -- ignored_override:反过来 —— 声明表把 override 压住了。这条更要报:运维设完
+            -- override 看到端点回显了值,很容易以为生效,实际没有。
+            local shadow, ignored
+            if msrc == "override" then
+                shadow = { source = "static", threshold_ms = ttft.ttft_static_limit_for(opts, m) }
+            elseif msrc == "declared" then
+                local o = ttft.ttft_override_for(opts, m)
+                if o then ignored = { override_ms = o, reason = "declared 指标表优先,override 不生效" } end
+            end
+            mstat[#mstat+1] = { model = key, source = msrc, items = list, shadowed = shadow, ignored_override = ignored }
         end
     end
     local active = ttft.ttft_dict_if_on(opts) and true or false
@@ -114,7 +142,9 @@ function _G.dbg_ttft_status(opts)
         dict_declared         = td and true or false,
         runtime_off           = (td and td:get(rp .. "__off")) and true or false,
         active                = active,
-        enforcing             = (active and opts.ttft_limit_ms) and true or false,
+        -- 声明了指标表但没有静态 ttft_limit_ms 时也在判定 —— 只看静态会误报 false。
+        -- (_G.TTFT_LIMIT_MS 有全局默认 30000,今天填得满,但口径要跟判定链一致。)
+        enforcing             = (active and (opts.ttft_limit_ms or opts.ttft_metrics)) and true or false,
         ttft_429_enabled      = not ttft.ttft_429_disabled(opts),   -- 硬 429 独立开关(false=只软控/cc收缩,不硬拒)
         ttft_limit_ms         = opts.ttft_limit_ms or nil,          -- 路由级默认阈值
         ttft_limit_by_model   = opts.ttft_limit_by_model or nil,    -- 每模型覆盖(peers_by_model)
@@ -124,6 +154,10 @@ function _G.dbg_ttft_status(opts)
         probe_window          = opts.ttft_probe_window,
         probe_per_window      = opts.ttft_probe_per_window,
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
+        -- ↓ 新增(只增不改不重排,回归套件依赖既有字段)
+        metrics               = mstat,                        -- 每模型指标列表 + source(override|declared|static)
+        dict_capacity         = td and td:capacity() or nil,  -- 容量观测:直方图 key 数随模型/指标增长,
+        dict_free_space       = td and td:free_space() or nil,--   一旦 LRU 淘汰 ewin/fd 锁会静默坏掉折叠
     }))
 end
 
@@ -190,6 +224,28 @@ end
 -- GET  /_ttft_limit?ms=45000&model=X → 设某模型阈值(仅 peers_by_model 路由)
 -- GET  /_ttft_limit?ms=0 [&model=X]  → 清除 override(回落静态默认)
 -- 注意:override 存共享字典、无 TTL,会跨 reload 存活;改 conf 默认值要同时清 override 才生效。
+-- 手工 override 的存活时长。**默认过期**是刻意的:
+--   lua_shared_dict 跨 reload 存活,而 override 压过声明表 —— 无 TTL 的话,半夜应急设的
+--   一个值会让该 route 声明的阈值**静默失效数月**,而且从任何端点都看不出来。
+--   给它一个自动回落的期限,让"忘了删"从一个长期故障退化成一段有限的偏离。
+-- ?ttl=0 显式表示永不过期(真需要长期钉住时用),响应里会标出来。
+local OVERRIDE_TTL_DEFAULT = 7200   -- 2h
+
+-- 返回 ttl(秒), 错误字符串;ttl==0 表示永久
+local function parse_override_ttl(arg_ttl)
+    if arg_ttl == nil then return OVERRIDE_TTL_DEFAULT end
+    local n = tonumber(arg_ttl)
+    if not n or n < 0 then return nil, "ttl must be >= 0 (0 = 永不过期)" end
+    return n
+end
+
+-- shared dict 的 :ttl() 对「无过期时间」的 key 返回 0,与我们的 0 语义一致,直接透传。
+local function override_ttl_of(td, k)
+    if td:get(k) == nil then return nil end
+    local t = td:ttl(k)
+    return t or nil
+end
+
 function _G.dbg_ttft_limit(opts)
     if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
@@ -202,22 +258,46 @@ function _G.dbg_ttft_limit(opts)
     local model = ngx.var.arg_model
     local k = (opts.route_name or "?") .. ":" .. (model and (model .. ":") or "") .. "limit_override"
     local ms = ngx.var.arg_ms
+    local ttl, terr = parse_override_ttl(ngx.var.arg_ttl)
+    if terr then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ ok = false, error = terr }))
+        return
+    end
     if ms then
         local n = tonumber(ms)
         if not n or n < 0 then
             ngx.status = 400
-            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?ms=0 清除 | ?ms=<正整数> 设阈值 [&model=X]" }))
+            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?ms=0 清除 | ?ms=<正整数> 设阈值 [&model=X] [&ttl=秒,默认7200,0=永久]" }))
             return
         end
-        if n == 0 then td:delete(k) else td:set(k, n) end
+        if n == 0 then td:delete(k) else td:set(k, n, ttl) end
     end
+    -- ⚠️ 必须回答「这次设置到底生效没有」:声明了指标表(CRD 渲染 / 手写)时 override 被压住,
+    -- 而端点若只回显 limit_override_ms,运维会以为压住了。effective=false 时给出原因。
+    -- ⚠️ Lua 陷阱:不能写 `has_ovr and eff or nil` —— eff 为 false 时 `x and false or nil`
+    --    恒得 nil,字段会整个消失,前端看到的是"没设 override",与事实相反。
+    --    先算好再放进表里。
+    local eff = ttft.ttft_override_effective(opts, model or false)
+    local ovr_eff = nil
+    if td:get(k) ~= nil then ovr_eff = eff end
+    local declared = opts.ttft_metrics and true or false
     ngx.say(cjson_dbg.encode({
         route             = opts.route_name, ok = true,
         model             = model or nil,
         limit_override_ms = td:get(k) or nil,             -- 当前 override(nil=未设,回落静态)
         static_limit_ms   = opts.ttft_limit_ms or nil,    -- 路由级静态默认
         static_by_model   = opts.ttft_limit_by_model or nil,
-        priority          = "override > 静态per-model > 静态route",
+        priority          = "declared(路由声明的指标表) > override > 静态per-model > 静态route",
+        -- ↓ 新增(只增不改不重排)
+        override_ttl_s    = override_ttl_of(td, k),       -- 剩余秒数(0=永不过期;nil=未设 override)
+        override_effective = ovr_eff,                     -- false = 设了但被声明表压住;nil = 没设
+        override_ignored_reason = (td:get(k) ~= nil and not eff)
+            and "route declares ttft_metrics; declared table wins over manual override" or nil,
+        -- override 生效时报出它盖住的静态值(重排后 override 只压静态那一层)
+        shadowed_limit_ms = (td:get(k) ~= nil and eff)
+            and ttft.ttft_static_limit_for(opts, model or false) or nil,
+        declares_metrics  = declared,
     }))
 end
 
@@ -260,15 +340,36 @@ function _G.dbg_tps_status(opts)
             fill_cc("_", false)
         end
     end
+    -- ewma_tps 保持老形状(单指标时取第一条),新增 metrics 展示完整指标列表。同 /_ttft_status。
+    local mstat = {}
     if td then
+        local models = {}
         if opts.peers_by_model then
-            for m in pairs(opts.peers_by_model) do
-                ewmas[m]   = td:get(rp .. m .. ":ewma")
-                nousage[m] = td:get(rp .. m .. ":nousage") or 0
-            end
+            for m in pairs(opts.peers_by_model) do models[#models+1] = m end
         else
-            ewmas["_"]   = td:get(rp .. "ewma")
-            nousage["_"] = td:get(rp .. "nousage") or 0
+            models[1] = false
+        end
+        for _, m in ipairs(models) do
+            local key = (m == false) and "_" or m
+            local pre = (m == false) and rp or (rp .. m .. ":")
+            local mlist, msrc = tps.tps_metrics(opts, m)     -- msrc: override|declared|static
+            local list = {}   -- 纯数组,理由同 /_ttft_status
+            for _, mt in ipairs(mlist) do
+                list[#list+1] = { metric = mt.metric, q = mt.q,
+                                  threshold_tps = mt.threshold,
+                                  ewma_tps = td:get(tps.tps_ewma_key(opts, m, mt.metric)) }
+            end
+            ewmas[key]   = list[1] and list[1].ewma_tps or nil
+            local shadow, ignored   -- 语义同 /_ttft_status
+            if msrc == "override" then
+                shadow = { source = "static", threshold_tps = tps.tps_static_limit_for(opts, m) }
+            elseif msrc == "declared" then
+                local o = tps.tps_override_for(opts, m)
+                if o then ignored = { override_tps = o, reason = "declared 指标表优先,override 不生效" } end
+            end
+            -- 数组形状,理由同 /_ttft_status
+            mstat[#mstat+1] = { model = key, source = msrc, items = list, shadowed = shadow, ignored_override = ignored }
+            nousage[key] = td:get(pre .. "nousage") or 0
         end
     end
     local active = tps.tps_dict_if_on(opts) and true or false
@@ -278,7 +379,21 @@ function _G.dbg_tps_status(opts)
         global_enabled        = _G.TPS_ENABLED and true or false,
         dict_declared         = td and true or false,
         runtime_off           = (td and td:get(rp .. "__off")) and true or false,
-        opt_in                = opts.tps_limit_tps and true or false,   -- 没配 tps_limit_tps = 整特性关
+        -- ⚠️ opt_in 只看静态下限,**已经答不了「本特性是不是开着」**,两个原因叠加:
+        --    ① 2026-08-25 起 _G.TPS_LIMIT_TPS 有了全局默认(20)→ 恒为 true;
+        --    ② 闸门(tps_dict_if_on)现在认 tps_metrics → 只声明指标表时特性是开的、这里却是 false。
+        --    字段保留是为了不破坏既有消费者(回归套件依赖字段集不变)。
+        --    **要判特性开没开看 active;要判阈值哪来的看 tps_limit_source。**
+        opt_in                = opts.tps_limit_tps and true or false,
+        -- 与 tps_dict_if_on 的闸门同口径:declared(指标表)排在静态之前,与判定链一致。
+        -- 不同口径会让端点自己打自己 —— active=true 而 source="none"。
+        -- 顺序必须与 tps_metrics 的优先级链一致:declared > override > 静态。
+        -- 漏了 override 会让同一个端点的两个字段打架 —— metrics[].source 报 "override",
+        -- 而这里报 "route"/"global_default"。
+        tps_limit_source      = (opts.tps_metrics and "declared")
+                                or (tps.tps_override_for(opts, false) and "override")
+                                or (opts.tps_limit_tps == nil and "none")
+                                or (opts.tps_limit_explicit and "route" or "global_default"),
         active                = active,
         tps_limit_tps         = opts.tps_limit_tps or nil,             -- 路由级默认下限
         tps_limit_by_model    = opts.tps_limit_by_model or nil,        -- 每模型覆盖(peers_by_model)
@@ -303,6 +418,10 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_abs       = opts.adaptive_cc and opts.adaptive_cc_abs or nil,   -- 绝对头寸(slots)
         adaptive_cc_rej       = adaptive_cc_rej,     -- 本区间被压抑需求(并发429数);>0 → 下tick 快涨到 desired
         adaptive_cc_interval  = opts.adaptive_cc and opts.adaptive_cc_interval or nil,
+        -- ↓ 新增(只增不改不重排)
+        metrics               = mstat,                        -- 每模型指标列表 + source(override|declared|static)
+        dict_capacity         = td and td:capacity() or nil,
+        dict_free_space       = td and td:free_space() or nil,
     }))
 end
 
@@ -404,19 +523,31 @@ function _G.dbg_tps_limit(opts)
     local model = ngx.var.arg_model
     local k = (opts.route_name or "?") .. ":" .. (model and (model .. ":") or "") .. "limit_override"
     local arg_tps = ngx.var.arg_tps   -- ⚠️ 不能命名 tps:会遮蔽顶层 `local tps = require "tps"`(下方 tps.tps_dict_if_on)
+    local ttl, terr = parse_override_ttl(ngx.var.arg_ttl)
+    if terr then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ ok = false, error = terr }))
+        return
+    end
     if arg_tps then
         local n = tonumber(arg_tps)
         if not n or n < 0 then
             ngx.status = 400
-            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?tps=0 清除 | ?tps=<正数> 设下限 [&model=X]" }))
+            ngx.say(cjson_dbg.encode({ ok = false, error = "use ?tps=0 清除 | ?tps=<正数> 设下限 [&model=X] [&ttl=秒,默认7200,0=永久]" }))
             return
         end
-        if n == 0 then td:delete(k) else td:set(k, n) end
+        if n == 0 then td:delete(k) else td:set(k, n, ttl) end
     end
     -- ⚠️ opt-in 陷阱:TPS 是静态 opt-in(tps_dict_if_on 会先查 opts.tps_limit_tps)。若路由没在
     -- factory 配 tps_limit_tps,光设 override 不会生效(采样/判定整链短路)——显式 enforcing + warning,
     -- 避免运维设了 override 以为已保护、实际放行(与 TTFT 默认开不同,TTFT 无此陷阱)。
     local opted_in = opts.tps_limit_tps and true or false
+    -- ⚠️ Lua 陷阱:不能写 `has_ovr and eff or nil` —— eff 为 false 时 `x and false or nil`
+    --    恒得 nil,字段会整个消失,前端看到的是"没设 override",与事实相反。
+    --    先算好再放进表里。
+    local eff = tps.tps_override_effective(opts, model or false)
+    local ovr_eff = nil
+    if td:get(k) ~= nil then ovr_eff = eff end   -- 语义同 /_ttft_limit
     ngx.say(cjson_dbg.encode({
         route              = opts.route_name, ok = true,
         model              = model or nil,
@@ -427,7 +558,15 @@ function _G.dbg_tps_limit(opts)
         limit_override_tps = td:get(k) or nil,             -- 当前 override(nil=未设,回落静态)
         static_limit_tps   = opts.tps_limit_tps or nil,    -- 路由级静态默认
         static_by_model    = opts.tps_limit_by_model or nil,
-        priority           = "override > 静态per-model > 静态route",
+        priority           = "declared(路由声明的指标表) > override > 静态per-model > 静态route",
+        -- ↓ 新增(只增不改不重排)
+        override_ttl_s     = override_ttl_of(td, k),       -- 剩余秒数(0=永不过期;nil=未设 override)
+        override_effective = ovr_eff,                      -- false = 设了但被声明表压住;nil = 没设
+        override_ignored_reason = (td:get(k) ~= nil and not eff)
+            and "route declares tps_metrics; declared table wins over manual override" or nil,
+        shadowed_limit_tps = (td:get(k) ~= nil and eff)
+            and tps.tps_static_limit_for(opts, model or false) or nil,
+        declares_metrics   = opts.tps_metrics and true or false,
     }))
 end
 

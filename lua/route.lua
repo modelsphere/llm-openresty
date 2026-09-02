@@ -64,6 +64,18 @@ function _G.register_route(name, opts_factory)
         return nil
     end
     opts.route_name = name
+    -- 路由声明的指标表(未配 = nil → 走静态单阈值)。谁写进来的引擎不关心:
+    -- 可以是外部工具渲染的,也可以在 conf 里手写 —— 对引擎完全等价。
+    -- 在这里校验一次(每 reload 一次),而不是每请求校验:热路径上只读已经过关的表。
+    -- 不合法 → 置 nil 回落静态,不让整条路由注册失败(阈值配错不该断流)。
+    --
+    -- ⚠️⚠️ **这两行必须早于所有读 opts.*_metrics 的代码**,顺序有语义:
+    --   下面的 adaptive_cc 闸门(`opts.tps_limit_tps or opts.tps_metrics`)以及运行时的
+    --   tps_dict_if_on 都拿它当「有没有声明」的依据。若校验被挪到闸门之后,一张非法的
+    --   tps_metrics(如 q=1.5)会把 AIMD 打开,而判定时它已被丢弃 → has_threshold 为 nil
+    --   → AIMD 每 tick 空转,cc 靠 TTL 老化到 min,静默降容量且无告警。
+    opts.ttft_metrics = util.validate_metrics(opts.ttft_metrics, "ttft", name)
+    opts.tps_metrics  = util.validate_metrics(opts.tps_metrics,  "tps",  name)
     -- 新格式 peers_by_model：按 model 分组的子池。把 opts.peers 建成所有子池的并集
     -- （health probe / dict / 容量统计基于 opts.peers，需覆盖全部 peer），
     -- 同时建 opts.peer_keys_by_model 供 do_route 按 body.model 选子池。
@@ -177,6 +189,11 @@ function _G.register_route(name, opts_factory)
     -- tps_limit_tps 默认 nil(=opt-in:没配则 tps_dict_if_on 返 nil → 全链路短路,零行为变化);
     -- dict 默认共享 "tps_stat";其余节奏参数对位 TTFT。tps_min_tokens 滤短响应(decode_time≈0 噪声)。
     opts.tps_dict                  = opts.tps_dict                  or "tps_stat"
+    -- 记下阈值是路由自己配的还是继承全局默认。_G.TPS_LIMIT_TPS 从 nil 改成 20 之后,
+    -- 「opts.tps_limit_tps 非 nil」不再等于「有人显式配过」,而排查时这两件事必须能分开
+    -- (供 /_tps_status 的 tps_limit_source)。不能靠比较数值判断 —— 路由显式配的值可能
+    -- 恰好等于全局默认(model-service-0.1 就是 20)。
+    opts.tps_limit_explicit        = (opts.tps_limit_tps ~= nil)
     opts.tps_limit_tps             = opts.tps_limit_tps             or _G.TPS_LIMIT_TPS
     opts.tps_ewma_alpha            = opts.tps_ewma_alpha            or 0.3
     if opts.tps_ewma_alpha < 0 or opts.tps_ewma_alpha > 1 then
@@ -205,9 +222,12 @@ function _G.register_route(name, opts_factory)
     -- adaptive_cc=true 时:复用 TPS EWMA 当反馈信号,每 adaptive_cc_interval 调一次池并发上限——
     --   EWMA < 阈值(tps_limit_tps/by_model/override)→ ×dec(减);>= → ×inc(增);clamp 在 [min,静态max]。
     --   max=运行时静态 limit(不配);min 不配则按 model 从静态 max 派生(×min_frac)。开了则跳过 TPS-429。
-    -- 默认模式:配了 tps_limit_tps 且未显式指定 adaptive_cc → 按全局 _G.ADAPTIVE_CC_DEFAULT 定(默认 true=自适应)。
-    -- 显式 adaptive_cc=false → 硬熔断;显式 true → 自适应。没配 tps_limit_tps → 保持 nil(无 tps 限流)。
-    if opts.adaptive_cc == nil and opts.tps_limit_tps then
+    -- 默认模式:声明了 OTPS 阈值(静态 tps_limit_tps **或**多指标表 tps_metrics)且未显式指定
+    -- adaptive_cc → 按全局 _G.ADAPTIVE_CC_DEFAULT 定(默认 true=自适应)。
+    -- 显式 adaptive_cc=false → 硬熔断;显式 true → 自适应。两种都没声明 → 保持 nil(无 tps 限流)。
+    -- ⚠️ 必须与 tps.tps_dict_if_on 的闸门口径一致:一处认 tps_metrics 另一处不认的话,
+    --    「只配 tps_metrics」的路由会走进硬 429 而不是 AIMD,与配了静态阈值的路由行为不一致。
+    if opts.adaptive_cc == nil and (opts.tps_limit_tps or opts.tps_metrics) then
         opts.adaptive_cc = _G.ADAPTIVE_CC_DEFAULT and true or nil
     elseif opts.adaptive_cc == false then
         opts.adaptive_cc = nil                                       -- 显式关 = 走硬熔断(与"未开"同路径)
@@ -426,18 +446,22 @@ function M.assess_pool(opts, peers, peer_keys)
     local _, _, avg_5min = M.compute_cluster_avg(opts.cluster_avg_dict,
         opts.peers_by_model and ngx.ctx.req_model or nil)
 
-    -- TTFT EWMA(池级,按 model 分 key;总开关关 / dict 未声明 = nil = 不参与判定)
-    local ttft_ewma
+    -- TTFT 违约判定(池级,按 model 分 key;总开关关 / dict 未声明 = nil = 不参与判定)。
+    -- ttft_assess 遍历**声明的**指标列表做 OR;单指标(P0 默认)时 ttft_ewma 与旧行为逐字节一致。
+    local ttft_ewma, ttft_hit
     local td = ttft.ttft_dict_if_on(opts)
     if td then
-        ttft_ewma = td:get(ttft.ttft_ewma_key(opts))
+        ttft_hit  = ttft.ttft_assess(opts, td)
+        ttft_ewma = ttft_hit.ewma
     end
 
-    -- TPS EWMA(解码速率,opt-in;特性关/无数据 = nil = 不参与判定,fail-open)
-    local tps_ewma
+    -- TPS 违约判定(解码速率,opt-in;特性关/无数据 = nil = 不参与判定,fail-open)
+    -- strict=false → 用 `<=`,与改动前 access.lua 的比较符一致(timers 的 AIMD 另用 `<`,见 tps_assess)
+    local tps_ewma, tps_hit
     local tpd = tps.tps_dict_if_on(opts)
     if tpd then
-        tps_ewma = tpd:get(tps.tps_ewma_key(opts))
+        tps_hit  = tps.tps_assess(opts, tpd, nil, false)
+        tps_ewma = tps_hit.ewma
     end
 
     -- 自适应并发上限(AIMD;do_adaptive_cc_loop 每 interval 写入,带 TTL)。经 tps_dict_if_on 读:
@@ -455,6 +479,7 @@ function M.assess_pool(opts, peers, peer_keys)
         healthy_all = healthy_all, healthy_peers = healthy_peers,
         limit = limit, rt_sum = rt_sum, avg_5min = avg_5min,
         ttft_ewma = ttft_ewma, tps_ewma = tps_ewma, adaptive_cc = adaptive_cc,
+        ttft_hit = ttft_hit, tps_hit = tps_hit,   -- 多指标判定结果(含触发那一条的 ewma/limit/metric)
         tps_prefix = tps_prefix,  -- tps_key_prefix(opts) 缓存(仅 adaptive+tps_on 时非 nil)
         tps_on = (tpd ~= nil),   -- tps 特性对本路由是否生效(__off/_G.TPS_ENABLED/未 opt-in = false)
     }
