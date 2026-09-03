@@ -25,20 +25,25 @@ function _G.do_route(opts)
     end
     -- ── API key 鉴权（从 Bearer 头取）──
     local ak = ngx.shared[opts.api_keys_dict]
-    -- 按 key 表的指纹播种,而不是"灌过一次就不再灌":shared dict 跨 reload 存活,
-    -- 用一次性标志的话,改了 api_keys.lua 再 reload(VM 上就是这个更新流程)
-    -- LLM 路由仍认旧 key。指纹变了就重灌一遍。
-    -- 指纹本身每 worker 只算一次,挂在 opts 上。
+    -- 播种策略:dict 条目按 key 表指纹加前缀(`<sig>:<key>`),而不是"整份 flush 再灌"。
+    --
+    -- 两个原因:
+    --   1) 这个 dict 是**所有路由共用**的(session_base.conf: lua_shared_dict api_keys)。
+    --      而 opts.api_keys 允许 per-route 覆盖 —— 一旦有路由用了不同的 key 表,
+    --      flush 式播种会让两张表互相冲刷,还会在"A 灌完 → B 冲掉 → A 查表"之间
+    --      产生**假 401**。加前缀则两张表并存,互不干扰。
+    --   2) 改了 key 表 = 新前缀,旧条目自然查不到(等价于失效),不必显式删。
+    --
+    -- 指纹每 worker 只算一次,挂在 opts 上。
     opts._api_keys_sig = opts._api_keys_sig or api_keys.fingerprint(opts.api_keys)
-    if ak:get("__sig") ~= opts._api_keys_sig then
-        ak:flush_all()          -- 删掉的 key 也要真的失效,不能只做增量覆盖
-        ak:flush_expired()
-        for k, v in pairs(opts.api_keys) do ak:set(k, v) end
-        ak:set("__sig", opts._api_keys_sig)
+    local sig = opts._api_keys_sig
+    if not ak:get(sig) then
+        for k, v in pairs(opts.api_keys) do ak:set(sig .. ":" .. k, v) end
+        ak:set(sig, "1")            -- 这份表已播种的标记
     end
     local auth = ngx.req.get_headers()["authorization"] or ""
     local akey = api_keys.parse_bearer(auth)
-    if not akey or not ak:get(akey) then
+    if not akey or not ak:get(sig .. ":" .. akey) then
         ngx.status = 401
         ngx.header["Content-Type"] = "application/json"
         ngx.say([[{"error":"missing or invalid api key"}]])
