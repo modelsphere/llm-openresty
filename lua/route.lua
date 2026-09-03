@@ -132,7 +132,9 @@ function _G.register_route(name, opts_factory)
     -- 默认 false(不外泄内部 peer);仅显式配 true 才开。非布尔值一律按 false 处理。
     opts.expose_routed_peer        = (opts.expose_routed_peer == true)
     opts.api_keys_dict             = opts.api_keys_dict             or "api_keys"
-    opts.api_keys                  = opts.api_keys                  or { ["REDACTED-API-KEY"] = "admin" }
+    -- 默认 key 表来自 lua/api_keys.lua(唯一来源)—— video 这类不走 lua 引擎的路由
+    -- 也读同一张表,密钥不必再写进 ModelRoute / chart values / git。
+    opts.api_keys                  = opts.api_keys                  or require("api_keys").keys
     opts.default_max               = opts.default_max               or _G.MAX_CONCURRENCY_PER_PEER
     -- 并发实时阈值放大倍数(每路由可配;缺省回退全局 _G.RT_LIMIT_FACTOR)
     opts.rt_limit_factor           = opts.rt_limit_factor           or _G.RT_LIMIT_FACTOR
