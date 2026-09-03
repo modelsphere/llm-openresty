@@ -24,11 +24,16 @@ end
 -- tools/minimax-h3/t33_shared_dict_survives_reload.sh),所以原来那个"灌过一次就
 -- 不再灌"的 __inited 标志会让"改 key + reload"对 LLM 路由不生效 —— 而 video 路由
 -- 是直接查表的、立刻生效,两条路径就分叉了。按指纹播种则 reload 后自动重灌。
+-- 指纹要**连 value 一起算**:value 是这条 key 的备注(归属方),
+-- 只按 key 名算的话,改备注不会触发重灌,dict 里会一直留着旧值。
+-- 今天鉴权只看条目在不在、不看 value,但别留这种静默陈旧点。
 function M.fingerprint(keys)
     local ks = {}
     for k in pairs(keys) do ks[#ks + 1] = k end
     table.sort(ks)
-    return ngx.md5(table.concat(ks, ","))
+    local parts = {}
+    for i = 1, #ks do parts[i] = ks[i] .. "=" .. tostring(keys[ks[i]]) end
+    return ngx.md5(table.concat(parts, ","))
 end
 
 -- 校验 Authorization 头。返回 (ok, 该 key 的备注)。

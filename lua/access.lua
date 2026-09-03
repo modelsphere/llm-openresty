@@ -41,9 +41,13 @@ function _G.do_route(opts)
         for k, v in pairs(opts.api_keys) do ak:set(sig .. ":" .. k, v) end
         ak:set(sig, "1")            -- 这份表已播种的标记
     end
+    -- dict 是**纯缓存**:没有任何地方在运行时增删 key(查过,只有这里写),
+    -- 权威始终是 opts.api_keys 这张 Lua 表。所以查不到时回落到表本身 ——
+    -- dict 写满被驱逐 / set 失败(ak:set 会返回 false)/ 被别处 flush 掉,
+    -- 都不该变成"合法 key 被拒"。少了这层兜底,dict 一满就是 401 风暴。
     local auth = ngx.req.get_headers()["authorization"] or ""
     local akey = api_keys.parse_bearer(auth)
-    if not akey or not ak:get(sig .. ":" .. akey) then
+    if not akey or not (ak:get(sig .. ":" .. akey) or opts.api_keys[akey]) then
         ngx.status = 401
         ngx.header["Content-Type"] = "application/json"
         ngx.say([[{"error":"missing or invalid api key"}]])
