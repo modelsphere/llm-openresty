@@ -14,14 +14,35 @@ M.keys = {
     ["REDACTED-API-KEY"] = "admin",
 }
 
+-- 从 Authorization 头取 key。只认 "Bearer <key>" —— 与 MiniMax / OpenAI 的约定一致。
+function M.parse_bearer(auth_header)
+    return (auth_header or ""):match("^Bearer%s+(.+)$")
+end
+
 -- 校验 Authorization 头。返回 (ok, 该 key 的备注)。
--- 只认 "Bearer <key>" —— 与 MiniMax / OpenAI 的约定一致。
 function M.check(auth_header)
-    local key = (auth_header or ""):match("^Bearer%s+(.+)$")
+    local key = M.parse_bearer(auth_header)
     if not key then return false, nil end
     local who = M.keys[key]
     if not who then return false, nil end
     return true, who
+end
+
+-- access 阶段的鉴权守卫,给**不走 lua 路由引擎**的路由用(autoconfig 渲染的 video 路由)。
+-- 逻辑放这里而不是渲染进每份 conf:401 的响应体、Bearer 的解析规则只有一份。
+--
+-- public_re:免鉴权路径的正则(ngx.re 语法);nil / "" = 所有路径都要 key。
+function M.guard(public_re)
+    if public_re and public_re ~= "" and ngx.re.find(ngx.var.uri, public_re, "jo") then
+        return
+    end
+    if M.check(ngx.req.get_headers()["authorization"]) then
+        return
+    end
+    ngx.status = 401
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say([[{"error":"missing or invalid api key"}]])
+    return ngx.exit(401)
 end
 
 return M
