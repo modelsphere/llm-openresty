@@ -19,6 +19,18 @@ function M.parse_bearer(auth_header)
     return (auth_header or ""):match("^Bearer%s+(.+)$")
 end
 
+-- 一份 key 表的指纹。access.lua 拿它判断 shared dict 里缓存的是不是当前这份表:
+-- lua_shared_dict 的内容**跨 `openresty -s reload` 存活**(实测,见
+-- tools/minimax-h3/t33_shared_dict_survives_reload.sh),所以原来那个"灌过一次就
+-- 不再灌"的 __inited 标志会让"改 key + reload"对 LLM 路由不生效 —— 而 video 路由
+-- 是直接查表的、立刻生效,两条路径就分叉了。按指纹播种则 reload 后自动重灌。
+function M.fingerprint(keys)
+    local ks = {}
+    for k in pairs(keys) do ks[#ks + 1] = k end
+    table.sort(ks)
+    return ngx.md5(table.concat(ks, ","))
+end
+
 -- 校验 Authorization 头。返回 (ok, 该 key 的备注)。
 function M.check(auth_header)
     local key = M.parse_bearer(auth_header)

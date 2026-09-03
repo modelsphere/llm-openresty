@@ -11,6 +11,7 @@ local ttft         = require "ttft"
 local tps          = require "tps"
 local bodylog      = require "bodylog"
 local reqtransform = require "reqtransform"
+local api_keys     = require "api_keys"
 
 -- ══════════════════════════════════════════════════════════════════════
 -- _G.do_route(opts) — access_by_lua_block 主体（参数化路由选址）
@@ -24,12 +25,19 @@ function _G.do_route(opts)
     end
     -- ── API key 鉴权（从 Bearer 头取）──
     local ak = ngx.shared[opts.api_keys_dict]
-    if not ak:get("__inited") then
+    -- 按 key 表的指纹播种,而不是"灌过一次就不再灌":shared dict 跨 reload 存活,
+    -- 用一次性标志的话,改了 api_keys.lua 再 reload(VM 上就是这个更新流程)
+    -- LLM 路由仍认旧 key。指纹变了就重灌一遍。
+    -- 指纹本身每 worker 只算一次,挂在 opts 上。
+    opts._api_keys_sig = opts._api_keys_sig or api_keys.fingerprint(opts.api_keys)
+    if ak:get("__sig") ~= opts._api_keys_sig then
+        ak:flush_all()          -- 删掉的 key 也要真的失效,不能只做增量覆盖
+        ak:flush_expired()
         for k, v in pairs(opts.api_keys) do ak:set(k, v) end
-        ak:set("__inited", "1")
+        ak:set("__sig", opts._api_keys_sig)
     end
     local auth = ngx.req.get_headers()["authorization"] or ""
-    local akey = auth:match("^Bearer%s+(.+)$")
+    local akey = api_keys.parse_bearer(auth)
     if not akey or not ak:get(akey) then
         ngx.status = 401
         ngx.header["Content-Type"] = "application/json"
