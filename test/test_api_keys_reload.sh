@@ -18,7 +18,11 @@ cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null
 trap cleanup EXIT
 mkdir -p "$PREFIX/logs" "$PREFIX/temp" "$PREFIX/lua"
 # lua/ 整份拷进 scratch:测试要改 api_keys.lua,绝不能动仓库里的原件
-cp "$HERE/../lua/"*.lua "$PREFIX/lua/"
+# LUA_SRC 可指向别处 —— 用来直接测【镜像里实际发出去的那份 lua】,
+# 而不是工作区里的文件(两者可能不一致,那正是要排除的情况)。
+LUA_SRC="${LUA_SRC:-$HERE/../lua}"
+cp "$LUA_SRC/"*.lua "$PREFIX/lua/"
+echo "  lua 来源: $LUA_SRC"
 write_keys() {  # write_keys <key>
   cat > "$PREFIX/lua/api_keys.lua" <<LUA
 local M = {}
