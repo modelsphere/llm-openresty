@@ -368,3 +368,34 @@ func TestDesiredReplicasAbsentWhenUnknown(t *testing.T) {
 		t.Errorf("实际副本数仍应正常上报, 得 %v", n)
 	}
 }
+
+// video 等纯反向代理的 route 不进 poll 列表(它们没有 lua 引擎的 _route_state/_tps_status/
+// _ttft_status,poll 必然失败;而 openresty_poll_up 是全局的,一条失败就把整个 openresty
+// 监控打成盲区 —— 生产 2026-09-03 实拍过)。但它们仍要留在富化/副本统计里。
+func TestResolverSkipsNonLLMRoutesForPoll(t *testing.T) {
+	const mr = `{"items":[
+	  {"spec":{"nginx":{"route":"kimi"},"discovery":{"service":"ns/kimi-svc"}}},
+	  {"spec":{"modelType":"llm","nginx":{"route":"glm"},"discovery":{"service":"ns/glm-svc"}}},
+	  {"spec":{"modelType":"video","nginx":{"route":"minimax-h3"},"discovery":{"service":"ns/h3-router"}}}
+	]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "endpointslices") {
+			_, _ = w.Write([]byte(esJSON("10.0.0.1")))
+			return
+		}
+		_, _ = w.Write([]byte(mr))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv)
+	r.refresh(context.Background())
+
+	// modelType 空 = llm(CRD 默认),显式 llm 也要;video 不要。
+	if got, want := r.getRoutes(), []string{"glm", "kimi"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("getRoutes() = %v, 想要 %v(video 路由不该进 poll 列表)", got, want)
+	}
+	// 但富化仍要覆盖 video —— bodylog 的 service label 和副本指标都靠它。
+	if got := r.serviceFor("minimax-h3"); got != "ns/h3-router" {
+		t.Errorf("serviceFor(minimax-h3) = %q, 想要 ns/h3-router(video 只是不 poll,不是不认)", got)
+	}
+}

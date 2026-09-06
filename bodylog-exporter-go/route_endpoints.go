@@ -199,11 +199,19 @@ type resolveResult struct {
 	svc    map[string]string
 }
 
-// modelRouteFull:投影 —— nginx.{route,service} + discovery.service。
+// modelRouteFull:投影 —— nginx.{route,service} + discovery.service + modelType。
+//
+// modelType 用来决定「要不要 poll 这条 route 的引擎状态端点」:
+// video 路由是 autoconfig 渲染的**纯反向代理**,压根没有 _route_state/_tps_status/_ttft_status
+// 这些 lua 引擎端点,poll 它必然失败。而 openresty_poll_up 是**全局**的
+// (「上轮 poll 是否全成功」),一条 route 失败就把它打成 0 —— 于是整个 openresty
+// 监控面变成盲区,连 OpenRestyNoHealthyPeer 这类依赖它的告警一起失效。
+// 生产实拍:video 路由 2026-09-03 13:12 上线那一刻 poll_up 就掉 0,一直没恢复。
 type modelRouteFull struct {
 	Items []struct {
 		Spec struct {
-			Nginx struct {
+			ModelType string `json:"modelType"` // 空 = llm(CRD 默认值)
+			Nginx     struct {
 				Route   string `json:"route"`
 				Service string `json:"service"`
 			} `json:"nginx"`
@@ -275,8 +283,13 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 		svcLabel := normalizeServiceLabel(svc)              // 展示用 label:剥掉 LWS 的 "-leader" 后缀
 		res.svc[route] = svcLabel                           // 含所有 route(serviceFor 稳健)
 
-		// poll route 列表:按 nginxService 过滤(多 openresty 用;空=全要)。
-		if r.nginxService == "" || strings.TrimSpace(it.Spec.Nginx.Service) == r.nginxService {
+		// poll route 列表:按 nginxService 过滤(多 openresty 用;空=全要),
+		// 并且**只 poll 走 lua 引擎的 route**(modelType 空或 llm)。
+		// video 等纯反向代理没有 _route_state/_tps_status/_ttft_status,poll 必然失败,
+		// 而 poll_up 是全局的,会把整个 openresty 监控拖成盲区(见 modelRouteFull 注释)。
+		mt := strings.TrimSpace(it.Spec.ModelType)
+		pollable := mt == "" || mt == "llm"
+		if pollable && (r.nginxService == "" || strings.TrimSpace(it.Spec.Nginx.Service) == r.nginxService) {
 			if !seen[route] {
 				seen[route] = true
 				res.routes = append(res.routes, route)
