@@ -1,12 +1,12 @@
 #!/bin/bash
-# TPS 限流(解码速率)功能 + 边界 case 自动化测试(隔离 scratch + mock,自清理,不碰生产)。
+# TPS 限流(输出 token 速率 = completion_tokens/总时长,含 prefill)功能 + 边界 case 自动化测试(隔离 scratch + mock,自清理,不碰生产)。
 # 镜像 test_ttft.sh:为加速把时间尺度/桶调小(逻辑与生产一致):
 #   tps_window=3s、tps_ttl=8s、tps_probe_window=3s、tps_min_decode_s=0.3、tps_min_tokens=16、
 #   小桶 {5,10,20,40,80,150,300}(溢出>300→P20代表=600)、floor=30 tok/s。
-# tps ≈ 1000/chunk_delay_ms:delay=50→20(慢,<30 限流)、delay=10→100(快,>30 放行)、
+# tps ≈ ctok/(prefill+chunk_delay*ctok):delay=50→~20(慢,<30 限流)、delay=10→~95(快,>30 放行)、
 #   delay=2→500(溢出)。max_tokens=completion_tokens(mock 跑满)。
 # 覆盖:alpha钳位 / P20(低尾非均值) / 少样本P20 / 桶溢出 / 限流+半开探测 / 窗口折叠 /
-#   每模型阈值(peers_by_model) / 非流式不喂 / 错误不喂 / toggle / 空窗保持+TTL过期 /
+#   每模型阈值(peers_by_model) / 非流式入账 / 分母含prefill / 错误不喂 / toggle / 空窗保持+TTL过期 /
 #   正常放行 / 在线阈值 / no-usage fail-open+nousage / min_tokens边界 / min_decode边界 /
 #   gmatch末匹配(fix#3 decoy) / opt-in未配不限流+warning。
 set -u
@@ -91,6 +91,10 @@ fire(){ local uopt='"stream_options":{"include_usage":true},'; [ "${6:-1}" = "0"
   curl -s -o /dev/null -w "%{http_code}" -N -H "$A" -H "$H" \
     -d "{${uopt}${ex}\"model\":\"${4:-x}\",\"stream\":true,\"chunk_delay_ms\":$2,\"max_tokens\":$3,\"prefill_delay_ms\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
     "$1/v1/chat/completions"; }
+# fireP:同 fire,但 prefill_delay_ms 可指定($4),用于验证分母是否含 prefill
+fireP(){ curl -s -o /dev/null -w "%{http_code}" -N -H "$A" -H "$H" \
+    -d "{\"stream_options\":{\"include_usage\":true},\"model\":\"${5:-x}\",\"stream\":true,\"chunk_delay_ms\":$2,\"max_tokens\":$3,\"prefill_delay_ms\":$4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+    "$1/v1/chat/completions"; }
 # 非流式
 firens(){ curl -s -o /dev/null -w "%{http_code}" -N -H "$A" -H "$H" -d "{\"model\":\"${4:-x}\",\"stream\":false,\"chunk_delay_ms\":$2,\"max_tokens\":$3,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" "$1/v1/chat/completions"; }
 ev(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['ewma_tps'].get('${2:-_}',''))"; }   # ewma 值(空=无)
@@ -134,8 +138,15 @@ ek=$(ev $PM kimi-k2.6); eg=$(ev $PM glm-5.1-fp8)
 rk=$(burst $PM 8 50 20 "kimi-k2.6"); rg=$(burst $PM 8 50 20 "glm-5.1-fp8")
 { echo "$rk"|grep -q 429 && ! echo "$rg"|grep -q 429; } && ok "TP7 每模型隔离:kimi(ewma=$ek)限 rk=[$rk] / glm(ewma=$eg)不限 rg=[$rg]" || no "TP7 kimi=$ek rk=[$rk] glm=$eg rg=[$rg]"
 
-# TP8 非流式不喂(ewma 空)
-expire; for i in 1 2 3 4 5; do firens $S 50 20 >/dev/null; done; v=$(ev $S); [ -z "$v" ] && ok "TP8 非流式不喂(ewma 空)" || no "TP8 ewma=$v"
+# TP8 非流式也喂(2026-09-07 口径变更:分母改总时长后非流式不再被排除)
+# firens 50ms/20tok → mock 睡 prefill+chunk*out ≈ 1.02s,ctok=20 → 约 19.6 tok/s(与同参数流式一致)
+expire; align; for i in 1 2 3 4 5 6; do ( firens $S 50 20 >/dev/null ) & done; wait; sleep 4; firens $S 50 20 >/dev/null; sleep 1
+v=$(ev $S); { [ -n "$v" ] && awk "BEGIN{exit !($v>=10 && $v<=80)}"; } && ok "TP8 非流式入账 ewma=$v(10~80)" || no "TP8 ewma='$v'(期望非空且 ~20)"
+
+# TP8b 分母含 prefill:大 prefill(2s) + 快解码(200tok/0.4s)。
+# 旧口径(扣 prefill)= 200/0.4 = 500 tok/s → 溢出桶(>=300);新口径 = 200/2.4 ≈ 83 → 不该溢出。
+expire; align; for i in 1 2 3 4 5 6; do ( fireP $S 2 200 2000 >/dev/null ) & done; wait; sleep 4; fireP $S 2 200 2000 >/dev/null; sleep 1
+v=$(ev $S); { [ -n "$v" ] && awk "BEGIN{exit !($v<250)}"; } && ok "TP8b 分母含 prefill:ewma=$v(<250,旧口径会溢出到 600)" || no "TP8b ewma='$v'(期望 <250)"
 
 # TP9 错误(后端500)不喂(ewma 空)
 expire; for i in 1 2 3 4 5; do fire $E 50 20 >/dev/null; done; v=$(ev $E); [ -z "$v" ] && ok "TP9 错误不喂(ewma 空)" || no "TP9 ewma=$v"
@@ -169,7 +180,7 @@ expire; for i in 1 2 3 4 5; do fire $S 50 15 >/dev/null; done; v15=$(ev $S)
 expire; estab $S 50 16; v16=$(ev $S)
 { [ -z "$v15" ] && [ -n "$v16" ]; } && ok "TP16 min_tokens:max15 不采(ewma空) / max16 采(ewma=$v16)" || no "TP16 v15='$v15' v16='$v16'"
 
-# TP17 min_decode 边界:decode<0.3s 不采(tps100 但 max=10 → decode 0.1s)
+# TP17 min_decode 边界:总时长<0.3s 不采(chunk10 × max10 → 0.02 prefill + 0.1 decode = 0.12s)
 expire; for i in 1 2 3 4 5; do fire $S 10 10 >/dev/null; done; vd=$(ev $S)
 [ -z "$vd" ] && ok "TP17 min_decode:decode<0.3s 不采(ewma 空)" || no "TP17 ewma=$vd"
 

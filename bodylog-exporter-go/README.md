@@ -29,7 +29,7 @@
 | `bodylog_finish_reason_total` | counter | `finish_reason` | 按停止原因计数 |
 | `bodylog_rt_seconds` | **histogram**(native-only) | `stream` | 总响应时间(秒) |
 | `bodylog_ttft_seconds` | **histogram**(native-only) | **`prompt_bucket`** | 首 token 时间/TTFT(秒,**仅流式**) |
-| `bodylog_output_tok_per_second` | **histogram**(native-only) | **`prompt_bucket`** | **单请求解码速率** `completion_tokens/(rt-frt)`(tok/s,**已扣 prefill**;仅流式,且 `ctok>=16` + 解码时长 `>=0.5s`) |
+| `bodylog_output_tok_per_second` | **histogram**(native-only) | **`prompt_bucket`** | **单请求输出 token 速率** `completion_tokens/rt`(tok/s,**分母为总时长、含 prefill**;流式与非流式均计,过滤 `ctok>=16` + `rt>=0.5s`) |
 
 > **⚠️ 2026-08-31(exporter 0.2.0)起,三个 histogram 改为 native-only** —— 不再双发经典桶,
 > `bodylog_*_bucket` / `_sum` / `_count` 这些 series **不再产生**。求分位数必须用**裸名、不带 `le`**:
@@ -100,7 +100,7 @@
 | `openresty_adaptive_cc_min` / `_max` | gauge | service,route,model | 生效下限 / 静态池容量 |
 | `openresty_adaptive_cc_conc` | gauge | service,route,model | **当前并发**(timer 判压力用的实时在途) |
 | `openresty_adaptive_cc_rej` | gauge | service,route,model | 本区间被压抑需求(并发 429 数) |
-| `openresty_tps_ewma` | gauge | service,route,model | 解码速率 EWMA(tok/s) |
+| `openresty_tps_ewma` | gauge | service,route,model | 输出 token 速率 EWMA(tok/s,口径同上:分母含 prefill、含非流式) |
 | `openresty_ttft_ewma_ms` | gauge | service,route,model | TTFT EWMA(ms) |
 | `openresty_tps_limiter_active` / `openresty_ttft_limiter_active` | gauge | service,route | 限流是否生效(1/0) |
 | `openresty_rejected_total` | **counter** | service,route,reason | 429 限流累计(reason=concurrency/ttft/tps) |

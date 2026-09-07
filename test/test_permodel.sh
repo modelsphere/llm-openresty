@@ -74,21 +74,27 @@ nc=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$A" -H "$H" -d '{"messag
 
 echo "########## TPS per-model 在线 override(override > by_model)##########"
 # kimi/glm 同窗建 ewma(桶40);kimi by_model=50 → 限;glm by_model=10 → 不限
+# ⚠️ chunk_delay 用 38 而非 50:本用例测的是「override 覆盖 by_model」的优先级,断言依赖
+#    ewma 落在桶 40,不该卡在桶边界上。50ms×20tok 在桶边界 20 附近 —— 速率口径一动
+#    (2026-09-07 分母改为总时长)算出的 ~19.4 就掉进桶 20,PM2 的 override=30 判定随之翻转。
+#    取「新旧两种口径都落桶 40(区间 (20,40])」的交集:实测 decode≈0.02c-0.05、rt≈0.02c+0.03,
+#    解 20/(0.02c-0.05) 与 20/(0.02c+0.03) 同在 (20,40] → c∈[27.5,48.5),取中点 38。
+#    这样该断言不再随速率口径漂移(已在改前/改后两个引擎上各验一遍)。
 expire; align
-for i in 1 2 3 4; do ( fire kimi-k2.6 50 20 >/dev/null ) & ( fire glm-5.1-fp8 50 20 >/dev/null ) & done; wait
-sleep 4; fire kimi-k2.6 50 20 >/dev/null; fire glm-5.1-fp8 50 20 >/dev/null; sleep 1
+for i in 1 2 3 4; do ( fire kimi-k2.6 38 20 >/dev/null ) & ( fire glm-5.1-fp8 38 20 >/dev/null ) & done; wait
+sleep 4; fire kimi-k2.6 38 20 >/dev/null; fire glm-5.1-fp8 38 20 >/dev/null; sleep 1
 ek=$(tpv kimi-k2.6); eg=$(tpv glm-5.1-fp8)
-rk=$(burst kimi-k2.6 50 20); rg=$(burst glm-5.1-fp8 50 20)
+rk=$(burst kimi-k2.6 38 20); rg=$(burst glm-5.1-fp8 38 20)
 { echo "$rk"|grep -q 429 && ! echo "$rg"|grep -q 429; } && ok "PM1 by_model:kimi(ewma=$ek,floor50)限 / glm(ewma=$eg,floor10)不限" || no "PM1 kimi=[$rk] glm=[$eg:$rg]"
 # 设 kimi override=30(< ewma40)→ kimi 不再限(override 盖住 by_model 50);glm 不受影响
 curl -s "$U/_tps_limit?tps=30&model=kimi-k2.6" >/dev/null
 ov=$(curl -s "$U/_tps_limit?model=kimi-k2.6"|python3 -c "import sys,json;print(json.load(sys.stdin).get('limit_override_tps'))")
-rk2=$(burst kimi-k2.6 50 20); rg2=$(burst glm-5.1-fp8 50 20)
+rk2=$(burst kimi-k2.6 38 20); rg2=$(burst glm-5.1-fp8 38 20)
 { [ "$ov" = "30" ] && ! echo "$rk2"|grep -q 429 && ! echo "$rg2"|grep -q 429; } && ok "PM2 override kimi=30(盖住by_model50)→ kimi 不限[$rk2] / glm 仍不限[$rg2]" || no "PM2 ov=$ov kimi=[$rk2] glm=[$rg2]"
 # 清 kimi override → 回落 by_model 50 → kimi 又限
 curl -s "$U/_tps_limit?tps=0&model=kimi-k2.6" >/dev/null
 ov3=$(curl -s "$U/_tps_limit?model=kimi-k2.6"|python3 -c "import sys,json;print(json.load(sys.stdin).get('limit_override_tps'))")
-rk3=$(burst kimi-k2.6 50 20)
+rk3=$(burst kimi-k2.6 38 20)
 { [ "$ov3" = "None" ] && echo "$rk3"|grep -q 429; } && ok "PM3 清 override → 回落 by_model 50 → kimi 又限[$rk3]" || no "PM3 ov=$ov3 kimi=[$rk3]"
 
 echo "########## TTFT per-model 在线 override ##########"

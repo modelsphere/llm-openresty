@@ -1,5 +1,6 @@
 -- openresty/lua/tps.lua
--- TPS 解码速率限流(池级 EWMA + 窗口 P20 + 半开探测)
+-- TPS 输出 token 速率限流(池级 EWMA + 窗口 P20 + 半开探测)
+-- 口径:completion_tokens / 请求总时长(含 prefill),流式与非流式一视同仁 —— 见 access.lua 的采样处。
 -- 跨模块函数挂 M(dict_if_on/key_prefix/ewma_key/limit_for/record/allow_probe);
 -- bucket_index/window_p20 仅内部用 → local。TPS_ENABLED / TPS_BUCKETS 是 config data 仍留 _G。
 
@@ -8,7 +9,7 @@ local M = {}
 local util = require "util"
 
 -- ══════════════════════════════════════════════════════════════════════
--- TPS 限流(解码速率)辅助:与 TTFT 同构,差三处——P20 低尾 / ewma<=下限 / opt-in。
+-- TPS 限流(输出 token 速率)辅助:与 TTFT 同构,差三处——P20 低尾 / ewma<=下限 / opt-in。
 -- 独立 tps_stat dict,key 同样带 <route>[:<model>] 前缀,与 ttft_stat 互不干扰。
 -- ══════════════════════════════════════════════════════════════════════
 -- 总开关 + opt-in 检查:返回可用 tps dict handle,或 nil(=特性对本路由关 → 调用方短路)。
