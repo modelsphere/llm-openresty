@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,5 +144,46 @@ func TestPollerRejectedStillCounts(t *testing.T) {
 		if v := testutil.ToFloat64(m.rejected.WithLabelValues("ns/svc", "r1", reason)); v != want {
 			t.Errorf("reason=%s 的值 = %v, 想要 %v", reason, v, want)
 		}
+	}
+}
+
+// 一条 route 挂了,不能把别的 route 也标成 down。
+//
+// 早先 openresty_poll_up 是全局单个 gauge(「上轮是否全成功」),任何一条 route 失败
+// 就归零 —— 生产上一条纯反向代理的 video 路由(没有 lua 引擎端点、必然 poll 失败)
+// 让 OpenRestyPollDown 连响 3 天,告警彻底失去信号价值(期间真出故障也分辨不出来)。
+func TestPollUpIsPerRoute(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/bad/") { // bad 这条全端点 401,模拟无 lua 引擎/被鉴权拦下
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":"missing or invalid api key"}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/good/_route_state":
+			_, _ = w.Write([]byte(`{"route":"good","active_level":1,"limit":10,"healthy_peers_in_level":1}`))
+		case "/good/_tps_status":
+			_, _ = w.Write([]byte(`{"active":false,"ewma_tps":{"_":1.0},"adaptive_cc":{"_":2.0}}`))
+		case "/good/_ttft_status":
+			_, _ = w.Write([]byte(`{"active":false,"ewma_ms":{"_":100.0}}`))
+		case "/good/_429_status":
+			_, _ = w.Write([]byte(`{"by_route":{}}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	reg := prometheus.NewRegistry()
+	m := newORMetrics(reg)
+	cfg := orConfig{baseURL: srv.URL, interval: time.Second, timeout: 2 * time.Second}
+	p := newORPoller(cfg, m, func() []string { return []string{"good", "bad"} }, nil)
+	p.pollOnce(context.Background())
+
+	if got := testutil.ToFloat64(m.pollUp.WithLabelValues("good")); got != 1 {
+		t.Errorf("openresty_poll_up{route=good} = %v, 想要 1(它自己是好的,不该被 bad 连累)", got)
+	}
+	if got := testutil.ToFloat64(m.pollUp.WithLabelValues("bad")); got != 0 {
+		t.Errorf("openresty_poll_up{route=bad} = %v, 想要 0", got)
 	}
 }

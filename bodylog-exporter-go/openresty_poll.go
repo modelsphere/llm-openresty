@@ -74,9 +74,15 @@ type orMetrics struct {
 	// /_429_status(counter:delta 累加,跨 poll 单调)
 	rejected *prometheus.CounterVec // {route,reason}
 	// poll 自监控
-	pollUp     prometheus.Gauge   // 上轮 poll 是否全成功(1/0)
-	pollErrors prometheus.Counter // poll 出错累计
-	pollLastOK prometheus.Gauge   // 上次成功 poll 的 unix 秒
+	// 上轮 poll 是否成功,**按 route 分**(1/0)。
+	// 早先是全局单个 Gauge(「是否全成功」),任何一条 route 失败就归零。
+	// 后果不是数据断流(各 route 的 gauge 是分开填的,其余 route 数据照常),
+	// 而是**这个告警本身失去信号价值**:一条注定失败的 video 路由让
+	// OpenRestyPollDown 连响 3 天(2026-09-03~09-06),期间真出轮询故障也分辨不出来。
+	// 按 route 拆开后,坏一条只黑一条,告警还能指名道姓。
+	pollUp     *prometheus.GaugeVec
+	pollErrors prometheus.Counter   // poll 出错累计
+	pollLastOK *prometheus.GaugeVec // 上次成功 poll 的 unix 秒
 
 	resettable []*prometheus.GaugeVec // 每 cycle 需清空的 gauge(不含 counter/self)
 }
@@ -112,11 +118,15 @@ func newORMetrics(reg *prometheus.Registry) *orMetrics {
 			Name: "openresty_rejected_total", Help: "429 限流累计(按 service × route × reason=concurrency/ttft/tps)",
 		}, []string{"service", "route", "reason"}),
 
-		pollUp:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "openresty_poll_up", Help: "上轮 openresty poll 是否全成功(1/0)"}),
+		pollUp:     g("openresty_poll_up", "上轮 openresty poll 该 route 是否成功(1/0)", "route"),
 		pollErrors: prometheus.NewCounter(prometheus.CounterOpts{Name: "openresty_poll_errors_total", Help: "openresty poll 出错累计"}),
-		pollLastOK: prometheus.NewGauge(prometheus.GaugeOpts{Name: "openresty_poll_last_success_seconds", Help: "上次成功 poll 的 unix 秒"}),
+		pollLastOK: g("openresty_poll_last_success_seconds", "该 route 上次成功 poll 的 unix 秒", "route"),
 	}
 	m.resettable = []*prometheus.GaugeVec{
+		// pollUp 要进来:route 下线后不该留一条恒 0 的平线触发告警。
+		// pollLastOK **不进来**:它的语义就是"上次成功的时刻",靠变旧来表达失败;
+		// 每轮 Reset 会把这条信息抹掉,失败时反而什么都看不到。
+		m.pollUp,
 		m.activeLevel, m.activeLimit, m.healthyPeers, m.peerActive, m.peerBanned, m.peerMax,
 		m.tpsActive, m.tpsEwma, m.adaptiveCC, m.adaptiveCCMin, m.adaptiveCCMax, m.adaptiveCCConc, m.adaptiveCCRej,
 		m.ttftActive, m.ttftEwma,
@@ -124,7 +134,8 @@ func newORMetrics(reg *prometheus.Registry) *orMetrics {
 	for _, gv := range m.resettable {
 		reg.MustRegister(gv)
 	}
-	reg.MustRegister(m.rejected, m.pollUp, m.pollErrors, m.pollLastOK)
+	// pollUp 已随 resettable 注册过,这里不能再来一次(会 duplicate registration panic)。
+	reg.MustRegister(m.rejected, m.pollErrors, m.pollLastOK)
 	return m
 }
 
@@ -224,14 +235,17 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 		gv.Reset()
 	}
 	routes := p.routesFn() // 动态:route 增删自动跟随(下线的 route gauge 因上面 Reset 消失)
-	ok := true
+	ok := true             // 仅用于全局端点(/_reject_stats 等)的成败
+	routeOK := map[string]bool{}
+	for _, r := range routes {
+		routeOK[r] = true
+	}
 
 	for _, route := range routes {
 		service := p.serviceOf(route)
 		var rs routeStateResp
 		if err := p.getJSON(ctx, "/"+route+"/_route_state", &rs); err != nil {
-			p.pollErr("route_state", route, err)
-			ok = false
+			p.pollErrRoute(routeOK, "route_state", route, err)
 		} else {
 			p.m.activeLevel.WithLabelValues(service, route).Set(rs.ActiveLevel)
 			p.m.activeLimit.WithLabelValues(service, route).Set(rs.Limit)
@@ -248,8 +262,7 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 
 		var ts tpsStatusResp
 		if err := p.getJSON(ctx, "/"+route+"/_tps_status", &ts); err != nil {
-			p.pollErr("tps_status", route, err)
-			ok = false
+			p.pollErrRoute(routeOK, "tps_status", route, err)
 		} else {
 			p.m.tpsActive.WithLabelValues(service, route).Set(b2f(ts.Active))
 			setModelMap(p.m.tpsEwma, service, route, ts.EwmaTps)
@@ -262,8 +275,7 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 
 		var tt ttftStatusResp
 		if err := p.getJSON(ctx, "/"+route+"/_ttft_status", &tt); err != nil {
-			p.pollErr("ttft_status", route, err)
-			ok = false
+			p.pollErrRoute(routeOK, "ttft_status", route, err)
 		} else {
 			p.m.ttftActive.WithLabelValues(service, route).Set(b2f(tt.Active))
 			setModelMap(p.m.ttftEwma, service, route, tt.EwmaMs)
@@ -336,17 +348,27 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 		}
 	}
 
-	if ok {
-		p.m.pollUp.Set(1)
-		p.m.pollLastOK.Set(float64(time.Now().Unix()))
-	} else {
-		p.m.pollUp.Set(0)
+	// 全局端点(/_reject_stats)失败算在所有 route 头上 —— 它不属于某一条。
+	now := float64(time.Now().Unix())
+	for _, route := range routes {
+		if routeOK[route] && ok {
+			p.m.pollUp.WithLabelValues(route).Set(1)
+			p.m.pollLastOK.WithLabelValues(route).Set(now)
+		} else {
+			p.m.pollUp.WithLabelValues(route).Set(0)
+		}
 	}
 }
 
 func (p *orPoller) pollErr(what, route string, err error) {
 	p.m.pollErrors.Inc()
 	log.Printf("openresty-poll: %s route=%s: %v", what, route, err)
+}
+
+// pollErrRoute:记错误并把该 route 标为本轮失败(pollErr 的 per-route 版)。
+func (p *orPoller) pollErrRoute(routeOK map[string]bool, what, route string, err error) {
+	p.pollErr(what, route, err)
+	routeOK[route] = false
 }
 
 func (p *orPoller) getJSON(ctx context.Context, path string, v interface{}) error {
