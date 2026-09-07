@@ -329,11 +329,18 @@ function _G.do_log_release(opts)
        and ngx.status and ngx.status >= 200 and ngx.status < 300 then
         ttft.ttft_record(opts, td, ngx.ctx.ttft_first_chunk_t * 1000)   -- 秒 → 毫秒
     end
-    -- TPS 入账:只采流式 + 2xx + 有首-chunk 计时。从尾缓冲 parse completion_tokens;
+    -- TPS 入账:2xx 即采,**流式与非流式一视同仁**。从尾缓冲 parse completion_tokens;
     -- 拿不到(no-usage)→ fail-open:不采样、不进 EWMA、绝不因此限流(只 incr nousage 计数做可观测)。
+    -- ⚠️ 2026-09-07 口径变更(两处同步改:本文件 + bodylog-exporter-go/metrics.go):
+    --   ① 不再要求 ttft_is_stream —— 非流式请求同样占并发、同样消耗后端算力,把它们排除在外
+    --      会让「非流式为主」的子池两路 EWMA 长期为 nil,AIMD 退化成纯并发压力跟随、过载保护失效。
+    --   ② 分母从「解码时长(总时长-TTFT)」改为**总时长**(即包含 prefill/TTFT 那一段)。
+    --      这正是 ① 得以成立的前提:非流式只有一个 body chunk、first_chunk_t≈总时长,
+    --      旧口径下分母≈0 会算出天文数字。改用总时长后两类请求共用同一个定义。
+    --   代价:同一后端在新口径下测得的值系统性低于旧口径(prefill 占比越高差得越多),
+    --      **历史数据不可比,tps_limit_tps / tps_metrics 的阈值需按新口径重定**。
     local tpd = tps.tps_dict_if_on(opts)
-    if tpd and ngx.ctx.ttft_is_stream and ngx.ctx.ttft_first_chunk_t
-       and ngx.status and ngx.status >= 200 and ngx.status < 300 then
+    if tpd and ngx.status and ngx.status >= 200 and ngx.status < 300 then
         local ctok
         local tail = ngx.ctx.tps_tail
         -- 取最后一个匹配:usage chunk 永远在流末尾,而响应正文里(如 tool-call 回显的 JSON)
@@ -343,11 +350,12 @@ function _G.do_log_release(opts)
         end
         if ctok and ctok >= opts.tps_min_tokens then
             ngx.update_time()
-            local decode = (ngx.now() - ngx.req.start_time()) - ngx.ctx.ttft_first_chunk_t
-            -- 解码时间下限:< tps_min_decode_s 的短快响应(如 16 token / 3ms → 5000 tok/s)解码速率
-            -- 失真,不能代表稳态吞吐,直接跳过(不采样、不计 nousage)。配合 tps_min_tokens 双重滤噪。
-            if decode >= opts.tps_min_decode_s then
-                tps.tps_record(opts, tpd, ctok / decode)   -- tokens / 解码秒数
+            -- 分母 = 请求总时长(含 prefill/TTFT),流式与非流式同一定义。
+            local elapsed = ngx.now() - ngx.req.start_time()
+            -- 时长下限:< tps_min_decode_s 的短快响应(如 16 token / 3ms → 5000 tok/s)速率失真,
+            -- 不能代表稳态吞吐,直接跳过(不采样、不计 nousage)。配合 tps_min_tokens 双重滤噪。
+            if elapsed >= opts.tps_min_decode_s then
+                tps.tps_record(opts, tpd, ctok / elapsed)   -- tokens / 总秒数
             end
         elseif not ctok then
             tpd:incr(tps.tps_key_prefix(opts) .. "nousage", 1, 0, opts.tps_ttl)  -- 可观测:无 usage 样本数

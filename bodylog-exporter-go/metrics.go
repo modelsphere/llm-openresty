@@ -195,23 +195,20 @@ func (m *metrics) observe(d detailRecord) {
 	if d.Frt > 0 && d.Stream != nil && *d.Stream {
 		m.ttft.WithLabelValues(service, route, backend, model, promptBucket(d.PromptTokens)).Observe(d.Frt)
 	}
-	// 解码速率 = completion_tokens / 解码耗时(rt - frt),**分母必须扣掉 prefill**。
-	// 此前分母用 rt(含 prefill),后果:
-	//   ① 与 openresty 引擎口径不一致 —— 引擎(tps.lua)算的是 ctok/(总时长-ttft),
-	//      两边对同一概念用两套定义,拿引擎的 tps_limit_tps(15~30)去卡这个指标是苹果比橘子;
-	//   ② 系统性低估,且**对慢请求低估得最狠** —— 实测慢尾请求中位 frt 占 rt 的 48%
-	//      (中位 86 token / 10.2s,扣掉 4.9s prefill 后 8.4→16.2 tok/s),把低尾压低约 2.4 倍。
-	//      注意别用全局 ttft_sum/rt_sum(仅 11%)去判断影响大小,那个被占多数的快请求稀释了。
-	// ⚠️ 只统计流式请求,理由同上面 TTFT:非流式只有一个 body chunk,frt≈rt → rt-frt≈0,
-	//    相除得天文数字,会把整个直方图顶进 overflow 桶。
-	// ⚠️ 下限过滤对齐引擎(tps_min_tokens=16 / tps_min_decode_s=0.5):短响应固定开销占比过高
-	//    (20 token / 2s = 10 tok/s),不代表稳态解码速率,不滤会污染低尾。实测滤掉约 16%。
-	// ⚠️ 语义变更:改动前后的历史数据不可比,依赖它的告警阈值需要按新口径重定。
-	if d.Stream != nil && *d.Stream && d.CompletionTokens >= 16 {
-		if decode := d.Rt - d.Frt; decode >= 0.5 {
-			m.outTokPerSec.WithLabelValues(service, route, backend, model, promptBucket(d.PromptTokens)).
-				Observe(float64(d.CompletionTokens) / decode)
-		}
+	// 输出 token 速率 = completion_tokens / 请求**总时长 rt**(含 prefill),流式与非流式一视同仁。
+	// ⚠️ 2026-09-07 口径变更(与 openresty 引擎 lua/access.lua 同步改,两边必须一致):
+	//   ① 分母由「解码耗时 rt-frt」改回**总时长 rt**;
+	//   ② 取消 stream 过滤 —— 非流式请求同样占并发、同样消耗后端算力,排除它们会让
+	//      「非流式为主」的路由样本长期为空,该指标失去监控意义。
+	//   ①是②的前提:非流式只有一个 body chunk、frt≈rt,旧口径下 rt-frt≈0,相除得天文数字,
+	//   会把整个直方图顶进 overflow 桶(这正是当初加 stream 过滤的原因)。
+	// ⚠️ 与旧口径相比系统性偏低,prefill 占比越高差得越多(实测慢尾请求 frt 中位占 rt 的 48%,
+	//    该段样本约低一半)。**历史数据不可比,告警阈值与引擎 tps_limit_tps 需按新口径同步重定。**
+	// ⚠️ 下限过滤对齐引擎(tps_min_tokens=16 / tps_min_decode_s=0.5,后者现在卡的是总时长):
+	//    短响应固定开销占比过高(20 token / 2s = 10 tok/s),不代表稳态吞吐,不滤会污染低尾。
+	if d.CompletionTokens >= 16 && d.Rt >= 0.5 {
+		m.outTokPerSec.WithLabelValues(service, route, backend, model, promptBucket(d.PromptTokens)).
+			Observe(float64(d.CompletionTokens) / d.Rt)
 	}
 
 	m.lines.Inc()

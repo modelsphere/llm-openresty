@@ -187,9 +187,9 @@ function _G.register_route(name, opts_factory)
     opts.ttft_probe_window         = opts.ttft_probe_window         or 10
     opts.ttft_probe_per_window     = opts.ttft_probe_per_window     or 5
     opts.ttft_window               = opts.ttft_window               or _G.TTFT_WINDOW
-    -- ── TPS 限流(解码速率,按路由 opt-in)默认值 ──
+    -- ── TPS 限流(输出 token 速率,按路由 opt-in)默认值 ──
     -- tps_limit_tps 默认 nil(=opt-in:没配则 tps_dict_if_on 返 nil → 全链路短路,零行为变化);
-    -- dict 默认共享 "tps_stat";其余节奏参数对位 TTFT。tps_min_tokens 滤短响应(decode_time≈0 噪声)。
+    -- dict 默认共享 "tps_stat";其余节奏参数对位 TTFT。tps_min_tokens 滤短响应(速率失真噪声)。
     opts.tps_dict                  = opts.tps_dict                  or "tps_stat"
     -- 记下阈值是路由自己配的还是继承全局默认。_G.TPS_LIMIT_TPS 从 nil 改成 20 之后,
     -- 「opts.tps_limit_tps 非 nil」不再等于「有人显式配过」,而排查时这两件事必须能分开
@@ -208,6 +208,7 @@ function _G.register_route(name, opts_factory)
     opts.tps_probe_per_window      = opts.tps_probe_per_window      or 5
     opts.tps_window                = opts.tps_window                or _G.TPS_WINDOW
     opts.tps_min_tokens            = opts.tps_min_tokens            or 16
+    -- tps_min_decode_s:请求**总时长**下限(2026-09-07 口径变更后分母含 prefill;沿用旧参数名不改配置)
     opts.tps_min_decode_s          = opts.tps_min_decode_s          or 0.5
     -- ── 规则化请求拒绝(reject_rules,按请求内容匹配 → 可配 status,默认 429)默认值 ──
     -- opts.reject_rules 为 nil 时天然 opt-in(该路由不启用);配了则由 validate_reject_rules 校验+归一
