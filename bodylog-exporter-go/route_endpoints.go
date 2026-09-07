@@ -204,9 +204,13 @@ type resolveResult struct {
 // modelType 用来决定「要不要 poll 这条 route 的引擎状态端点」:
 // video 路由是 autoconfig 渲染的**纯反向代理**,压根没有 _route_state/_tps_status/_ttft_status
 // 这些 lua 引擎端点,poll 它必然失败。而 openresty_poll_up 是**全局**的
-// (「上轮 poll 是否全成功」),一条 route 失败就把它打成 0 —— 于是整个 openresty
-// 监控面变成盲区,连 OpenRestyNoHealthyPeer 这类依赖它的告警一起失效。
-// 生产实拍:video 路由 2026-09-03 13:12 上线那一刻 poll_up 就掉 0,一直没恢复。
+// (「上轮 poll 是否全成功」),一条 route 失败就把它打成 0。
+//
+// 危害不是"指标断了"——pollOnce 是逐条 route 填 gauge 的,失败的只让自己那份空着,
+// 其余 route 的数据照常(2026-09-03~09-06 实测:LLM 路由的 healthy_peers/active_level
+// 全程连续)。真正的危害是 **OpenRestyPollDown 连响 3 天、这个告警彻底失去信号价值**:
+// 期间若真发生轮询故障(openresty 不可达等),没人分辨得出来——它早就在响了。
+// 而看板上完全看不出异常(poll_up 在三个 dashboard 里零引用),所以拖了 3 天。
 type modelRouteFull struct {
 	Items []struct {
 		Spec struct {
