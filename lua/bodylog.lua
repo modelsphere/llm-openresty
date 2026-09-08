@@ -22,7 +22,10 @@ _G.BODYLOG_DEFAULT_PCT     = 100     -- 默认 100% 采样；如需降采样改�
 -- cloud-b 网（gateway-host/12）应设 10.0.0.2。应急回退本机收数：env 设 127.0.0.1 +
 -- systemctl start bodylog-listener。这样本文件跨所有部署字节一致，机器差异只在 nginx.conf。
 
-_G.bodylog_max_req         = 2 * 1024 * 1024    -- 2 MB 请求 body 上限
+-- 与 session_base.conf 的 client_body_buffer_size 对齐(10m = LLM 的 per-model 上限)。
+-- 两者必须一起提:只提这个没用 —— body 超过 buffer 时 nginx 已经把它写进临时文件、
+-- get_body_data() 返回 nil,这里再大也是记个空串。
+_G.bodylog_max_req         = 10 * 1024 * 1024   -- 10 MB 请求 body 上限
 -- 响应 body 双区缓存（head + tail ring buffer），总和 = head + tail。
 -- head 装满后切到 tail 环形 buffer，最旧的 chunk 被淘汰，最终保留"开头 + 结尾"。
 -- 这样长 SSE 流截断后仍能保留尾部 finish_reason / usage chunk。
