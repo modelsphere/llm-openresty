@@ -16,7 +16,12 @@ spec:
     matchLabels: {{- include "openresty.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      labels: {{- include "openresty.selectorLabels" . | nindent 8 }}
+      labels:
+        {{- include "openresty.selectorLabels" . | nindent 8 }}
+        {{- /* 只进 pod,不进上面的 selector:selector 不可变。用途见 values.yaml。 */}}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.podAnnotations }}
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}

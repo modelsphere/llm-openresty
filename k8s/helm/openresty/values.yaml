@@ -66,6 +66,11 @@ resources:                              # worker_processes=20 的生产 openrest
   limits:   { cpu: "20", memory: 32Gi }
 
 podAnnotations: {}
+
+# podLabels:额外 pod 标签,**不进 selector**(selector 不可变,动了 upgrade 直接失败)。
+# 用途:让一个外部 Service 同时选中多个 release 的 pod(canary operator 的 PerArm 模式)。
+podLabels: {}
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
