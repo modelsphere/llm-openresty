@@ -30,11 +30,15 @@
 | `bodylog_rt_seconds` | **histogram**(native-only) | `stream` | 总响应时间(秒) |
 | `bodylog_ttft_seconds` | **histogram**(native-only) | **`prompt_bucket`** | 首 token 时间/TTFT(秒,**仅流式**) |
 | `bodylog_output_tok_per_second` | **histogram**(native-only) | **`prompt_bucket`** | **单请求输出 token 速率** `completion_tokens/rt`(tok/s,**分母为总时长、含 prefill**;流式与非流式均计,过滤 `ctok>=16` + `rt>=0.5s`) |
+| `bodylog_overall_output_tok_per_second` | **histogram**(native-only) | — | **总体输出 token 速率** `completion_tokens/rt`(tok/s);仅 `status` 为 2xx、`completion_tokens>0`、`rt>0` 的请求,不带 `prompt_bucket`/`stream` 过滤 |
+| `bodylog_decode_output_tok_per_second` | **histogram**(native-only) | — | **解码输出 token 速率** `completion_tokens/(lct-frt)`(tok/s);仅 2xx、`completion_tokens>0` 且 `lct-frt>0.3s` 的请求,不带 `prompt_bucket`/`stream` 过滤 |
 
-> **⚠️ 2026-08-31(exporter 0.2.0)起,三个 histogram 改为 native-only** —— 不再双发经典桶,
+> **⚠️ 2026-08-31(exporter 0.2.0)起,上述五个 histogram 均为 native-only** —— 不再双发经典桶,
 > `bodylog_*_bucket` / `_sum` / `_count` 这些 series **不再产生**。求分位数必须用**裸名、不带 `le`**:
 > `histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`。
 > 起因:Prometheus 侧开了 `scrapeClassicHistograms`,双发会真被抓进 TSDB(实测 12x series 膨胀)。
+
+`bodylog_output_tok_per_second` 是历史 legacy 指标,语义和 HELP 保持不变(含 `prompt_bucket`、`completion_tokens>=16`、`rt>=0.5s`),不得作为新实验的 TPS 口径；Watchmen 使用的 overall/decode 指标是新增指标,不能用旧指标替代。`decode` 明确使用明细 JSON 的 `lct-frt`，只要求 `lct-frt>0.3s`，不额外限定 `stream`；三个 TPS 指标的 observation 都是单请求直方图样本,Prometheus 查询时按 `service` 聚合即可。
 
 #### `prompt_bucket`:按输入长度分档(ttft / output_tok_per_second)
 
@@ -313,6 +317,10 @@ sum by(service,reason)(rate(openresty_rejected_total[1m]))
 
 # 单请求生成速率 p50(每条请求 completion/rt 的分布)
 histogram_quantile(0.5, sum by(service)(rate(bodylog_output_tok_per_second[5m])))
+
+# Watchmen overall/decode TPS 均值(按 service 聚合;新指标不带 prompt_bucket)
+histogram_avg(sum by(service)(rate(bodylog_overall_output_tok_per_second[1m])))
+histogram_avg(sum by(service)(rate(bodylog_decode_output_tok_per_second[1m])))
 
 # 更细:某 service 下每个 backend(pod)QPS —— pod 扩缩时按 service 聚合更稳
 sum by(backend)(rate(bodylog_requests_total{service="model-service/fallback-model-service-01"}[1m]))

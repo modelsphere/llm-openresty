@@ -46,7 +46,8 @@ func TestNativeOnly(t *testing.T) {
 	}
 	for _, mf := range mfs {
 		n := mf.GetName()
-		if n != "bodylog_ttft_seconds" && n != "bodylog_output_tok_per_second" && n != "bodylog_rt_seconds" {
+		if n != "bodylog_ttft_seconds" && n != "bodylog_output_tok_per_second" && n != "bodylog_rt_seconds" &&
+			n != "bodylog_overall_output_tok_per_second" && n != "bodylog_decode_output_tok_per_second" {
 			continue
 		}
 		for _, mm := range mf.GetMetric() {
@@ -59,6 +60,16 @@ func TestNativeOnly(t *testing.T) {
 				len(h.GetBucket()), h.GetSchema(), len(h.GetPositiveDelta()), lbls["prompt_bucket"])
 			if len(h.GetBucket()) != 0 {
 				t.Errorf("仍在发经典桶: %d 个", len(h.GetBucket()))
+			}
+			if h.GetSchema() == 0 {
+				t.Errorf("%s: native schema=0, want non-zero native schema", n)
+			}
+			// 新 TPS 指标只允许 service/route/backend/model,不带 prompt_bucket。
+			if n == "bodylog_overall_output_tok_per_second" || n == "bodylog_decode_output_tok_per_second" {
+				if _, ok := lbls["prompt_bucket"]; ok {
+					t.Errorf("%s: 不应暴露 prompt_bucket", n)
+				}
+				continue
 			}
 			// rt_seconds 不带 prompt_bucket(只去经典桶),其余两个必须落对档
 			if n != "bodylog_rt_seconds" && lbls["prompt_bucket"] != "0006k_0008k" {
