@@ -14,7 +14,7 @@
 
 ### 业务指标(维度:`service` / `route` / `backend` / `model`)
 
-**每条业务指标都带 4 个维度**:`service`(= ModelRoute 的 `discovery.service`,`ns/name` 形式,**用户主聚合维度**)、`route`(= `nginx.route`)、`backend`(真后端 pod IP:port,会漂移)、`model`(明细里的 served-model-name,可能空)。`service`/`route` 由**富化**据 `backend` pod IP 反查 ModelRoute 得到(见下方「富化:podIP→service/route」);in-cluster 才有,裸机退化为 `unknown`。
+**每条业务指标都带 4 个维度**:`service`(= ModelRoute 的 `discovery.service`,`ns/name` 形式,**用户主聚合维度**)、`route`(= `nginx.route`,省略则 ModelRoute 的 `metadata.name`,与 autoconfig 一致)、`backend`(真后端 pod IP:port,会漂移)、`model`(明细里的 served-model-name,可能空)。`service`/`route` 由**富化**据 `backend` pod IP 反查 ModelRoute 得到(见下方「富化:podIP→service/route」);in-cluster 才有,裸机退化为 `unknown`。
 
 | 指标 | 类型 | 额外 label | 含义 |
 |---|---|---|---|
@@ -115,7 +115,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 ### label 说明
 
 - **`service`**:后端所属 ModelRoute 的 `spec.discovery.service`(`ns/name`,如 `model-service/fallback-model-service-01`)。**推荐主聚合维度** —— pod IP 会漂移、`model` 会抓空,但 service 稳定。富化未命中(裸机/无 SA/pod 刚建未进 EndpointSlice)= `unknown`。
-- **`route`**:后端所属 ModelRoute 的 `spec.nginx.route`(如 `fallback-model-service-0.1`),与 service 1:1。未命中 = `unknown`。
+- **`route`**:后端所属 ModelRoute 的 `spec.nginx.route`(如 `fallback-model-service-0.1`),省略则取 `metadata.name`(与 autoconfig 生成 `session_route_<route>.conf` 的规则一致;只有连 nginx 段都没有的 monitor-only 才不计),与 service 1:1。未命中 = `unknown`。
 - **`backend`**:归一化后的**真实后端** `host:port`(= bodylog 聚合的 peer key)。缺失时为 `(none)`(如未路由的 4xx);重试会出现 `<peer> (retry#1)` 变体。
 - **`model`**:响应里的 served-model-name(取自 `resp_meta.model`,**有界**);缺失为 `unknown`。**纯取明细,不用 ModelRoute 兜底**(要稳定的服务维度用 `service`)。
 - **`status_class`**:`2xx` / `4xx` / `5xx` / `other`(429 归 `4xx`;精确 429 分 reason 见 `openresty_rejected_total`)。
@@ -171,7 +171,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 | `OPENRESTY_POLL_INTERVAL_MS` | `15000` | poll 周期 |
 | `OPENRESTY_POLL_TIMEOUT_MS` | `3000` | 单请求超时 |
 
-**route 集合默认【动态发现】**(不填 `OPENRESTY_POLL_ROUTES` 时):走**与富化同一个发现器**(in-cluster SA 列 **ModelRoute CR** `routing.gpucluster.io/v1alpha1`),取 `spec.nginx.route` 得 route 列表、`spec.discovery.service` 得 route→service,周期刷新、增删自动跟随 —— **无需静态配、route 变了不重启**。下面这几个 env **同时**控制富化和 poll 发现(一份 list 两用):
+**route 集合默认【动态发现】**(不填 `OPENRESTY_POLL_ROUTES` 时):走**与富化同一个发现器**(in-cluster SA 列 **ModelRoute CR** `routing.gpucluster.io/v1alpha1`),取 `spec.nginx.route`(省略则 `metadata.name`,同 autoconfig)得 route 列表、`spec.discovery.service` 得 route→service,周期刷新、增删自动跟随 —— **无需静态配、route 变了不重启**。下面这几个 env **同时**控制富化和 poll 发现(一份 list 两用):
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
