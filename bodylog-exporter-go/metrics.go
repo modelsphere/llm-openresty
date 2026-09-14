@@ -55,7 +55,7 @@ type metrics struct {
 }
 
 func newMetrics(reg *prometheus.Registry) *metrics {
-	// service = ModelRoute discovery.service(ns/name,用户主聚合维度);route = nginx.route。
+	// service = ModelRoute discovery.service(ns/name,用户主聚合维度);route = nginx.route(省略则 metadata.name)。
 	// 二者都随后端 pod 稳定(pod IP 漂移也不变),补上 bodylog backend/model 缺的 service 归属。
 	srbm := []string{"service", "route", "backend", "model"}
 	// srbmp = srbm + prompt_bucket。用 slices.Concat 而非 append(srbm, ...):append 在 cap>len
@@ -141,7 +141,7 @@ func orDefault(s, def string) string {
 func (m *metrics) observe(d detailRecord) {
 	backend := orDefault(d.Backend, "(none)")
 	model := orDefault(d.Model, "unknown") // model 纯来自明细,不做兜底
-	// 富化:后端 pod IP → service(= ns/name,主聚合维度)+ route(nginx.route)。未命中回退 unknown。
+	// 富化:后端 pod IP → service(= ns/name,主聚合维度)+ route(nginx.route,省略则 metadata.name)。未命中回退 unknown。
 	route, service := "unknown", "unknown"
 	if m.resolver != nil {
 		if rt, svc, ok := m.resolver.Lookup(backendIP(d.Backend)); ok {

@@ -34,7 +34,7 @@ const (
 )
 
 // routeInfo:一个后端 pod 所属的 route 及其 service(来自它所在的 ModelRoute)。
-// route   = spec.nginx.route(如 "fallback-model-service-0.1");
+// route   = spec.nginx.route(如 "fallback-model-service-0.1"),省略则 metadata.name(同 autoconfig,见 routeName);
 // service = spec.discovery.service(ns/name 形式,如 "model-service/fallback-model-service-01",用户一般按它聚合),
 //
 //	经 normalizeServiceLabel 剥掉 LWS 的 "-leader" 后缀(kimi/kimi-k25-leader → kimi/kimi-k25)。
@@ -213,17 +213,38 @@ type resolveResult struct {
 // 而看板上完全看不出异常(poll_up 在三个 dashboard 里零引用),所以拖了 3 天。
 type modelRouteFull struct {
 	Items []struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
 		Spec struct {
 			ModelType string `json:"modelType"` // 空 = llm(CRD 默认值)
 			Nginx     struct {
-				Route   string `json:"route"`
-				Service string `json:"service"`
+				Route           string            `json:"route"`
+				Service         string            `json:"service"`
+				OutputConfigMap string            `json:"outputConfigMap"`
+				Peers           []json.RawMessage `json:"peers"`
 			} `json:"nginx"`
 			Discovery struct {
 				Service string `json:"service"`
 			} `json:"discovery"`
 		} `json:"spec"`
 	} `json:"items"`
+}
+
+// routeName:与 autoconfig 的 nginxRoute() 同一规则 —— spec.nginx.route 优先,省略则用 metadata.name。
+// nginx.route 在 CRD 里是 omitempty,chart 也只在 values 显式写了才渲染;只认 route 字段会把
+// 「没写 route、靠默认名」的正常路由当成 monitor-only 整条跳过(2026-09-14 线上:model-service-03-kimi /
+// mf-dummpy 路由在跑、openresty 有 conf 和 sock,但 bodylog_service_replicas 里没有它们,
+// 服务健康总览看板上整个服务消失)。
+// 真正的 monitor-only = 连 nginx 段都没有(无 outputConfigMap、无 peers),这种返回 ""。
+func routeName(name, route, outputConfigMap string, peers int) string {
+	if r := strings.TrimSpace(route); r != "" {
+		return r
+	}
+	if strings.TrimSpace(outputConfigMap) == "" && peers == 0 {
+		return ""
+	}
+	return strings.TrimSpace(name)
 }
 
 // endpointSliceList:discovery.k8s.io/v1 EndpointSlice —— 取 endpoints[].addresses[] + conditions.ready
@@ -279,7 +300,7 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 	// 上溯路径高度重合,缓存把 apiserver 的 GET 次数压到每个对象一次。
 	ownerCache := map[string]*ownerObj{}
 	for _, it := range lst.Items {
-		route := strings.TrimSpace(it.Spec.Nginx.Route)
+		route := routeName(it.Metadata.Name, it.Spec.Nginx.Route, it.Spec.Nginx.OutputConfigMap, len(it.Spec.Nginx.Peers))
 		if route == "" { // monitor-only(无 nginx 路由)→ 既不 poll 也无法归属
 			continue
 		}

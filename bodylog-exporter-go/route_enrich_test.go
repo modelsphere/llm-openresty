@@ -399,3 +399,64 @@ func TestResolverSkipsNonLLMRoutesForPoll(t *testing.T) {
 		t.Errorf("serviceFor(minimax-h3) = %q, 想要 ns/h3-router(video 只是不 poll,不是不认)", got)
 	}
 }
+
+// nginx.route 省略时按 autoconfig 的规则回退到 metadata.name(2026-09-14 线上 model-service-03-kimi /
+// mf-dummpy 就是这种:路由在跑,exporter 却整条跳过,看板上服务消失)。
+// 连 nginx 段都没有的才是 monitor-only,仍跳过。
+func TestResolverRouteDefaultsToName(t *testing.T) {
+	const mr = `{"items":[
+	  {"metadata":{"name":"model-service-02-kimi"},"spec":{"nginx":{"route":"model-service-02-kimi","outputConfigMap":"llm-route/openresty-conf","peers":[{"use":"backend"}]},"discovery":{"service":"model-service-02-kimi/model-service-02-kimi"}}},
+	  {"metadata":{"name":"model-service-03-kimi"},"spec":{"nginx":{"outputConfigMap":"llm-route/openresty-conf","peers":[{"use":"cart"},{"use":"backend"}]},"discovery":{"service":"model-service-03-kimi/model-service-03-kimi"}}},
+	  {"metadata":{"name":"renamed"},"spec":{"nginx":{"route":"custom-route","outputConfigMap":"llm-route/openresty-conf","peers":[{"use":"backend"}]},"discovery":{"service":"ns/renamed-svc"}}},
+	  {"metadata":{"name":"m-only"},"spec":{"monitor":{"model":"m-only"},"discovery":{"service":"ns/m-only-svc"}}}
+	]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "endpointslices") {
+			_, _ = w.Write([]byte(esJSON("10.0.0.1")))
+			return
+		}
+		_, _ = w.Write([]byte(mr))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv)
+	r.refresh(context.Background())
+
+	// 省略 route → 用 name;显式 route 优先于 name;monitor-only 不进。
+	if got, want := r.getRoutes(), []string{"custom-route", "model-service-02-kimi", "model-service-03-kimi"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("getRoutes() = %v, 想要 %v", got, want)
+	}
+	if got := r.serviceFor("model-service-03-kimi"); got != "model-service-03-kimi/model-service-03-kimi" {
+		t.Errorf("serviceFor(model-service-03-kimi) = %q", got)
+	}
+	if got := r.serviceFor("renamed"); got != "" {
+		t.Errorf("显式 route 时不该再按 name 登记, serviceFor(renamed) = %q", got)
+	}
+	if got := r.serviceFor("m-only"); got != "" {
+		t.Errorf("monitor-only 不该有 route, serviceFor(m-only) = %q", got)
+	}
+	// 看板靠的就是这条 gauge:省略 route 的服务也必须有副本数。
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service-03-kimi/model-service-03-kimi", "model-service-03-kimi")); n != 1 {
+		t.Errorf("model-service-03-kimi replicas = %v, 想要 1", n)
+	}
+}
+
+func TestRouteName(t *testing.T) {
+	cases := []struct {
+		name, route, cm string
+		peers           int
+		want            string
+	}{
+		{"mr", "explicit", "ns/cm", 1, "explicit"},
+		{"mr", "  explicit ", "ns/cm", 1, "explicit"},
+		{"mr", "", "ns/cm", 1, "mr"},
+		{"mr", "", "ns/cm", 0, "mr"},
+		{"mr", "", "", 2, "mr"},
+		{"mr", "", "", 0, ""}, // 无 nginx 段 = monitor-only
+	}
+	for _, c := range cases {
+		if got := routeName(c.name, c.route, c.cm, c.peers); got != c.want {
+			t.Errorf("routeName(%q,%q,%q,%d) = %q, 想要 %q", c.name, c.route, c.cm, c.peers, got, c.want)
+		}
+	}
+}
