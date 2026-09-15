@@ -175,3 +175,24 @@ func TestHousekeepStaggeredConcurrent(t *testing.T) {
 		t.Fatalf("归档成员数 %d,应为 24;源目录是否已删=%v", n, srcGone)
 	}
 }
+
+func TestHousekeepCleansBothTmpNamings(t *testing.T) {
+	// tmp 改成 os.CreateTemp 之后名字是 `<date>.tar.gz.tmp-XXXXXX`,
+	// 而清理分支原本只认 HasSuffix(".tar.gz.tmp") —— 新命名一个都匹配不上,
+	// 崩溃残留(每个可能几十 GB)就永远清不掉,等于把"丢数据"换成"磁盘泄漏"。
+	// 两种命名都要认(旧的可能还躺在盘上)。
+	root := t.TempDir()
+	old := filepath.Join(root, "2026-09-01.tar.gz.tmp")
+	neu := filepath.Join(root, "2026-09-02.tar.gz.tmp-a1b2c3")
+	for _, p := range []string{old, neu} {
+		if err := os.WriteFile(p, []byte("leftover"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	housekeep(root)
+	for _, p := range []string{old, neu} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("残留临时文件没被清理: %s", filepath.Base(p))
+		}
+	}
+}

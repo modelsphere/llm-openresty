@@ -695,7 +695,7 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 // housekeep 扫描 BODYLOG_DIR，处理：
 //  1. YYYY-MM-DD/ 目录（非今日）→ tar.gz 整个目录 → 删原目录
 //  2. YYYY-MM-DD.tar.gz（≥ keepDays 天）→ 删
-//  3. .tar.gz.tmp 残留（上次崩溃没完成）→ 删
+//  3. .tar.gz.tmp / .tar.gz.tmp-XXXXXX 残留（上次崩溃没完成）→ 删
 //  4. （兼容）旧版 X.jsonl 在根目录 → gzip → 删原文件
 //  5. （兼容）旧版 X.jsonl.gz 在根目录（≥ keepDays 天）→ 删
 //
@@ -752,7 +752,12 @@ func housekeep(dir string) {
 				log.Printf("removed old %s", name)
 			}
 
-		case !e.IsDir() && strings.HasSuffix(name, ".tar.gz.tmp"):
+		// ⚠️ 两种命名都要认:旧版是固定名 `<date>.tar.gz.tmp`,现在是 os.CreateTemp 的
+		// `<date>.tar.gz.tmp-XXXXXX`。只写 HasSuffix(".tar.gz.tmp") 的话新命名一个都匹配不上,
+		// 崩溃残留的临时文件(每个可能几十 GB)就永远清不掉 —— 等于把丢数据换成了磁盘泄漏。
+		// 删自己正在写的那个不会发生:housekeep 已串行化,且 ReadDir 的快照取在打包之前。
+		case !e.IsDir() && (strings.HasSuffix(name, ".tar.gz.tmp") ||
+			strings.Contains(name, ".tar.gz.tmp-")):
 			// 上次崩溃残留：直接删，下次 housekeep 会重新打包对应目录
 			_ = os.Remove(full)
 			log.Printf("removed crashed temp %s", name)
