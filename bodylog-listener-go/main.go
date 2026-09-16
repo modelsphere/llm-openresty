@@ -695,12 +695,21 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 // housekeep 扫描 BODYLOG_DIR，处理：
 //  1. YYYY-MM-DD/ 目录（非今日）→ tar.gz 整个目录 → 删原目录
 //  2. YYYY-MM-DD.tar.gz（≥ keepDays 天）→ 删
-//  3. .tar.gz.tmp 残留（上次崩溃没完成）→ 删
+//  3. .tar.gz.tmp / .tar.gz.tmp-XXXXXX 残留（上次崩溃没完成）→ 删
 //  4. （兼容）旧版 X.jsonl 在根目录 → gzip → 删原文件
 //  5. （兼容）旧版 X.jsonl.gz 在根目录（≥ keepDays 天）→ 删
 //
-// 多次并发触发是安全的：每个目标都先 Stat 检查 dst 是否已存在再处理。
+// ⚠️ **不可重入,必须串行**。原注释写的是「多次并发触发是安全的:每个目标都先 Stat 检查
+// dst 是否已存在再处理」—— 这句是错的,2026-09-15 因此丢了七天数据:
+// dst 要等 tarGzDir 完成 rename 之后才出现,而打包一次要二三十分钟,这期间 Stat 一直说
+// 「不存在」,守卫形同虚设。守卫该守的是「这个目录正在被处理」,而不是「产物是否已存在」。
+// 这里用一把全局锁把 housekeep 串起来:它本来就不是热路径(跨日一次 + 启动一次),
+// 串行的代价可以忽略,而并发的代价是永久丢数据。
+var housekeepMu sync.Mutex
+
 func housekeep(dir string) {
+	housekeepMu.Lock()
+	defer housekeepMu.Unlock()
 	today := time.Now().Format("2006-01-02")
 	cutoff := time.Now().AddDate(0, 0, -keepDays).Format("2006-01-02")
 	entries, err := os.ReadDir(dir)
@@ -743,7 +752,12 @@ func housekeep(dir string) {
 				log.Printf("removed old %s", name)
 			}
 
-		case !e.IsDir() && strings.HasSuffix(name, ".tar.gz.tmp"):
+		// ⚠️ 两种命名都要认:旧版是固定名 `<date>.tar.gz.tmp`,现在是 os.CreateTemp 的
+		// `<date>.tar.gz.tmp-XXXXXX`。只写 HasSuffix(".tar.gz.tmp") 的话新命名一个都匹配不上,
+		// 崩溃残留的临时文件(每个可能几十 GB)就永远清不掉 —— 等于把丢数据换成了磁盘泄漏。
+		// 删自己正在写的那个不会发生:housekeep 已串行化,且 ReadDir 的快照取在打包之前。
+		case !e.IsDir() && (strings.HasSuffix(name, ".tar.gz.tmp") ||
+			strings.Contains(name, ".tar.gz.tmp-")):
 			// 上次崩溃残留：直接删，下次 housekeep 会重新打包对应目录
 			_ = os.Remove(full)
 			log.Printf("removed crashed temp %s", name)
@@ -861,14 +875,18 @@ func isDateName(s string) bool {
 
 // tarGzDir 打包 srcDir → dst（先写 dst.tmp 再原子 rename，crash 时不会留半截 .tar.gz）
 func tarGzDir(srcDir, dst string) error {
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
+	// ⚠️ tmp 必须**唯一**,不能用固定的 dst+".tmp"。2026-09-15 事故:两个 housekeep 并发
+	// 时都 os.Create(同一个 tmp) → 两条 gzip 流交错写进**同一个 inode**;先完成的 rename
+	// 成正式归档后,另一个的 fd 仍指向那个 inode,继续把**正式归档**写坏。
+	// 结果:归档从某个小时起不可读,而源目录已被删 → 数据永久丢失(七天,每天 8~14 小时)。
+	out, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
 	defer func() {
 		_ = out.Close()
-		// 失败时清掉 .tmp（成功路径上已经 rename 走了，不影响）
+		// 失败时清掉 tmp(成功路径上已经 rename 走了,不影响)
 		_ = os.Remove(tmp)
 	}()
 	gw, _ := gzip.NewWriterLevel(out, 6)
@@ -914,7 +932,77 @@ func tarGzDir(srcDir, dst string) error {
 	if err := out.Close(); err != nil {
 		return err
 	}
+	// ⚠️ **rename 之前先把归档完整读一遍**。这是最后一道闸:调用方成功返回后就会
+	// os.RemoveAll(源目录),一旦归档不完整,数据就永久没了。校验挡的不只是并发写,
+	// 还有盘满、进程被 kill、以及将来任何新引入的问题 —— 校验不过就保留源目录,
+	// 把"永久丢数据"降级成"多占一天磁盘"。
+	if err := verifyTarGz(tmp, srcDir); err != nil {
+		return fmt.Errorf("归档自检失败(源目录保留,不删): %w", err)
+	}
 	return os.Rename(tmp, dst)
+}
+
+// verifyTarGz 把刚生成的归档整个读一遍,并核对成员集合与源目录一致。
+// 只 Stat 大小是不够的 —— 交错写出来的坏档大小照样"合理",必须真解压走一遍。
+func verifyTarGz(path, srcDir string) error {
+	want := map[string]bool{}
+	parent := filepath.Dir(srcDir)
+	if err := filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(parent, p)
+		if err != nil {
+			return err
+		}
+		want[rel] = true
+		return nil
+	}); err != nil {
+		return fmt.Errorf("walk src: %w", err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("gzip open: %w", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	got := map[string]bool{}
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("tar read: %w", err)
+		}
+		// 必须把内容也读完 —— 坏在文件体里的话,只读 header 发现不了
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			return fmt.Errorf("tar body %s: %w", hdr.Name, err)
+		}
+		if !hdr.FileInfo().IsDir() {
+			got[hdr.Name] = true
+		}
+	}
+	var missing []string
+	for n := range want {
+		if !got[n] {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("归档少了 %d 个成员: %s", len(missing), strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func gzipFile(src, dst string) error {
@@ -1623,19 +1711,17 @@ func main() {
 		conns.Range(func(k, _ any) bool { _ = k.(net.Conn).Close(); return true }) // 关活跃连接，解开 readFrame
 	}()
 
-	go housekeep(dir)
-	go func() {
-		t := time.NewTicker(6 * time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				housekeep(dir)
-			}
-		}
-	}()
+	// housekeep 的触发源**只剩一个**:hourWriter.Write 里 dayChanged 的那次。
+	// w.day 初值是空字符串,所以进程起来后的第一条写入必然命中 —— "停机跨过零点、
+	// 事后恢复"的情况它同样兜得住,不需要额外在启动时再调一次。
+	//
+	// 去掉的两个(2026-09-15 事故后):
+	//   · 每 6h 的巡检:对打包是冗余的,而它的相位(= 进程启动时刻 mod 6h)一旦落进
+	//     零点打包窗口就会天天和跨日打包并发。事故时相位 00:19:37,而打包耗时从
+	//     17 分钟涨到 25~35 分钟后必然重叠 → 归档被写坏 + 源目录已删 = 永久丢数据。
+	//   · 启动时的一次:与"第一条写入"重复,而且两者会在启动后几毫秒内并发。
+	// 触发源收敛到一个,竞态从源头消失;housekeepMu 仍保留作为兜底。
+	// 保留期清理跟着跨日走:有流量就每天一次;没流量时也没有新数据要清。
 
 	// 每 60s flush 一次：把 minute < now-90s 的 bucket 移到 archive 并写盘
 	go func() {
