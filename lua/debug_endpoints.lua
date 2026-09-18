@@ -35,6 +35,16 @@ function _G.dbg_health_status(opts)
             banned = bad:get(k) and true or false,
         }
     end
+    -- Global flags go under the reserved _meta key rather than alongside the
+    -- peers: every other key in this table is a peer name and consumers iterate
+    -- over it, so a non-peer key at the top level would show up as a phantom peer.
+    --
+    -- api_keys_configured=false means no key file was readable and
+    -- authentication is letting everything through. That fail-open is deliberate
+    -- (a misconfigured Secret returning 401 for the whole site is worse than a
+    -- brief window without auth) but it must be discoverable: besides the error
+    -- logged at init, it is surfaced here for monitoring to alert on.
+    out._meta = { api_keys_configured = require("api_keys").configured and true or false }
     ngx.header["Content-Type"] = "application/json"
     ngx.say(cjson_dbg.encode(out))
 end

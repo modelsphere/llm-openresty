@@ -1,3 +1,10 @@
+{{- /* Which Secret holds the API keys, or "" for none (authentication off).
+       existingSecret wins over secret.create, so production can point at a Secret
+       created out of band and keep the keys out of git entirely.
+       Defined at file scope on purpose: it is used by the openresty container, the
+       reload sidecar and the volumes list, and a variable defined inside one of
+       those blocks would not be visible in the others. */}}
+{{- $sec := .Values.existingSecret | default (ternary (include "openresty.fullname" .) "" .Values.secret.create) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,6 +51,11 @@ spec:
             - { name: BODYLOG_LISTENER_HOST, value: {{ .Values.bodylog.host | quote }} }
             - { name: BODYLOG_LISTENER_PORT, value: {{ .Values.bodylog.port | quote }} }
           {{- end }}
+          {{- /* API keys are mounted as a file (see the volumeMounts below), not injected
+                 as an environment variable: nginx re-reads files on reload but never
+                 re-reads `env`, so a mounted Secret can be rotated with a graceful
+                 reload instead of restarting the master. The reload sidecar watches the
+                 mount directory as a second --watch path. */}}
           {{- if gt (int .Values.preStop.sleepSeconds) 0 }}
           lifecycle:
             preStop:
@@ -59,6 +71,16 @@ spec:
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
             - name: route-sock                                                # 路径路由 dispatch 的 unix socket(与 reload 共享,供清孤儿)
               mountPath: /usr/local/openresty/nginx/sock
+            {{- if $sec }}
+            {{- /* Whole-volume mount, never subPath: a Secret update swaps the ..data
+                   symlink, which a subPath mount does not follow -- it copies the file
+                   once and then goes stale, so rotation would silently stop working.
+                   Its own directory rather than joining conf.d/routes, which autoconfig
+                   owns and rewrites. Path matches api_keys.lua's DEFAULT_PATH. */}}
+            - name: api-keys
+              mountPath: /etc/openresty/api-keys
+              readOnly: true
+            {{- end }}
           {{- if .Values.probes.enabled }}
           startupProbe:                     # 慢启动预算:admin 口 /healthz 起来前不判 live/ready(最多 ~60s)
             httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
@@ -78,12 +100,29 @@ spec:
         - name: reload
           image: {{ .Values.reload.image }}
           # --sock-dir:reload 前清「无 conf 引用的孤儿 <name>.sock」(路径路由;删模型后残留 socket)
-          args: ["--watch", "/watch", "--process", {{ .Values.reload.process | quote }}, "--sock-dir", "/usr/local/openresty/nginx/sock"]
+          # The route-conf mount MUST stay the first --watch: the sidecar scopes its
+          # orphan-socket *.conf scan to that first path.
+          args:
+            - "--watch"
+            - "/watch"
+            {{- if $sec }}
+            - "--watch"                     # API-key Secret: a key change reloads nginx, no master restart
+            - "/keys"
+            {{- end }}
+            - "--process"
+            - {{ .Values.reload.process | quote }}
+            - "--sock-dir"
+            - "/usr/local/openresty/nginx/sock"
           volumeMounts:
             - name: routes
               mountPath: /watch
             - name: route-sock                                                # 与 openresty 共享 socket 目录
               mountPath: /usr/local/openresty/nginx/sock
+            {{- if $sec }}
+            - name: api-keys                                                  # 只为 watch 到 Secret 变化,不读内容
+              mountPath: /keys
+              readOnly: true
+            {{- end }}
         {{- end }}
         {{- if .Values.ha.enabled }}
         - name: hagate                       # master-standby:只有 leader 给自己打 ha-active 标签 → 只有它进 Service
@@ -102,6 +141,11 @@ spec:
             name: {{ .Values.configMapName }}
         - name: route-sock                     # 路径路由 dispatch unix socket(emptyDir,per-pod;openresty 建、reload 清孤儿)
           emptyDir: {}
+        {{- if $sec }}
+        - name: api-keys                       # 入口鉴权 key;挂成文件 → reload 即可改 key,不重启 master
+          secret:
+            secretName: {{ $sec }}
+        {{- end }}
       {{- if or .Values.affinity .Values.ha.enabled }}
       affinity:
         {{- if .Values.affinity }}
