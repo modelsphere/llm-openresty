@@ -45,9 +45,27 @@ function _G.do_route(opts)
     -- 权威始终是 opts.api_keys 这张 Lua 表。所以查不到时回落到表本身 ——
     -- dict 写满被驱逐 / set 失败(ak:set 会返回 false)/ 被别处 flush 掉,
     -- 都不该变成"合法 key 被拒"。少了这层兜底,dict 一满就是 401 风暴。
+    -- **这条路由**的 key 表为空 => 鉴权关闭,放行(fail-open)。openresty 是公网入口,
+    -- 升级时 Secret 配错导致**全站 401** 比短暂无鉴权更糟。这不是静默:init 期打 ERR,
+    -- /_health_status 报 _meta.api_keys_configured=false 供告警。
+    --
+    -- ⚠️ 判断必须在**这里**:本函数走 dict 缓存路径,不经过 api_keys.check(),
+    -- 所以 check() 里那个 fail-open 短路对主路由不生效。少了它,空 key 表会让每个
+    -- 请求都"查不到"而 401 —— 实测过(tools/openresty-keys/verify_failopen_behavior.sh):
+    -- 主路由 401、而 guard() 路由放行,两条路径行为相反。
+    --
+    -- ⚠️ 判的是 opts.api_keys 这张**本路由的表**,不是全局 api_keys.configured。
+    -- opts.api_keys 允许 per-route 覆盖(video 路由、测试 harness 都显式传表)。
+    -- 看全局开关的话,一条自带 key 表的路由会被"key 文件没挂上"这个与它无关的状态
+    -- 把鉴权整个关掉 —— 踩到过:test_api_keys_dict_full 的非法 key 被放行。
+    -- 空表结论缓存在 opts 上:表在 init 之后不再变,而每请求遍历(可能上千条)太贵。
+    if opts._api_keys_empty == nil then
+        opts._api_keys_empty = (next(opts.api_keys) == nil)
+    end
     local auth = ngx.req.get_headers()["authorization"] or ""
     local akey = api_keys.parse_bearer(auth)
-    if not akey or not (ak:get(sig .. ":" .. akey) or opts.api_keys[akey]) then
+    if not opts._api_keys_empty
+       and (not akey or not (ak:get(sig .. ":" .. akey) or opts.api_keys[akey])) then
         ngx.status = 401
         ngx.header["Content-Type"] = "application/json"
         ngx.say([[{"error":"missing or invalid api key"}]])
