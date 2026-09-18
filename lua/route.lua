@@ -135,6 +135,12 @@ function _G.register_route(name, opts_factory)
     -- 默认 key 表来自 lua/api_keys.lua(唯一来源)—— video 这类不走 lua 引擎的路由
     -- 也读同一张表,密钥不必再写进 ModelRoute / chart values / git。
     opts.api_keys                  = opts.api_keys                  or require("api_keys").keys
+    -- 这条路由的 key 表是否为空 —— 空 = 本路由鉴权关闭(fail-open,见 access.lua)。
+    -- 在注册时算一次,而不是在 access 路径里惰性算,原因有两个:
+    --   ① access 每请求都要判,而表可能有上千条,不能每次遍历;
+    --   ② /_health_status 要报**这条路由**的真实鉴权状态,而它可能在该路由还没
+    --      服务过任何请求时就被访问 —— 惰性计算那时只能读到 nil。
+    opts._api_keys_empty           = (next(opts.api_keys) == nil)
     opts.default_max               = opts.default_max               or _G.MAX_CONCURRENCY_PER_PEER
     -- 并发实时阈值放大倍数(每路由可配;缺省回退全局 _G.RT_LIMIT_FACTOR)
     opts.rt_limit_factor           = opts.rt_limit_factor           or _G.RT_LIMIT_FACTOR

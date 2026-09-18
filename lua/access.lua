@@ -62,10 +62,9 @@ function _G.do_route(opts)
     -- 测试 harness 已经在这么用。看全局开关的话,一条自带 key 表的路由会被
     -- "key 文件没挂上"这个与它无关的状态把鉴权整个关掉 —— 踩到过:
     -- test_api_keys_dict_full 的非法 key 被放行。
-    -- 空表结论缓存在 opts 上:表在 init 之后不再变,而每请求遍历(可能上千条)太贵。
-    if opts._api_keys_empty == nil then
-        opts._api_keys_empty = (next(opts.api_keys) == nil)
-    end
+    -- 空表结论在 register_route 时就算好了(route.lua),这里只读不算:
+    -- 表在 init 之后不再变,而每请求遍历(可能上千条)太贵;放在注册时还能让
+    -- /_health_status 在该路由尚未服务过任何请求时也读得到真实状态。
     local auth = ngx.req.get_headers()["authorization"] or ""
     local akey = api_keys.parse_bearer(auth)
     if not opts._api_keys_empty

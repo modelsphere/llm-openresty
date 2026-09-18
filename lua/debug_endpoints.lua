@@ -44,7 +44,22 @@ function _G.dbg_health_status(opts)
     -- (a misconfigured Secret returning 401 for the whole site is worse than a
     -- brief window without auth) but it must be discoverable: besides the error
     -- logged at init, it is surfaced here for monitoring to alert on.
-    out._meta = { api_keys_configured = require("api_keys").configured and true or false }
+    --
+    -- 两个字段不是一回事,监控要看的是后者:
+    --   api_keys_configured —— **全局** key 文件有没有读到 key(api_keys.M.configured)
+    --   route_auth_enabled  —— **这条路由**实际有没有在鉴权
+    -- 绝大多数情况下二者相同(所有路由共用同一张表);但路由允许 per-route 覆盖
+    -- key 表,此时只报全局值会给出与该路由实际行为相反的结论。
+    local route_empty = opts._api_keys_empty
+    if route_empty == nil then
+        -- 兜底:理论上 register_route 已经算好(route.lua)。真读到 nil 时宁可现算,
+        -- 也不要让 not nil 变成"在鉴权"这种反向误报。
+        route_empty = (next(opts.api_keys or {}) == nil)
+    end
+    out._meta = {
+        api_keys_configured = require("api_keys").configured and true or false,
+        route_auth_enabled  = not route_empty,
+    }
     ngx.header["Content-Type"] = "application/json"
     ngx.say(cjson_dbg.encode(out))
 end
