@@ -29,9 +29,31 @@ print("== read_file ==")
 -- A missing file must be an ordinary "no keys" outcome, not a crash: that is the
 -- fail-open path that keeps a misconfigured deployment serving instead of 401ing
 -- the whole site.
-local spec, err = api_keys.read_file("/nonexistent/definitely/not/here")
+local spec, err, kind = api_keys.read_file("/nonexistent/definitely/not/here")
 eq(spec, nil, "missing file returns nil")
 eq(type(err), "string", "missing file reports a reason")
+-- The third return value separates "never configured" from "configured but
+-- broken". Both fail open, but only the second is a misconfiguration to chase,
+-- and collapsing them leaves an operator unable to tell which one they have.
+eq(kind, "missing", "missing file is classified as missing, not unreadable")
+
+print("== read_file: unreadable is NOT the same as missing ==")
+-- Build a file this process cannot open. Running as root defeats it (root reads
+-- mode 000), so skip rather than assert something untrue.
+local nop = "/tmp/utest_noperm_" .. tostring(math.random(1e9))
+local nfh = assert(io.open(nop, "w")); nfh:write("sk-x:owner\n"); nfh:close()
+os.execute("chmod 000 '" .. nop .. "'")
+local probe = io.open(nop, "r")
+if probe then
+    probe:close()
+    print("  skip - 当前用户能读 mode 000(多半是 root),该分支无法在此验证")
+else
+    local s2, e2, k2 = api_keys.read_file(nop)
+    eq(s2, nil, "unreadable file returns nil")
+    eq(type(e2), "string", "unreadable file reports a reason")
+    eq(k2, "unreadable", "unreadable file is classified as unreadable, not missing")
+end
+os.execute("chmod 644 '" .. nop .. "' 2>/dev/null; rm -f '" .. nop .. "'")
 
 -- Mounted Secrets and hand-edited files almost always end in a newline; it must
 -- not become part of the last key.

@@ -33,6 +33,9 @@ function _G.do_route(opts)
     --      flush 式播种会让两张表互相冲刷,还会在"A 灌完 → B 冲掉 → A 查表"之间
     --      产生**假 401**。加前缀则两张表并存,互不干扰。
     --   2) 改了 key 表 = 新前缀,旧条目自然查不到(等价于失效),不必显式删。
+    --      代价是旧条目会**留在 dict 里不被清理**(dict 跨 reload 存活)。量级可忽略:
+    --      每条约百字节、dict 1m 能放上万条,而一次轮换只多几条 —— 撑满要轮换几千次。
+    --      真撑满也不会误拒:LRU 驱逐后有下面那层回落 Lua 表的兜底。
     --
     -- 指纹每 worker 只算一次,挂在 opts 上。
     opts._api_keys_sig = opts._api_keys_sig or api_keys.fingerprint(opts.api_keys)

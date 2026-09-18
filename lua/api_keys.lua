@@ -64,12 +64,27 @@ local DEFAULT_PATH = "/etc/openresty/api-keys/keys"
 -- Read the key file. Returns the spec string, or nil plus a reason. A missing
 -- file is an ordinary outcome (authentication simply off), not an error worth
 -- distinguishing from an unreadable one at the call site.
+-- Returns (spec, err, kind) where kind is one of:
+--   "missing"    -- no such file; this deployment simply did not configure keys
+--   "unreadable" -- the file is there but could not be opened or read
+--
+-- The distinction matters and must not be collapsed. Both end in fail-open, but
+-- they mean opposite things: "missing" is a deployment that never intended to
+-- authenticate, while "unreadable" is one that meant to and failed -- a wrong
+-- defaultMode on the Secret, a bad mount, an ownership mistake. Reporting both
+-- as "no keys loaded" leaves an operator unable to tell a deliberate open
+-- endpoint from a broken one, which is exactly when they need to know.
+--
+-- io.open's third return value is errno on POSIX; 2 is ENOENT. Using the code
+-- rather than matching the message text keeps this working under any locale.
 function M.read_file(path)
-    local fh, oerr = io.open(path, "r")
-    if not fh then return nil, oerr or "cannot open" end
+    local fh, oerr, errno = io.open(path, "r")
+    if not fh then
+        return nil, oerr or "cannot open", (errno == 2) and "missing" or "unreadable"
+    end
     local body = fh:read("*a")
     fh:close()
-    if not body then return nil, "cannot read" end
+    if not body then return nil, "cannot read", "unreadable" end
     -- Trailing newlines are near-universal in mounted Secrets and in anything a
     -- human edits; parse() trims each entry but never sees them otherwise.
     return (body:gsub("%s+$", ""))
@@ -78,20 +93,36 @@ end
 -- Loaded on every init_by_lua, which a reload re-executes -- that is precisely
 -- what lets a key change take effect without restarting the master.
 M.path = os.getenv("OPENRESTY_API_KEYS_FILE") or DEFAULT_PATH
-local spec, read_err = M.read_file(M.path)
+local spec, read_err, read_kind = M.read_file(M.path)
 local parsed, count = M.parse(spec)
 
 M.keys = parsed
 -- Read by /_health_status and by the access guard: false means authentication is
 -- currently disabled and everything is let through.
 M.configured = count > 0
+-- Why there are no keys, for /_health_status to expose:
+--   "ok"         -- keys loaded
+--   "missing"    -- no key file; presumably deliberate
+--   "unreadable" -- the file exists but could not be read; presumably a mistake
+--   "empty"      -- readable but contained no usable entry
+M.file_status = M.configured and "ok" or (read_kind or "empty")
 
 if not M.configured then
     -- ngx.log is available during init_by_lua; operators must see this one.
-    ngx.log(ngx.ERR,
-        "[api_keys] no keys loaded from ", M.path, " (", read_err or "file present but yielded no keys",
-        ") -- authentication is DISABLED, all requests are allowed through.",
-        " In production mount it from a Kubernetes Secret (format key1:owner1,key2:owner2).")
+    -- An unreadable file gets its own wording: that is a misconfiguration to fix,
+    -- not a deployment that chose to run open, and the two must not read alike.
+    if M.file_status == "unreadable" then
+        ngx.log(ngx.ERR,
+            "[api_keys] key file ", M.path, " EXISTS BUT COULD NOT BE READ (", read_err or "?",
+            ") -- authentication is DISABLED and every request is allowed through.",
+            " This looks like a broken mount or wrong file permissions, not an",
+            " intentionally open endpoint. Check the Secret's defaultMode and mount.")
+    else
+        ngx.log(ngx.ERR,
+            "[api_keys] no keys loaded from ", M.path, " (", read_err or "file present but yielded no keys",
+            ") -- authentication is DISABLED, all requests are allowed through.",
+            " In production mount it from a Kubernetes Secret (format key1:owner1,key2:owner2).")
+    end
 else
     ngx.log(ngx.INFO, "[api_keys] loaded ", count, " key(s) from ", M.path)
 end

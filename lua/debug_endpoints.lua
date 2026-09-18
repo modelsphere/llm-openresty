@@ -56,9 +56,13 @@ function _G.dbg_health_status(opts)
         -- 也不要让 not nil 变成"在鉴权"这种反向误报。
         route_empty = (next(opts.api_keys or {}) == nil)
     end
+    -- key_file_status 把「本来就没配」和「配了但读不了」分开:两者都导致放行,
+    -- 但后者是挂载/权限出错,该告警;只报一个布尔值分不出来。
+    local _ak = require("api_keys")
     out._meta = {
-        api_keys_configured = require("api_keys").configured and true or false,
+        api_keys_configured = _ak.configured and true or false,
         route_auth_enabled  = not route_empty,
+        key_file_status     = _ak.file_status or "unknown",
     }
     ngx.header["Content-Type"] = "application/json"
     ngx.say(cjson_dbg.encode(out))
