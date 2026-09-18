@@ -116,7 +116,9 @@ existingSecret: ""           # takes precedence over create; both empty = no aut
 # following the ..data symlink swap, so rotation would silently stop working.)
 
 # bodylog-listener 地址(openresty 发帧目标)。本集群已把 bodylog 迁进 k8s(helm bodylog chart,llm-route ns),
-# 故指向其 in-cluster Service。host 空=用镜像默认(session_base.conf 的 os.getenv or "10.0.0.1" 主集群生产)。
+# 故指向其 in-cluster Service。**host 留空 = 完全不记 bodylog**(不再回落到任何默认地址):
+# 默认地址意味着"没配过 bodylog 的部署"会把完整请求/响应体(含 prompt)发到另一个网段的机器,
+# 那是数据外发的形状,不是便利。要记日志就显式写 listener 地址。
 # ⚠️ 必须用【完整 FQDN】(bodylog.<ns>.svc.cluster.local):nginx cosocket resolver 不套 search 域,
 #    裸 Service 名(bodylog / bodylog.llm-route.svc)解析不了 → 帧静默丢(2026-08-18 迁移时踩过)。
 bodylog:

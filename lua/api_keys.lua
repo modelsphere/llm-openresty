@@ -25,7 +25,7 @@
 --     rotation would be an outage, which means nobody would ever rotate.
 --   * The owner may be omitted (`key1,key2`); it is then recorded as "unnamed".
 --
--- When the variable is unset or yields no keys, requests are ALLOWED THROUGH
+-- When no key file is readable, or it yields no keys, requests are ALLOWED THROUGH
 -- rather than rejected. This is a deliberate fail-open: openresty is the public
 -- entry point, and a misconfigured Secret returning 401 for the whole site is
 -- worse than a short window without authentication. The fail-open is never
