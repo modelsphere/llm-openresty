@@ -55,9 +55,12 @@ function _G.do_route(opts)
     -- 主路由 401、而 guard() 路由放行,两条路径行为相反。
     --
     -- ⚠️ 判的是 opts.api_keys 这张**本路由的表**,不是全局 api_keys.configured。
-    -- opts.api_keys 允许 per-route 覆盖(video 路由、测试 harness 都显式传表)。
-    -- 看全局开关的话,一条自带 key 表的路由会被"key 文件没挂上"这个与它无关的状态
-    -- 把鉴权整个关掉 —— 踩到过:test_api_keys_dict_full 的非法 key 被放行。
+    -- 现状是所有生产路由都用同一张公用表(video 路由走 guard(),也是同一张),
+    -- 两种判法此刻等价;但 opts.api_keys 在设计上允许 per-route 覆盖
+    -- (route.lua:137 的 `or` 默认值;ModelRoute CR 里也预留了 api_keys 字段),
+    -- 测试 harness 已经在这么用。看全局开关的话,一条自带 key 表的路由会被
+    -- "key 文件没挂上"这个与它无关的状态把鉴权整个关掉 —— 踩到过:
+    -- test_api_keys_dict_full 的非法 key 被放行。
     -- 空表结论缓存在 opts 上:表在 init 之后不再变,而每请求遍历(可能上千条)太贵。
     if opts._api_keys_empty == nil then
         opts._api_keys_empty = (next(opts.api_keys) == nil)
