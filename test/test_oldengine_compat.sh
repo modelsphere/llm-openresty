@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OLD=${OLD:-/tmp/oldeng}
 ENGINE="$OLD/session_base.conf"
 OPENRESTY=${OPENRESTY:-/usr/local/openresty/bin/openresty}
-PREFIX=${PREFIX:-/tmp/oldcompat}; KEY=REDACTED-API-KEY
+PREFIX=${PREFIX:-/tmp/oldcompat}; KEY="${API_KEY:-}"
 P=19699
 
 pass=0; fail=0

@@ -14,7 +14,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"; PY="${PY:-python3}"
-PREFIX="${PREFIX:-/tmp/lctest}"; KEY=REDACTED-API-KEY; U="http://127.0.0.1:19692"
+PREFIX="${PREFIX:-/tmp/lctest}"; KEY="${API_KEY:-}"; U="http://127.0.0.1:19692"
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1
   pkill -9 -f "$PREFIX/nginx" 2>/dev/null; rm -rf "$PREFIX"; }
 trap cleanup EXIT

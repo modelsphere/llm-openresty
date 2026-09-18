@@ -13,7 +13,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
-PREFIX="${PREFIX:-/tmp/mhwtest}"; KEY=REDACTED-API-KEY
+PREFIX="${PREFIX:-/tmp/mhwtest}"; KEY="${API_KEY:-}"
 P=19698
 
 pass=0; fail=0
