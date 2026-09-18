@@ -48,6 +48,21 @@ ngx.ctx.bodylog_active = nil
 pcall(bodylog.bodylog_capture_request, opts)
 eq(ngx.ctx.bodylog_active, nil, "empty host => request is NOT captured")
 
+print("== whitespace-only host is also treated as unset (the trim) ==")
+-- session_base.conf trims before the empty check. Without the trim, a value of
+-- spaces passes the ~= "" test and gets used as a hostname, failing later inside
+-- logger.init with an unhelpful error. This mirrors that exact normalisation --
+-- it is the only case the trim exists for, and it had no coverage until now.
+for _, raw_ws in ipairs({ "   ", "\t", " \n " }) do
+    local norm = raw_ws:match("^%s*(.-)%s*$")
+    if norm == "" then norm = nil end
+    _G.BODYLOG_LISTENER_HOST = norm
+    ngx.ctx.bodylog_active = nil
+    pcall(bodylog.bodylog_capture_request, opts)
+    eq(ngx.ctx.bodylog_active, nil,
+       "whitespace-only host (" .. string.format("%q", raw_ws) .. ") => NOT captured")
+end
+
 print("== host set => gate passes (capture proceeds) ==")
 -- With a host configured the gate must NOT short-circuit. Proof that it
 -- proceeded: it gets as far as the request-body call, which the resty CLI has no
