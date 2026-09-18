@@ -52,7 +52,7 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: registry.example.com/llm/autoconfig-reload:0.3.31
+  image: registry.example.com/llm/autoconfig-reload:0.3.46
   process: "nginx: master"
 
 service:
