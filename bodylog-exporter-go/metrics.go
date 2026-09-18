@@ -21,6 +21,7 @@ type detailRecord struct {
 	Model            string  `json:"model"`
 	FinishReason     string  `json:"finish_reason"`
 	Frt              float64 `json:"frt"` // ≈TTFT,秒
+	Lct              float64 `json:"lct"` // last chunk time,秒
 	Rt               float64 `json:"rt"`  // 总响应时间,秒
 	ReqBytes         int64   `json:"req_bytes"`
 	RespBytes        int64   `json:"resp_bytes"`
@@ -32,18 +33,20 @@ type detailRecord struct {
 }
 
 type metrics struct {
-	requests      *prometheus.CounterVec // {backend,model,status_class,stream}
-	promptTok     *prometheus.CounterVec // {backend,model}
-	completionTok *prometheus.CounterVec
-	cachedTok     *prometheus.CounterVec
-	reasoningTok  *prometheus.CounterVec
-	totalTok      *prometheus.CounterVec
-	reqBytes      *prometheus.CounterVec
-	respBytes     *prometheus.CounterVec
-	finishReason  *prometheus.CounterVec // {backend,model,finish_reason}
-	rt            *prometheus.HistogramVec
-	ttft          *prometheus.HistogramVec
-	outTokPerSec  *prometheus.HistogramVec
+	requests         *prometheus.CounterVec // {backend,model,status_class,stream}
+	promptTok        *prometheus.CounterVec // {backend,model}
+	completionTok    *prometheus.CounterVec
+	cachedTok        *prometheus.CounterVec
+	reasoningTok     *prometheus.CounterVec
+	totalTok         *prometheus.CounterVec
+	reqBytes         *prometheus.CounterVec
+	respBytes        *prometheus.CounterVec
+	finishReason     *prometheus.CounterVec // {backend,model,finish_reason}
+	rt               *prometheus.HistogramVec
+	ttft             *prometheus.HistogramVec
+	outTokPerSec     *prometheus.HistogramVec
+	overallTokPerSec *prometheus.HistogramVec
+	decodeTokPerSec  *prometheus.HistogramVec
 	// exporter 自监控
 	lines    prometheus.Counter
 	offset   prometheus.Gauge
@@ -94,14 +97,18 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		// prompt_bucket:同 ttft —— 解码速率同样随 context 变长而下降(KV 越长 attention 越贵),
 		// 分档后才能看出「长输入到底拖慢多少」。见 promptBucket()。
 		outTokPerSec: hist("bodylog_output_tok_per_second", "单请求解码速率 completion_tokens/(rt-frt)(tok/s,已扣 prefill;仅流式)", srbmp),
-		lines:        prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
-		offset:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
-		lastTs:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
-		recovers:     prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
+		// 新口径给 Watchmen 使用:不带 prompt_bucket,只按稳定的 service/route/backend/model 维度暴露。
+		overallTokPerSec: hist("bodylog_overall_output_tok_per_second", "单请求总体输出速率 completion_tokens/rt(tok/s,仅2xx)", srbm),
+		decodeTokPerSec:  hist("bodylog_decode_output_tok_per_second", "单请求解码输出速率 completion_tokens/(lct-frt)(tok/s,仅2xx)", srbm),
+		lines:            prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_lines_total", Help: "已 observe 的明细行数"}),
+		offset:           prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_offset_bytes", Help: "当前 tail 文件的字节 offset"}),
+		lastTs:           prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
+		recovers:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
 	}
 	reg.MustRegister(
 		m.requests, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
 		m.reqBytes, m.respBytes, m.finishReason, m.rt, m.ttft, m.outTokPerSec,
+		m.overallTokPerSec, m.decodeTokPerSec,
 		m.lines, m.offset, m.lastTs, m.recovers,
 	)
 	return m
@@ -209,6 +216,21 @@ func (m *metrics) observe(d detailRecord) {
 	if d.CompletionTokens >= 16 && d.Rt >= 0.5 {
 		m.outTokPerSec.WithLabelValues(service, route, backend, model, promptBucket(d.PromptTokens)).
 			Observe(float64(d.CompletionTokens) / d.Rt)
+	}
+
+	// Watchmen TPS:只采 2xx 且 usage/时长有效的请求。overall 使用总响应时长,
+	// decode 使用 bodylog 的 last_chunk_t-first_chunk_t,不复用旧指标的 prompt_bucket、
+	// stream 或 ctok/时长下限,以保持这两个新 metric 的契约精确且可按 service 聚合。
+	if statusClass(d.Status) == "2xx" && d.CompletionTokens > 0 {
+		if d.Rt > 0 {
+			m.overallTokPerSec.WithLabelValues(service, route, backend, model).
+				Observe(float64(d.CompletionTokens) / d.Rt)
+		}
+		decodeSeconds := d.Lct - d.Frt
+		if decodeSeconds > 0.3 {
+			m.decodeTokPerSec.WithLabelValues(service, route, backend, model).
+				Observe(float64(d.CompletionTokens) / decodeSeconds)
+		}
 	}
 
 	m.lines.Inc()
