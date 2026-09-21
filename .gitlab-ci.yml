@@ -3,7 +3,7 @@
 # 参考同组 chat-engine 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置 harbor 鉴权,
 # CI 里不需要 docker login、也不需要配任何 HARBOR_ 变量,直接 docker build + docker push。
 #
-# app 镜像 FROM harbor 的 openresty-base(见 Dockerfile / Dockerfile.base),纯 COPY 配置、不装东西,
+# app image builds from Dockerfile (single stage).
 # 所以 public-buildx runner 够不到 docker.io/外网也能 build。
 #
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。

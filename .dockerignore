@@ -7,13 +7,7 @@ bin/
 # ⚠️ 不排除 bodylog-listener-go/:CI 用 classic builder 时 `-f Dockerfile.bodylog .` 也读【根】.dockerignore
 #   (per-Dockerfile 的 Dockerfile.bodylog.dockerignore 仅 BuildKit 生效)。排除它会让 bodylog 的
 #   `COPY bodylog-listener-go/go.mod` 失败。主 openresty 镜像是 selective COPY(不 COPY 它),含进上下文无害。
-bodylog_listener.py
-bodylog-listener.service
 bodylog_http_token
-install_openresty.sh
-logrotate-openresty.conf
-push_conf_noreload.sh
-llm-gateway-1.example.com.conf
 *.md
 *.html
 __pycache__/

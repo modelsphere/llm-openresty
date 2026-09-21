@@ -7,12 +7,7 @@ vendor/
 test/
 bin/
 k8s/
-bodylog_listener.py
-bodylog-listener.service
 bodylog_http_token
-install_openresty.sh
-logrotate-openresty.conf
-llm-gateway-1.example.com.conf
 *.md
 *.html
 __pycache__/
