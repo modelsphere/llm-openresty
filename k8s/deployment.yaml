@@ -43,7 +43,7 @@ spec:
       terminationGracePeriodSeconds: 3600
       containers:
       - name: openresty
-        image: registry.example.com/llm/llm-openresty:0.3.4-dispatch   # 路径路由(8080 dispatch)镜像
+        image: 4pdosc/llm-openresty:0.1.19   # 路径路由(8080 dispatch)镜像
         imagePullPolicy: IfNotPresent
         # 镜像已 STOPSIGNAL SIGQUIT → 优雅排空由它触发;preStop 只负责「解端点摘除竞态」
         lifecycle:

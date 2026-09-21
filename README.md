@@ -67,8 +67,8 @@ lua/                    the engine (12 modules)
   bodylog.lua             async request/response capture
   debug_endpoints.lua     everything under /_*
   util.lua                shared helpers
-k8s/                    Helm charts (openresty, bodylog, bodylog-exporter) and a
-                        standalone Deployment manifest
+k8s/                    a standalone Deployment manifest (the Helm charts live in
+                        project-modelpilot/helm-charts)
 bodylog-listener-go/    receives body-log frames, writes JSONL
 bodylog-exporter-go/    turns body-log details into Prometheus metrics
 test/                   self-contained test harnesses (see Testing)
@@ -211,22 +211,21 @@ docker run --rm -p 8080:8080 -p 8090:8090 \
   llm-openresty:dev
 ```
 
-The build installs OpenResty from openresty.org. If your build host cannot reach it,
-point `BASE` at an image that already carries OpenResty — the Dockerfile detects that
-and skips the install:
-
-```bash
-docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 -t llm-openresty:dev .
-```
-
 ### Kubernetes
 
+The charts are published from
+[project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts):
+
 ```bash
-helm -n llm upgrade --install openresty k8s/helm/openresty --create-namespace \
-  --set image.repository=<your-registry>/llm-openresty \
-  --set image.tag=<tag> \
+helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
+helm repo update
+
+helm -n llm upgrade --install openresty modelpilot/openresty --create-namespace \
   --set existingSecret=openresty-api-keys
 ```
+
+There are three: `openresty` (this router), `bodylog` (the listener that records
+what it served) and `bodylog-exporter` (Prometheus metrics from those records).
 
 The chart runs two replicas in master-standby: routing state (connection counts,
 ban lists) is per-pod in shared memory, so only the leader takes traffic. A sidecar

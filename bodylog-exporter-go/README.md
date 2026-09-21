@@ -226,28 +226,45 @@ spec:
   endpoints: [ { port: metrics, path: /metrics, interval: 30s, honorLabels: true } ]
 ```
 
-### k8s:bodylog chart sidecar(主场景 —— 一个实例同时出两类指标)
+### k8s:独立 chart(与 listener 同节点,一个实例同时出两类指标)
 
-集群装了 bodylog(`openresty/k8s/helm/bodylog`)时,exporter 作 **sidecar 内置在 bodylog chart 里**:同 pod 只读共享 data 卷 tail 明细(`bodylog_*`)+ poll 集群内 openresty(`openresty_*`)。**一个实例 = tail + poll 两半全出**。由 `values.exporter.*` 控制:
+exporter 是**独立 chart**(不再是 bodylog chart 的 sidecar):只读 tail listener 落在**节点本地盘**的明细(`bodylog_*`)+ poll 集群内 openresty(`openresty_*`)。**一个实例 = tail + poll 两半全出**。独立部署的好处是升级 exporter 不重启 listener,收帧/落盘零中断;代价是**必须与 listener 钉在同一节点**(明细在该节点本地盘)。
 
-```yaml
-exporter:
-  enabled: true
-  image: { repository: registry.example.com/llm/bodylog-exporter, tag: "" }  # tag="" 回落 chart appVersion
-  openrestyPoll:
-    url: "http://openresty:8080"   # 集群内 openresty Service;空=只 tail 不 poll
-    routes: []                     # 留空=动态发现;填了=静态覆盖
-    intervalMs: 15000
-  routeDiscovery:                  # 动态发现 route(list ModelRoute CR)
-    enabled: true                  # 自动建 SA+ClusterRole(list modelroutes)+Binding(templates/rbac.yaml)
-    openrestyService: ""           # 只统计 nginx.service 指向本 openresty 的 route;空=全要
-  serviceMonitor: { enabled: true, releaseLabel: kube-prometheus-stack }
-```
+chart 发布在 [project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts):
 
 ```bash
-helm repo add harbor-chart-repo https://registry.example.com/chartrepo/llm
-helm -n <ns> upgrade --install bodylog harbor-chart-repo/bodylog --version <tag> --set-string secret.token=<token>
+helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
+helm repo update
+
+# 先装 listener
+helm -n <ns> upgrade --install bodylog modelpilot/bodylog \
+  --set-string secret.token=<token> \
+  --set persistence.hostPath=/data/bodylog \
+  --set nodeSelector."kubernetes\.io/hostname"=<node>
+
+# 再装 exporter:同节点 + hostPath 与 listener 一致 + 复用它的 Secret
+helm -n <ns> upgrade --install bodylog-exporter modelpilot/bodylog-exporter \
+  --set data.hostPath=/data/bodylog \
+  --set nodeSelector."kubernetes\.io/hostname"=<node>
 ```
+
+关键 values(详见 chart 自带的 `values.yaml`):
+
+```yaml
+data:
+  dir: /data/bodylog             # 容器内挂载点,须 = listener 的 dataDir
+  hostPath: /data/bodylog        # 节点真实目录,须 = listener persistence.hostPath
+openrestyPoll:
+  url: "http://openresty:8080"   # 集群内 openresty Service;空=只 tail 不 poll
+  routes: []                     # 留空=动态发现;填了=静态覆盖
+  intervalMs: 15000
+routeDiscovery:
+  enabled: true                  # list ModelRoute CR(chart 自动建 SA+ClusterRole+Binding)
+  openrestyService: ""           # 只统计 nginx.service 指向本 openresty 的 route;空=全要
+serviceMonitor: { enabled: true, releaseLabel: kube-prometheus-stack }
+```
+
+⚠️ `data.hostPath` 非空但 `nodeSelector` 为空 → chart 直接 `fail`(否则 pod 调度到别的 node 会读到空目录,看着像"一条数据都没有")。
 
 Service 自动加 `metrics:9110` 口 + ServiceMonitor(集群内直接抓,已置 `honorLabels: true` 解决 `service` 撞名)。
 
@@ -258,7 +275,7 @@ Service 自动加 `metrics:9110` 口 + ServiceMonitor(集群内直接抓,已置 
 
 ```bash
 # 复用宿主机裸盘(如 bodylog 从裸机迁进 k8s,续用原数据目录)
-helm -n <ns> upgrade --install bodylog harbor-chart-repo/bodylog --version <tag> \
+helm -n <ns> upgrade --install bodylog modelpilot/bodylog --version <tag> \
   --set-string secret.token=<token> \
   --set persistence.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
@@ -276,17 +293,21 @@ kubectl apply -f deploy/exporter-standalone.yaml   # 换 ns/openresty Service �
 
 裸机 systemd 场景默认只 tail;要顺带 poll **同机**的 openresty,给 `bodylog-exporter.service` 的 Environment 加 `OPENRESTY_POLL_URL`(如 `http://127.0.0.1:18080`)+ `OPENRESTY_POLL_ROUTES`(裸机非 k8s、无 ModelRoute API → 用静态 route 列表)。
 
-CI:`openresty/.gitlab-ci.yml` 的 `build:exporter` + `chart:exporter`。**只发 exporter 用带前缀的 tag**:
+CI:`.github/workflows/release.yml` 的 `image` job(matrix 里的 `exporter`)。**只发 exporter 用带前缀的 tag**:
 
 ```bash
 git tag exporter/v0.2.0 && git push origin exporter/v0.2.0
-# → 镜像 registry.example.com/llm/bodylog-exporter:0.2.0 + bodylog-exporter chart 0.2.0
-#   (前缀被剥掉;openresty / bodylog 的 job 不进 pipeline,它们的 :latest 也不会被挪)
+# → 镜像 4pdosc/bodylog-exporter:0.2.0
+#   (前缀被剥掉;openresty / bodylog 不进 matrix,它们的 :latest 也不会被挪)
 ```
 
 同理 `openresty/v*` / `bodylog/v*`;**无前缀的 tag(如 `0.1.13`)仍然三个组件一起发**。
-认不出的前缀(打错成 `exporters/v1`)一个 job 都不跑 —— 宁可什么都不发生。
-规则改动后跑 `test/verify_ci_tag_rules.py` 离线验一遍(哪些 job 会跑 + 版本剥成什么)。
+认不出的前缀(打错成 `exporters/v1`)直接让 workflow 失败 —— 宁可什么都不发生。
+预发布 tag(带 `-`,如 `0.2.0-rc1`)照常出镜像,但**不动 `:latest`**。
+
+chart 不在本仓发布:三个 chart 在
+[project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts),
+由那个仓的 chart-releaser 发到 GitHub Pages。
 
 ---
 

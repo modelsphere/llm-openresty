@@ -106,33 +106,7 @@ build:exporter:
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$EXPORTER_IMAGE:$VERSION" "$EXPORTER_IMAGE:latest" && docker push "$EXPORTER_IMAGE:latest"; fi
 
-# helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
-# push-chart 自处理 harbor ChartMuseum 鉴权(cm-push 到 harbor-chart-repo)。
-# 三个 chart 各自一个 job:除了能分别触发,也不再是「第一个 push 失败带走后两个」。
-# 三个 chart 的 values.yaml 都是 image.tag="" → 回落 appVersion,所以只 sed chart 的 version/appVersion。
-.chart-job:
-  extends: .build-job
-  variables:
-    REGISTRY_PROJECT: hardcore-tech
-
-chart:openresty:
-  extends: [.chart-job, .on-openresty]
-  script:
-    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/openresty/Chart.yaml'
-    - export MODULE_NAME=openresty CHART_FOLDER=k8s/helm/openresty
-    - push-chart
-
-chart:bodylog:
-  extends: [.chart-job, .on-bodylog]
-  script:
-    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/bodylog/Chart.yaml'
-    - export MODULE_NAME=bodylog CHART_FOLDER=k8s/helm/bodylog
-    - push-chart
-
-# bodylog-exporter chart 独立于 bodylog listener,复用 bodylog-exporter 镜像。
-chart:exporter:
-  extends: [.chart-job, .on-exporter]
-  script:
-    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/bodylog-exporter/Chart.yaml'
-    - export MODULE_NAME=bodylog-exporter CHART_FOLDER=k8s/helm/bodylog-exporter
-    - push-chart
+# Charts are not published from this repository. The openresty, bodylog and
+# bodylog-exporter charts live in the helm-charts repository and are published
+# by its own pipeline, so there are no chart jobs here -- only the three image
+# builds above.
