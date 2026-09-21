@@ -42,6 +42,7 @@ variables:
   # 不要引用其它变量:GitLab 14 不展开 variables 块内的变量引用,拼出来是空串。
   OPENRESTY_BUILD_ARGS: >-
     --build-arg BASE=harbor.4pd.io/hardcore-tech/openresty-base:1.29.2.3
+    --build-arg INSTALL_OPENRESTY=0
   GO_BUILD_ARGS: >-
     --build-arg GO_BASE=harbor.4pd.io/hardcore-tech/golang:1.24-bookworm
     --build-arg RUNTIME_BASE=harbor.4pd.io/hardcore-tech/debian:12-slim
@@ -78,11 +79,6 @@ variables:
 build:openresty:
   extends: [.build-job, .on-openresty]
   script:
-    # 诊断:base 镜像里到底有没有 openresty(CI 里 [ -x ] 判假,但 k8s 上同 tag 有)
-    - 'BASE_IMG=harbor.4pd.io/hardcore-tech/openresty-base:1.29.2.3'
-    - docker pull "$BASE_IMG"
-    - 'docker inspect --format "{{index .RepoDigests 0}}" "$BASE_IMG" || true'
-    - 'docker run --rm "$BASE_IMG" sh -c "ls -la /usr/local/openresty/bin/ 2>&1 | head -20; echo ---; ls -la /usr/local/openresty/ 2>&1 | head -20; echo ---; [ -x /usr/local/openresty/bin/openresty ] && echo X_OK || echo X_FAIL" || true'
     # --pull:不复用本地既有层,确保 FROM 按 --build-arg 重新解析
     - docker build --pull $OPENRESTY_BUILD_ARGS -t "$IMAGE:$VERSION" .
     - docker push "$IMAGE:$VERSION"

@@ -4,11 +4,19 @@
 #
 #   docker build -t llm-openresty:dev .
 #
-# Where the build host cannot reach openresty.org (our CI runner cannot), pass a
-# base that already carries OpenResty instead -- the install step below detects it
-# and skips apt entirely, so one file serves both cases:
+# Where the build host cannot reach openresty.org, pass a base that already carries
+# OpenResty and turn the install off:
 #
-#   docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 -t llm-openresty:x .
+#   docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 \
+#                --build-arg INSTALL_OPENRESTY=0 -t llm-openresty:x .
+#
+# INSTALL_OPENRESTY is an explicit switch rather than a test for an existing
+# installation, deliberately. Detecting it with `[ -x /usr/local/openresty/bin/
+# openresty ]` looks obviously right and fails on our build runner: in that base
+# the path is a symlink to ../nginx/sbin/nginx, and while the target is present
+# and executable when the image runs on a cluster (same digest, verified), the
+# test comes out false inside `docker run` on the runner. Build behaviour should
+# not hinge on a filesystem probe that answers differently per environment.
 #
 # The image ships the engine and the framework config only. Per-route configs
 # (session_route_<route>.conf) are NOT baked in -- they are mounted into
@@ -21,11 +29,14 @@ FROM ${BASE}
 # visible in the instructions below.
 ARG OPENRESTY_VER=1.29.2.3-1~jammy1
 ARG OR=/usr/local/openresty
+# 1 = install from openresty.org (matches the ubuntu default above)
+# 0 = the base already carries it
+ARG INSTALL_OPENRESTY=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
-    if [ -x "${OR}/bin/openresty" ]; then \
-        echo "OpenResty already present in base image; skipping install"; \
+    if [ "${INSTALL_OPENRESTY}" != "1" ]; then \
+        echo "INSTALL_OPENRESTY=${INSTALL_OPENRESTY}: using OpenResty from the base image"; \
     else \
         apt-get update; \
         apt-get install -y --no-install-recommends \
