@@ -12,7 +12,9 @@ metadata: { name: bodylog-exporter, namespace: llm-gateway }
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata: { name: bodylog-exporter-modelroute-reader }
-# 与 k8s/helm/bodylog-exporter/templates/rbac.yaml 保持一致(那份是权威,这份是不带 helm 的逃生口)。
+# Keep in step with the bodylog-exporter chart's rbac.yaml in
+# project-modelpilot/helm-charts, which is the authoritative copy. This manifest
+# is the escape hatch for clusters not using Helm.
 rules:
   - apiGroups: [ "routing.gpucluster.io" ]
     resources: [ "modelroutes" ]
@@ -54,7 +56,7 @@ spec:
       serviceAccountName: bodylog-exporter        # 有 list modelroutes 权限(动态发现)
       containers:
         - name: exporter
-          image: registry.example.com/llm/bodylog-exporter:0.1.3
+          image: 4pdosc/bodylog-exporter:1.0.0
           imagePullPolicy: IfNotPresent
           env:
             - { name: BODYLOG_DETAILS_DIR, value: "/tmp/details" }   # 无 bodylog:空跑 tail

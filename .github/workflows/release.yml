@@ -1,0 +1,165 @@
+# Build and publish the three images to Docker Hub on a tag.
+#
+# Tag naming matches .gitlab-ci.yml, so the same tag means the same thing to both
+# CIs:
+#
+#   openresty/v0.2.0  -> 4pdosc/llm-openresty:0.2.0
+#   bodylog/v0.2.0    -> 4pdosc/bodylog-listener:0.2.0
+#   exporter/v0.2.0   -> 4pdosc/bodylog-exporter:0.2.0
+#   0.2.0             -> all three (the older prefix-less form)
+#
+# The component prefix is stripped from the image tag: a Helm chart's version must
+# be valid SemVer, and a prefixed one is rejected outright.
+#
+# Why separate tags per component: sharing one counter means a change to the
+# exporter also publishes identical new versions of the other two, and moves all
+# three :latest tags onto builds nobody asked for.
+#
+# The Dockerfiles are kept byte-identical to the GitLab copy so the two
+# repositories never diverge on them. Their ARG defaults target the internal
+# build environment, so the differences that belong to *this* runner are passed
+# here as build args rather than edited into the files:
+#
+#   GOPROXY  - the default is a mirror reachable from the internal network;
+#              a GitHub runner needs the upstream proxy.
+#
+# The openresty image needs no overrides: its defaults (ubuntu:22.04 plus
+# INSTALL_OPENRESTY=1) are already the public path.
+#
+# Charts are NOT published here -- they live in project-modelpilot/helm-charts and
+# are released by that repository's own chart-releaser workflow.
+name: release
+
+on:
+  push:
+    tags:
+      - 'openresty/v[0-9]*'
+      - 'bodylog/v[0-9]*'
+      - 'exporter/v[0-9]*'
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build and push (e.g. 0.2.0)'
+        required: true
+      components:
+        description: 'Which images: all, openresty, bodylog, exporter'
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version:   ${{ steps.v.outputs.version }}
+      latest:    ${{ steps.v.outputs.latest }}
+      openresty: ${{ steps.v.outputs.openresty }}
+      bodylog:   ${{ steps.v.outputs.bodylog }}
+      exporter:  ${{ steps.v.outputs.exporter }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF="${{ inputs.components }}"
+            VERSION="${{ inputs.version }}"
+            case "$REF" in
+              all)       O=true; B=true; E=true ;;
+              openresty) O=true; B=false; E=false ;;
+              bodylog)   O=false; B=true; E=false ;;
+              exporter)  O=false; B=false; E=true ;;
+              *) echo "unknown components: $REF" >&2; exit 1 ;;
+            esac
+          else
+            REF="${{ github.ref_name }}"
+            # Strip the component prefix. Only one of these can match; the others
+            # are no-ops, and a prefix-less tag passes through untouched.
+            VERSION="${REF#openresty/v}"; VERSION="${VERSION#bodylog/v}"; VERSION="${VERSION#exporter/v}"
+            case "$REF" in
+              openresty/v*) O=true;  B=false; E=false ;;
+              bodylog/v*)   O=false; B=true;  E=false ;;
+              exporter/v*)  O=false; B=false; E=true  ;;
+              */*)          echo "unrecognised tag: $REF" >&2; exit 1 ;;
+              *)            O=true;  B=true;  E=true  ;;
+            esac
+          fi
+
+          # A version must not still contain a slash, or it would produce an
+          # image tag Docker rejects -- fail loudly rather than pushing junk.
+          case "$VERSION" in
+            */*|'') echo "bad version derived from '$REF': '$VERSION'" >&2; exit 1 ;;
+          esac
+
+          # Pre-release versions (a SemVer "-" suffix, e.g. 0.2.0-rc1) do NOT move
+          # :latest. A release candidate exists to be tested deliberately; it should
+          # never become what you get by not specifying a version.
+          case "$VERSION" in *-*) LATEST=false ;; *) LATEST=true ;; esac
+
+          {
+            echo "version=$VERSION"
+            echo "latest=$LATEST"
+            echo "openresty=$O"
+            echo "bodylog=$B"
+            echo "exporter=$E"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "ref=$REF -> version=$VERSION latest=$LATEST (openresty=$O bodylog=$B exporter=$E)"
+
+  image:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: openresty
+            image: 4pdosc/llm-openresty
+            context: .
+            dockerfile: Dockerfile
+            build_args: ''
+          - component: bodylog
+            image: 4pdosc/bodylog-listener
+            context: .
+            dockerfile: Dockerfile.bodylog
+            build_args: |
+              GOPROXY=https://proxy.golang.org,direct
+          - component: exporter
+            image: 4pdosc/bodylog-exporter
+            context: bodylog-exporter-go
+            dockerfile: bodylog-exporter-go/Dockerfile
+            build_args: |
+              GOPROXY=https://proxy.golang.org,direct
+    steps:
+      - name: Should this component build?
+        id: gate
+        run: echo "run=${{ needs.setup.outputs[matrix.component] }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: docker/login-action@v3
+        if: steps.gate.outputs.run == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: ${{ matrix.build_args }}
+          push: true
+          # A plain v2 manifest, not a manifest list with attestations: some
+          # container runtimes stall pulling the attestation variant.
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ matrix.image }}:${{ needs.setup.outputs.version }}
+            ${{ needs.setup.outputs.latest == 'true' && format('{0}:latest', matrix.image) || '' }}

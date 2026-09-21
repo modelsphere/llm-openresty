@@ -3,8 +3,10 @@
 # 参考同组 chat-engine 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置 harbor 鉴权,
 # CI 里不需要 docker login、也不需要配任何 HARBOR_ 变量,直接 docker build + docker push。
 #
-# app image builds from Dockerfile (single stage).
-# 所以 public-buildx runner 够不到 docker.io/外网也能 build。
+# app 镜像用单个 Dockerfile 构建:默认 FROM ubuntu 自己装 OpenResty,CI 则用
+# app 镜像:Dockerfile 默认 FROM ubuntu 自己装 OpenResty(开源可用);CI 用
+# --build-arg BASE=<harbor>/openresty-base 覆盖成已装好的基础镜像,Dockerfile 检测到
+# 后跳过 apt,所以 runner 够不到外网也能 build。
 #
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
 #
@@ -27,9 +29,23 @@
 stages: [build]
 
 variables:
-  IMAGE: registry.example.com/llm/llm-openresty
-  BODYLOG_IMAGE: registry.example.com/llm/bodylog-listener
-  EXPORTER_IMAGE: registry.example.com/llm/bodylog-exporter
+  # 镜像地址直写在这里,不走 CI/CD 变量拼接:GitLab 14 不会展开 variables 块内对其它
+  # 变量的引用,拼出来是空串,曾导致 `docker build -t :<ver>` 和 `--build-arg BASE=` 都为空。
+  # 基础镜像地址则写在各 Dockerfile 的 ARG 默认值里(classic builder 下 --build-arg
+  # 覆盖不了 FROM 之前的 ARG,只有默认值生效)。
+  IMAGE: harbor.4pd.io/hardcore-tech/llm-openresty
+  BODYLOG_IMAGE: harbor.4pd.io/hardcore-tech/bodylog-listener
+  EXPORTER_IMAGE: harbor.4pd.io/hardcore-tech/bodylog-exporter
+
+  # 各 Dockerfile 的 ARG 默认值是公网镜像,开源后 `docker build .` 开箱即用;
+  # 这里覆盖回 harbor —— runner 够不到 docker.io / openresty.org。写成字面量,
+  # 不要引用其它变量:GitLab 14 不展开 variables 块内的变量引用,拼出来是空串。
+  OPENRESTY_BUILD_ARGS: >-
+    --build-arg BASE=harbor.4pd.io/hardcore-tech/openresty-base:1.29.2.3
+    --build-arg INSTALL_OPENRESTY=0
+  GO_BUILD_ARGS: >-
+    --build-arg GO_BASE=harbor.4pd.io/hardcore-tech/golang:1.24-bookworm
+    --build-arg RUNTIME_BASE=harbor.4pd.io/hardcore-tech/debian:12-slim
   DOCKER_BUILDKIT: "0"             # 出简单 v2 manifest,containerd 直接拉(buildkit attestation manifest-list 拉取会卡)
 
 # VERSION = tag 剥掉 "<组件>/v" 前缀。无前缀的 tag 剥不掉任何东西,原样通过。
@@ -63,7 +79,8 @@ variables:
 build:openresty:
   extends: [.build-job, .on-openresty]
   script:
-    - docker build -t "$IMAGE:$VERSION" .
+    # --pull:不复用本地既有层,确保 FROM 按 --build-arg 重新解析
+    - docker build --pull $OPENRESTY_BUILD_ARGS -t "$IMAGE:$VERSION" .
     - docker push "$IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$IMAGE:$VERSION" "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
@@ -74,7 +91,7 @@ build:openresty:
 build:bodylog:
   extends: [.build-job, .on-bodylog]
   script:
-    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$VERSION" .
+    - docker build --pull -f Dockerfile.bodylog $GO_BUILD_ARGS -t "$BODYLOG_IMAGE:$VERSION" .
     - docker push "$BODYLOG_IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$BODYLOG_IMAGE:$VERSION" "$BODYLOG_IMAGE:latest" && docker push "$BODYLOG_IMAGE:latest"; fi
@@ -84,38 +101,12 @@ build:bodylog:
 build:exporter:
   extends: [.build-job, .on-exporter]
   script:
-    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
+    - docker build --pull -f bodylog-exporter-go/Dockerfile $GO_BUILD_ARGS -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
     - docker push "$EXPORTER_IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$EXPORTER_IMAGE:$VERSION" "$EXPORTER_IMAGE:latest" && docker push "$EXPORTER_IMAGE:latest"; fi
 
-# helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
-# push-chart 自处理 harbor ChartMuseum 鉴权(cm-push 到 harbor-chart-repo = https://registry.example.com/chartrepo/llm)。
-# 三个 chart 各自一个 job:除了能分别触发,也不再是「第一个 push 失败带走后两个」。
-# 三个 chart 的 values.yaml 都是 image.tag="" → 回落 appVersion,所以只 sed chart 的 version/appVersion。
-.chart-job:
-  extends: .build-job
-  variables:
-    REGISTRY_PROJECT: llm
-
-chart:openresty:
-  extends: [.chart-job, .on-openresty]
-  script:
-    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/openresty/Chart.yaml'
-    - export MODULE_NAME=openresty CHART_FOLDER=k8s/helm/openresty
-    - push-chart
-
-chart:bodylog:
-  extends: [.chart-job, .on-bodylog]
-  script:
-    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/bodylog/Chart.yaml'
-    - export MODULE_NAME=bodylog CHART_FOLDER=k8s/helm/bodylog
-    - push-chart
-
-# bodylog-exporter chart 独立于 bodylog listener,复用 bodylog-exporter 镜像。
-chart:exporter:
-  extends: [.chart-job, .on-exporter]
-  script:
-    - 'sed -i -E "s/^version:.*/version: ${VERSION}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" k8s/helm/bodylog-exporter/Chart.yaml'
-    - export MODULE_NAME=bodylog-exporter CHART_FOLDER=k8s/helm/bodylog-exporter
-    - push-chart
+# Charts are not published from this repository. The openresty, bodylog and
+# bodylog-exporter charts live in project-modelpilot/helm-charts and are released
+# by that repository's own chart-releaser workflow, so there are no chart jobs
+# here -- only the three image builds above.
