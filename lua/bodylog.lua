@@ -17,10 +17,14 @@ _G.BODYLOG_DEFAULT_ENABLED = true    -- 默认开启（head+tail + 异步 timer 
 _G.BODYLOG_DEFAULT_PCT     = 100     -- 默认 100% 采样；如需降采样改这里或 toggle 改
 
 -- ★ listener 地址已移到机器级 env（见 init_worker_by_lua_block）★
--- 各机在 nginx.conf 用 `env BODYLOG_LISTENER_HOST=...;` 设置（默认 gateway-host
--- 10.0.0.1：集中式 listener，多 OpenResty 共用，落盘 gateway-host:/mnt/nvme1n1/nginx/bodylog/）。
--- cloud-b 网（gateway-host/12）应设 10.0.0.2。应急回退本机收数：env 设 127.0.0.1 +
--- systemctl start bodylog-listener。这样本文件跨所有部署字节一致，机器差异只在 nginx.conf。
+-- 各机在 nginx.conf 用 `env BODYLOG_LISTENER_HOST=...;` 设置。集中式 listener，
+-- 多 OpenResty 共用，落盘 <listener>:/mnt/nvme1n1/nginx/bodylog/。
+-- 应急回退本机收数：env 设 127.0.0.1 + systemctl start bodylog-listener。
+-- 这样本文件跨所有部署字节一致，机器差异只在 nginx.conf。
+--
+-- Unset or empty => logging is OFF and there is no fallback address (see the
+-- note in session_base.conf). bodylog_should_sample returns false, so nothing is
+-- captured or sent.
 
 -- 与 session_base.conf 的 client_body_buffer_size 对齐(10m = LLM 的 per-model 上限)。
 -- 两者必须一起提:只提这个没用 —— body 超过 buffer 时 nginx 已经把它写进临时文件、
@@ -45,6 +49,11 @@ _G.bodylog_strip_hdrs  = {
 -- 优先级：toggle endpoint 设过的 shared dict 值 > opts.bodylog_default_* > 全局常量 fallback。
 -- opts 可选；未传时取 ngx.ctx.route_opts 或默认 K2.5。
 local function bodylog_should_sample(opts)
+    -- No listener configured => logging is off. Gating here rather than at the
+    -- send site means nothing is captured at all: no body is held in ngx.ctx, no
+    -- frame is assembled, and drop_count stays clean instead of counting up
+    -- forever and looking like a listener outage.
+    if not _G.BODYLOG_LISTENER_HOST then return false end
     opts = opts or ngx.ctx.route_opts or _G.__route_opts.k25
     local ctl = ngx.shared[opts.bodylog_ctl_dict or "bodylog_ctl"]
     local default_en = opts.bodylog_default_enabled

@@ -11,6 +11,7 @@ local ttft         = require "ttft"
 local tps          = require "tps"
 local bodylog      = require "bodylog"
 local reqtransform = require "reqtransform"
+local api_keys     = require "api_keys"
 
 -- ══════════════════════════════════════════════════════════════════════
 -- _G.do_route(opts) — access_by_lua_block 主体（参数化路由选址）
@@ -24,13 +25,53 @@ function _G.do_route(opts)
     end
     -- ── API key 鉴权（从 Bearer 头取）──
     local ak = ngx.shared[opts.api_keys_dict]
-    if not ak:get("__inited") then
-        for k, v in pairs(opts.api_keys) do ak:set(k, v) end
-        ak:set("__inited", "1")
+    -- 播种策略:dict 条目按 key 表指纹加前缀(`<sig>:<key>`),而不是"整份 flush 再灌"。
+    --
+    -- 两个原因:
+    --   1) 这个 dict 是**所有路由共用**的(session_base.conf: lua_shared_dict api_keys)。
+    --      而 opts.api_keys 允许 per-route 覆盖 —— 一旦有路由用了不同的 key 表,
+    --      flush 式播种会让两张表互相冲刷,还会在"A 灌完 → B 冲掉 → A 查表"之间
+    --      产生**假 401**。加前缀则两张表并存,互不干扰。
+    --   2) 改了 key 表 = 新前缀,旧条目自然查不到(等价于失效),不必显式删。
+    --      代价是旧条目会**留在 dict 里不被清理**(dict 跨 reload 存活)。量级可忽略:
+    --      每条约百字节、dict 1m 能放上万条,而一次轮换只多几条 —— 撑满要轮换几千次。
+    --      真撑满也不会误拒:LRU 驱逐后有下面那层回落 Lua 表的兜底。
+    --
+    -- 指纹每 worker 只算一次,挂在 opts 上。
+    opts._api_keys_sig = opts._api_keys_sig or api_keys.fingerprint(opts.api_keys)
+    local sig = opts._api_keys_sig
+    if not ak:get(sig) then
+        for k, v in pairs(opts.api_keys) do ak:set(sig .. ":" .. k, v) end
+        ak:set(sig, "1")            -- 这份表已播种的标记
     end
+    -- dict 是**纯缓存**:没有任何地方在运行时增删 key(查过,只有这里写),
+    -- 权威始终是 opts.api_keys 这张 Lua 表。所以查不到时回落到表本身 ——
+    -- dict 写满被驱逐 / set 失败(ak:set 会返回 false)/ 被别处 flush 掉,
+    -- 都不该变成"合法 key 被拒"。少了这层兜底,dict 一满就是 401 风暴。
+    -- **这条路由**的 key 表为空 => 鉴权关闭,放行(fail-open)。openresty 是公网入口,
+    -- 升级时 Secret 配错导致**全站 401** 比短暂无鉴权更糟。这不是静默:init 期打 ERR,
+    -- /_health_status 报 _meta.api_keys_configured=false 供告警。
+    --
+    -- ⚠️ 判断必须在**这里**:本函数走 dict 缓存路径,不经过 api_keys.check(),
+    -- 所以 check() 里那个 fail-open 短路对主路由不生效。少了它,空 key 表会让每个
+    -- 请求都"查不到"而 401 —— 实测过(tools/openresty-keys/verify_failopen_behavior.sh):
+    -- 主路由 401、而 guard() 路由放行,两条路径行为相反。
+    --
+    -- ⚠️ 判的是 opts.api_keys 这张**本路由的表**,不是全局 api_keys.configured。
+    -- 现状是所有生产路由都用同一张公用表(video 路由走 guard(),也是同一张),
+    -- 两种判法此刻等价;但 opts.api_keys 在设计上允许 per-route 覆盖
+    -- (route.lua:137 的 `or` 默认值 —— ModelRoute CR 里**没有** api_keys 字段,
+--  CRD 白名单只认 auth / auth_public_paths,写了会被校验拒),
+    -- 测试 harness 已经在这么用。看全局开关的话,一条自带 key 表的路由会被
+    -- "key 文件没挂上"这个与它无关的状态把鉴权整个关掉 —— 踩到过:
+    -- test_api_keys_dict_full 的非法 key 被放行。
+    -- 空表结论在 register_route 时就算好了(route.lua),这里只读不算:
+    -- 表在 init 之后不再变,而每请求遍历(可能上千条)太贵;放在注册时还能让
+    -- /_health_status 在该路由尚未服务过任何请求时也读得到真实状态。
     local auth = ngx.req.get_headers()["authorization"] or ""
-    local akey = auth:match("^Bearer%s+(.+)$")
-    if not akey or not ak:get(akey) then
+    local akey = api_keys.parse_bearer(auth)
+    if not opts._api_keys_empty
+       and (not akey or not (ak:get(sig .. ":" .. akey) or opts.api_keys[akey])) then
         ngx.status = 401
         ngx.header["Content-Type"] = "application/json"
         ngx.say([[{"error":"missing or invalid api key"}]])

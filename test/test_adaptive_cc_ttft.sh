@@ -14,7 +14,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
-PREFIX="${PREFIX:-/tmp/ccttfttest}"; KEY=REDACTED-API-KEY
+PREFIX="${PREFIX:-/tmp/ccttfttest}"; KEY="${API_KEY:-}"
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1
   for pid in $(ps -eo pid,cmd|grep "$PREFIX/nginx"|grep -v grep|awk '{print $1}'); do kill -9 "$pid" 2>/dev/null; done
   rm -rf "$PREFIX"; }

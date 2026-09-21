@@ -11,7 +11,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"; PY="${PY:-python3}"
-PREFIX="${PREFIX:-/tmp/afftest}"; KEY=REDACTED-API-KEY
+PREFIX="${PREFIX:-/tmp/afftest}"; KEY="${API_KEY:-}"
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1
   pkill -9 -f "$PREFIX/nginx" 2>/dev/null
   for p in 28941 28942; do pkill -9 -f "mock_vllm_sse.py --port $p" 2>/dev/null; done

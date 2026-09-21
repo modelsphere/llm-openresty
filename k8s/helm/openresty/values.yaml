@@ -52,7 +52,7 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: registry.example.com/llm/autoconfig-reload:0.3.31
+  image: registry.example.com/llm/autoconfig-reload:0.3.46
   process: "nginx: master"
 
 service:
@@ -77,8 +77,48 @@ affinity: {}
 nameOverride: ""
 fullnameOverride: ""
 
+# ── API keys (entry-point authentication) ────────────────────────────
+# Keys stay out of the image and out of git; this chart mounts them from a Secret
+# as a file at /etc/openresty/api-keys/keys, which lua/api_keys.lua reads.
+#
+# Mounted as a file, not injected as an environment variable, so that keys can be
+# ROTATED WITHOUT RESTARTING the nginx master: nginx reads `env` declarations only
+# at master startup and `-s reload` does not re-read them, but a reload does
+# re-execute init_by_lua and re-read files. Restarting the master would drop every
+# in-flight stream, which for LLM traffic can mean minutes-long responses.
+# The reload sidecar watches the Secret mount as a second --watch path, so a key
+# change triggers the reload on its own.
+#
+# Format `key1:owner1,key2:owner2` -- the owner label records who holds the key.
+# Supporting several keys is what makes rotation possible: issue the new key
+# alongside the old one, move callers over, then retire the old one. A single
+# key would turn every rotation into an outage.
+#
+# Three ways to use it (mirrors bodylog):
+#   1) secret.create=true + secret.keys=xxx    -> this chart creates the Secret
+#                                                 (simplest for test/single-host)
+#   2) secret.create=false + existingSecret=N  -> reuse a Secret created out of
+#                                                 band (recommended in production,
+#                                                 keys never reach git)
+#   3) neither                                 -> authentication OFF
+#
+# Option 3 is a deliberate fail-open: openresty is the public entry point, and a
+# misconfigured Secret returning 401 for the whole site is worse than a brief
+# window without auth. It is not silent -- the engine logs an error and
+# /_health_status reports _meta.api_keys_configured=false for alerting.
+secret:
+  create: false
+  keys: ""                   # only used when create=true, e.g. "sk-xxx:admin,sk-yyy:teamB"
+existingSecret: ""           # takes precedence over create; both empty = no authentication
+# The entry inside the Secret must be named `keys`: the Secret is mounted as a
+# directory, so each entry name becomes a file name under /etc/openresty/api-keys.
+# (A whole-volume mount, never subPath -- subPath copies the file once and stops
+# following the ..data symlink swap, so rotation would silently stop working.)
+
 # bodylog-listener 地址(openresty 发帧目标)。本集群已把 bodylog 迁进 k8s(helm bodylog chart,llm-route ns),
-# 故指向其 in-cluster Service。host 空=用镜像默认(session_base.conf 的 os.getenv or "10.0.0.1" 主集群生产)。
+# 故指向其 in-cluster Service。**host 留空 = 完全不记 bodylog**(不再回落到任何默认地址):
+# 默认地址意味着"没配过 bodylog 的部署"会把完整请求/响应体(含 prompt)发到另一个网段的机器,
+# 那是数据外发的形状,不是便利。要记日志就显式写 listener 地址。
 # ⚠️ 必须用【完整 FQDN】(bodylog.<ns>.svc.cluster.local):nginx cosocket resolver 不套 search 域,
 #    裸 Service 名(bodylog / bodylog.llm-route.svc)解析不了 → 帧静默丢(2026-08-18 迁移时踩过)。
 bodylog:

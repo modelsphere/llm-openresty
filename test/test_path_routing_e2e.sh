@@ -6,7 +6,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"; BASE="$HERE/.."
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"; PY="${PY:-python3}"
-MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"; PREFIX="${PREFIX:-/tmp/prE2E}"; KEY=REDACTED-API-KEY
+MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"; PREFIX="${PREFIX:-/tmp/prE2E}"; KEY="${API_KEY:-}"
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c nginx.conf -s stop 2>/dev/null; sleep 1; pkill -9 -f "$PREFIX/nginx" 2>/dev/null
   for p in 28951 28952; do pkill -9 -f "mock_vllm_sse.py --port $p" 2>/dev/null; done; }
 trap cleanup EXIT

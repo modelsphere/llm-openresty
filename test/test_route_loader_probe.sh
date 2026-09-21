@@ -17,7 +17,18 @@ rm -rf "$PREFIX"; mkdir -p "$PREFIX/logs" "$PREFIX/temp" "$PREFIX/routes"
 
 # ① 抽 session_base 的全局 dict(17-26)+ init_by_lua_block(79-198)
 sed -n '17,26p' "$BASE/session_base.conf" > "$PREFIX/global_dicts.conf"
-sed -n '79,198p' "$BASE/session_base.conf" > "$PREFIX/initblock.conf"
+# 按【标记】提取 init_by_lua_block,不用硬编码行号。
+# 原本写死 sed -n '79,198p':session_base.conf 一旦增删行,这个窗口就整体推歪,
+# 截出两个块的残片 → nginx 报 unexpected "," 起不来,看着像引擎坏了。
+# 2026-09-18 踩到:bodylog gate 改动让该文件净增 22 行,init_by_lua_block 实际是 112-245,
+# 而窗口 79-198 的首行落在 init_worker 块中间、末行落在 init_by_lua 块里。
+awk '/^init_by_lua_block \{/{f=1} f{print} f&&/^\}/{exit}' \
+    "$BASE/session_base.conf" > "$PREFIX/initblock.conf"
+# 截空或没截到闭合花括号 = 提取失败,立刻报错,别让它变成一个看不懂的 nginx 语法错
+if [ "$(wc -l < "$PREFIX/initblock.conf")" -lt 10 ] || ! tail -1 "$PREFIX/initblock.conf" | grep -q '^}'; then
+  echo "FAIL: 从 session_base.conf 提取 init_by_lua_block 失败(行数=$(wc -l < "$PREFIX/initblock.conf"))"
+  exit 1
+fi
 
 # ② per-model 路由文件:只有 6 个 suffixed dict + 一行 ROUTE_DATA(无 server)
 cat > "$PREFIX/routes/session_route_glm.conf" <<'EOF'

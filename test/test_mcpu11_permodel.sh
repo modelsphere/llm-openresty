@@ -8,7 +8,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
 OPENRESTY="${OPENRESTY:-/usr/local/openresty/bin/openresty}"
 PY="${PY:-python3}"
-PREFIX="${PREFIX:-/tmp/mcpu11test}"; KEY=REDACTED-API-KEY
+PREFIX="${PREFIX:-/tmp/mcpu11test}"; KEY="${API_KEY:-}"
 MPORTS="28051 28052 28053 28054 28055"
 cleanup(){ "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf" -s stop 2>/dev/null; sleep 1
   for pid in $(ps -eo pid,cmd|grep "$PREFIX/nginx"|grep -v grep|awk '{print $1}'); do kill -9 "$pid" 2>/dev/null; done

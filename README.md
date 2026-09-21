@@ -236,7 +236,7 @@ curl 'http://127.0.0.1:18080/_active_conns_set?flush=1'
 access_by_lua_block {
     local ak = ngx.shared.api_keys
     if not ak:get('__inited') then
-        ak:set('REDACTED-API-KEY', 'admin')
+        ak:set('<your-api-key>', 'admin')
         ak:set('__inited', '1')
     end
     local auth = ngx.req.get_headers()['authorization'] or ''
@@ -261,7 +261,7 @@ curl -v http://127.0.0.1:18080/v1/completions -X POST \
 
 # 带正确 key → 透传到后端
 curl -v http://127.0.0.1:18080/v1/completions -X POST \
-  -H 'Authorization: Bearer REDACTED-API-KEY' \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"kimi-k2.5","prompt":[1,2,3],"max_tokens":3}'
 

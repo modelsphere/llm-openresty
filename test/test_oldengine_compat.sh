@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OLD=${OLD:-/tmp/oldeng}
 ENGINE="$OLD/session_base.conf"
 OPENRESTY=${OPENRESTY:-/usr/local/openresty/bin/openresty}
-PREFIX=${PREFIX:-/tmp/oldcompat}; KEY=REDACTED-API-KEY
+PREFIX=${PREFIX:-/tmp/oldcompat}; KEY="${API_KEY:-}"
 P=19699
 
 pass=0; fail=0
@@ -86,8 +86,22 @@ echo "    /_ttft_status: $(echo "$s" | head -c 160)"
 # 旧引擎应当**忽略**指标表,阈值仍是静态的 20000
 echo "$s" | grep -q '"ttft_limit_ms":20000' && ok "阈值仍是静态 20000(指标表被忽略,不是半生效)" \
   || no "ttft_limit_ms 不是 20000: $(echo "$s"|head -c 120)"
-# 旧引擎没有 metrics 字段(那是新引擎才加的)
-echo "$s" | grep -q '"metrics"' && no "旧引擎不该有 metrics 字段" || ok "无 metrics 字段(符合旧引擎)"
+# 旧引擎不该输出 metrics 字段 —— 那是新引擎才加的。
+#
+# 这条失败几乎总是【基线太新】,而不是兼容性问题:$OLD 里那份"旧引擎"是我们自己
+# git archive 出来的,它输出什么完全由导出的 ref 决定,跟被测的新 conf 毫无关系。
+# 所以把话说准,别让"基线不再旧了"伪装成"旧引擎被新键打坏了"——
+# 本套件 2026-09-02 12:21 写下,当天 15:19 metrics 就进了 main,从那以后
+# `git archive main` 导出的东西自己就带 metrics 字段,这条必红。它长期显示绿,
+# 只是因为 chat 上 /tmp/oldeng 是很久以前导出的陈旧副本。
+if echo "$s" | grep -q '"metrics"'; then
+    no "基线失效(不是兼容性问题):$OLD 这份『旧引擎』自己就输出 metrics 字段,
+     说明它已经是支持 metrics 的版本。请把基线往回挪到 metrics 之前的提交
+     (已知可用:0d88330 —— 本套件写下时的 main HEAD,实测 6/0),
+     重新 git archive 到 $OLD 再跑。run_regression.sh 里是 OLD_ENGINE_REF。"
+else
+    ok "无 metrics 字段(符合旧引擎)"
+fi
 
 # error.log 不该因为未知键报错
 grep -qiE "\[error\].*(ttft_metrics|tps_metrics)" "$PREFIX/logs/error.log" 2>/dev/null \

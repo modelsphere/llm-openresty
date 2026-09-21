@@ -16,6 +16,34 @@ local reqtransform = require "reqtransform"
 -- 调用方：server 块的 content_by_lua_block { _G.dbg_xxx(_G.__route_opts[ngx.var.route]) }
 -- ══════════════════════════════════════════════════════════════════════
 
+-- Authentication state for monitoring. Split out because it must be reported on the
+-- no-peers path too: a route with an empty peer list is exactly when both things can
+-- be wrong at once (peers gone AND the key Secret not mounted), and reporting only a
+-- 503 there would leave the "auth is currently open" signal unreachable -- breaking the
+-- promise made in api_keys.lua, values.yaml and secret.yaml that the fail-open is
+-- discoverable via /_health_status.
+local function auth_meta(opts)
+    -- 两个字段不是一回事,监控要看的是后者:
+    --   api_keys_configured —— **全局** key 文件有没有读到 key(api_keys.M.configured)
+    --   route_auth_enabled  —— **这条路由**实际有没有在鉴权
+    -- 绝大多数情况下二者相同(所有路由共用同一张表);但路由允许 per-route 覆盖
+    -- key 表,此时只报全局值会给出与该路由实际行为相反的结论。
+    local route_empty = opts._api_keys_empty
+    if route_empty == nil then
+        -- 兜底:理论上 register_route 已经算好(route.lua)。真读到 nil 时宁可现算,
+        -- 也不要让 not nil 变成"在鉴权"这种反向误报。
+        route_empty = (next(opts.api_keys or {}) == nil)
+    end
+    -- key_file_status 把「本来就没配」和「配了但读不了」分开:两者都导致放行,
+    -- 但后者是挂载/权限出错,该告警;只报一个布尔值分不出来。
+    local _ak = require("api_keys")
+    return {
+        api_keys_configured = _ak.configured and true or false,
+        route_auth_enabled  = not route_empty,
+        key_file_status     = _ak.file_status or "unknown",
+    }
+end
+
 function _G.dbg_health_status(opts)
     -- H1: nil opts 防御
     if util.opts_missing(opts) then return end
@@ -23,7 +51,12 @@ function _G.dbg_health_status(opts)
     if not opts.peer_keys or #opts.peer_keys == 0 then
         ngx.status = 503
         ngx.header["Content-Type"] = "application/json"
-        ngx.say(string.format([[{"error":"no peers configured","route":"%s"}]], opts.route_name or "?"))
+        -- _meta is included here as well: see auth_meta above.
+        ngx.say(cjson_dbg.encode({
+            error = "no peers configured",
+            route = opts.route_name or "?",
+            _meta = auth_meta(opts),
+        }))
         return
     end
     local bad = ngx.shared[opts.bad_peers_dict]
@@ -35,6 +68,17 @@ function _G.dbg_health_status(opts)
             banned = bad:get(k) and true or false,
         }
     end
+    -- Global flags go under the reserved _meta key rather than alongside the
+    -- peers: every other key in this table is a peer name and consumers iterate
+    -- over it, so a non-peer key at the top level would show up as a phantom peer.
+    --
+    -- api_keys_configured=false means no key file was readable and
+    -- authentication is letting everything through. That fail-open is deliberate
+    -- (a misconfigured Secret returning 401 for the whole site is worse than a
+    -- brief window without auth) but it must be discoverable: besides the error
+    -- logged at init, it is surfaced here for monitoring to alert on.
+    --
+    out._meta = auth_meta(opts)
     ngx.header["Content-Type"] = "application/json"
     ngx.say(cjson_dbg.encode(out))
 end
