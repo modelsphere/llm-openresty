@@ -4,8 +4,9 @@
 # CI 里不需要 docker login、也不需要配任何 HARBOR_ 变量,直接 docker build + docker push。
 #
 # app 镜像用单个 Dockerfile 构建:默认 FROM ubuntu 自己装 OpenResty,CI 则用
-# app 镜像 FROM 的基础镜像写在 Dockerfile 的 ARG BASE 默认值里(已装好 OpenResty),
-# 所以 runner 够不到外网也能 build;Dockerfile 会检测到已存在并跳过 apt。
+# app 镜像:Dockerfile 默认 FROM ubuntu 自己装 OpenResty(开源可用);CI 用
+# --build-arg BASE=<harbor>/openresty-base 覆盖成已装好的基础镜像,Dockerfile 检测到
+# 后跳过 apt,所以 runner 够不到外网也能 build。
 #
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
 #
@@ -35,6 +36,15 @@ variables:
   IMAGE: harbor.4pd.io/hardcore-tech/llm-openresty
   BODYLOG_IMAGE: harbor.4pd.io/hardcore-tech/bodylog-listener
   EXPORTER_IMAGE: harbor.4pd.io/hardcore-tech/bodylog-exporter
+
+  # 各 Dockerfile 的 ARG 默认值是公网镜像,开源后 `docker build .` 开箱即用;
+  # 这里覆盖回 harbor —— runner 够不到 docker.io / openresty.org。写成字面量,
+  # 不要引用其它变量:GitLab 14 不展开 variables 块内的变量引用,拼出来是空串。
+  OPENRESTY_BUILD_ARGS: >-
+    --build-arg BASE=harbor.4pd.io/hardcore-tech/openresty-base:1.29.2.3
+  GO_BUILD_ARGS: >-
+    --build-arg GO_BASE=harbor.4pd.io/hardcore-tech/golang:1.24-bookworm
+    --build-arg RUNTIME_BASE=harbor.4pd.io/hardcore-tech/debian:12-slim
   DOCKER_BUILDKIT: "0"             # 出简单 v2 manifest,containerd 直接拉(buildkit attestation manifest-list 拉取会卡)
 
 # VERSION = tag 剥掉 "<组件>/v" 前缀。无前缀的 tag 剥不掉任何东西,原样通过。
@@ -68,7 +78,8 @@ variables:
 build:openresty:
   extends: [.build-job, .on-openresty]
   script:
-    - docker build -t "$IMAGE:$VERSION" .
+    # --pull:不复用本地既有层,确保 FROM 按 --build-arg 重新解析
+    - docker build --pull $OPENRESTY_BUILD_ARGS -t "$IMAGE:$VERSION" .
     - docker push "$IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$IMAGE:$VERSION" "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
@@ -79,7 +90,7 @@ build:openresty:
 build:bodylog:
   extends: [.build-job, .on-bodylog]
   script:
-    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$VERSION" .
+    - docker build --pull -f Dockerfile.bodylog $GO_BUILD_ARGS -t "$BODYLOG_IMAGE:$VERSION" .
     - docker push "$BODYLOG_IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$BODYLOG_IMAGE:$VERSION" "$BODYLOG_IMAGE:latest" && docker push "$BODYLOG_IMAGE:latest"; fi
@@ -89,7 +100,7 @@ build:bodylog:
 build:exporter:
   extends: [.build-job, .on-exporter]
   script:
-    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
+    - docker build --pull -f bodylog-exporter-go/Dockerfile $GO_BUILD_ARGS -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
     - docker push "$EXPORTER_IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$EXPORTER_IMAGE:$VERSION" "$EXPORTER_IMAGE:latest" && docker push "$EXPORTER_IMAGE:latest"; fi

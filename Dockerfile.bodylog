@@ -9,11 +9,10 @@
 # 模块从 GOPROXY 拉(默认阿里云 goproxy,可 --build-arg 换);GOSUMDB=off 避 sum.golang.org(被墙)。
 # ⚠️ 用阿里云不用 goproxy.cn:后者对大模块(arrow-go v18)在容器 bridge 里会 connection reset。
 # ⚠️ CI runner 若彻底离线(连阿里云 goproxy 都不通),需先 `go mod vendor` 入库并加 -mod=vendor。
-# Addresses live in the ARG defaults, not in --build-arg: the classic builder does
-# not let --build-arg override an ARG used by FROM. This is the form that has always
-# built successfully here.
-ARG GO_BASE=harbor.4pd.io/hardcore-tech/golang:1.24-bookworm
-ARG RUNTIME_BASE=harbor.4pd.io/hardcore-tech/debian:12-slim
+# Defaults are public images so a plain checkout builds; CI overrides them with
+# --build-arg to the mirror its runner can reach.
+ARG GO_BASE=golang:1.24-bookworm
+ARG RUNTIME_BASE=debian:12-slim
 ARG GOPROXY=https://mirrors.tencent.com/go/,direct
 
 FROM ${GO_BASE} AS builder

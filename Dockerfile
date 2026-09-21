@@ -1,26 +1,20 @@
 # OpenResty session router image.
 #
-# BASE defaults to a base that already carries OpenResty, because the build runner
-# here cannot reach openresty.org or the Ubuntu archive. Building from a plain
-# ubuntu:22.04 instead works anywhere with network access:
+# BASE defaults to a public image so a plain checkout builds anywhere:
 #
-#   docker build --build-arg BASE=ubuntu:22.04 -t llm-openresty:dev .
+#   docker build -t llm-openresty:dev .
 #
-# NOTE on why the default carries the address rather than CI passing it: with the
-# classic builder (DOCKER_BUILDKIT=0, set below for the manifest format) --build-arg
-# does NOT override an ARG declared before FROM. The default value does take effect.
-# Verified in this repo's own history: Dockerfile.bodylog has always put the address
-# in the ARG default and builds fine, while passing it via --build-arg silently fell
-# back to the default and broke the build.
+# Where the build host cannot reach openresty.org (our CI runner cannot), pass a
+# base that already carries OpenResty instead -- the install step below detects it
+# and skips apt entirely, so one file serves both cases:
 #
-# The install step below detects OpenResty in the base and skips apt, so either
-# base works from one file.
+#   docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 -t llm-openresty:x .
 #
 # The image ships the engine and the framework config only. Per-route configs
 # (session_route_<route>.conf) are NOT baked in -- they are mounted into
 # conf.d/routes/ at runtime, so adding a model never requires rebuilding.
 
-ARG BASE=harbor.4pd.io/hardcore-tech/openresty-base:1.29.2.3
+ARG BASE=ubuntu:22.04
 FROM ${BASE}
 
 # ARGs are scoped to the build stage: these must be re-declared after FROM to be
