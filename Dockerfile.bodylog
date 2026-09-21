@@ -1,14 +1,19 @@
 # bodylog-listener 镜像(k8s)—— 多阶段:harbor golang:1.24 编 CGO 二进制 → harbor debian:12-slim 运行。
 # 构建上下文 = openresty 仓库根(才能访问 bodylog-listener-go/)。
-#   docker build -f Dockerfile.bodylog -t registry.example.com/llm/bodylog-listener:<tag> .
+#   docker build -f Dockerfile.bodylog -t bodylog-listener:dev .
+#   docker build -f Dockerfile.bodylog --build-arg REGISTRY=<registry>/<project> ... .
+#
+# REGISTRY defaults to the public Docker Hub library so a plain checkout builds.
+# Where the runner cannot reach Docker Hub, pass a mirror that holds the same bases.
 #
 # go-duckdb 需 CGO(内嵌 libduckdb.a,cxx11 ABI):golang:1.24-bookworm 自带 gcc12(够新);
 # debian:12-slim 自带 glibc2.36 + libstdc++6 + libgcc(二进制动态依赖全满足,零 apt)。
 # 模块从 GOPROXY 拉(默认阿里云 goproxy,可 --build-arg 换);GOSUMDB=off 避 sum.golang.org(被墙)。
 # ⚠️ 用阿里云不用 goproxy.cn:后者对大模块(arrow-go v18)在容器 bridge 里会 connection reset。
 # ⚠️ CI runner 若彻底离线(连阿里云 goproxy 都不通),需先 `go mod vendor` 入库并加 -mod=vendor。
-ARG GO_BASE=registry.example.com/llm/golang:1.24-bookworm
-ARG RUNTIME_BASE=registry.example.com/llm/debian:12-slim
+ARG REGISTRY=docker.io/library
+ARG GO_BASE=${REGISTRY}/golang:1.24-bookworm
+ARG RUNTIME_BASE=${REGISTRY}/debian:12-slim
 ARG GOPROXY=https://mirrors.tencent.com/go/,direct
 
 FROM ${GO_BASE} AS builder

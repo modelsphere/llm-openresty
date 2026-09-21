@@ -211,6 +211,14 @@ docker run --rm -p 8080:8080 -p 8090:8090 \
   llm-openresty:dev
 ```
 
+The build installs OpenResty from openresty.org. If your build host cannot reach it,
+point `BASE` at an image that already carries OpenResty — the Dockerfile detects that
+and skips the install:
+
+```bash
+docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 -t llm-openresty:dev .
+```
+
 ### Kubernetes
 
 ```bash

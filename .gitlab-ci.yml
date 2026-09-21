@@ -3,8 +3,9 @@
 # 参考同组 chat-engine 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置 harbor 鉴权,
 # CI 里不需要 docker login、也不需要配任何 HARBOR_ 变量,直接 docker build + docker push。
 #
-# app image builds from Dockerfile (single stage).
-# 所以 public-buildx runner 够不到 docker.io/外网也能 build。
+# app 镜像用单个 Dockerfile 构建:默认 FROM ubuntu 自己装 OpenResty,CI 则用
+# --build-arg BASE=<registry>/openresty-base 指向已装好的基础镜像 —— Dockerfile 会
+# 检测到 OpenResty 已存在并跳过 apt,所以 runner 够不到外网也能 build。
 #
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
 #
@@ -27,9 +28,16 @@
 stages: [build]
 
 variables:
-  IMAGE: registry.example.com/llm/llm-openresty
-  BODYLOG_IMAGE: registry.example.com/llm/bodylog-listener
-  EXPORTER_IMAGE: registry.example.com/llm/bodylog-exporter
+  # REGISTRY_HOST / REGISTRY_PROJECT come from the project's CI/CD variables, so this
+  # file carries no deployment-specific registry address and can be shared verbatim
+  # with a public mirror of the repo. Set both in Settings > CI/CD > Variables.
+  IMAGE: $REGISTRY_HOST/$REGISTRY_PROJECT/llm-openresty
+  BODYLOG_IMAGE: $REGISTRY_HOST/$REGISTRY_PROJECT/bodylog-listener
+  EXPORTER_IMAGE: $REGISTRY_HOST/$REGISTRY_PROJECT/bodylog-exporter
+  # Base images for the builds. The Dockerfiles default to public bases so a plain
+  # checkout builds; here we point them at the mirror the runner can actually reach.
+  OPENRESTY_BASE: $REGISTRY_HOST/$REGISTRY_PROJECT/openresty-base:1.29.2.3
+  GO_DEBIAN_REGISTRY: $REGISTRY_HOST/$REGISTRY_PROJECT
   DOCKER_BUILDKIT: "0"             # 出简单 v2 manifest,containerd 直接拉(buildkit attestation manifest-list 拉取会卡)
 
 # VERSION = tag 剥掉 "<组件>/v" 前缀。无前缀的 tag 剥不掉任何东西,原样通过。
@@ -63,7 +71,9 @@ variables:
 build:openresty:
   extends: [.build-job, .on-openresty]
   script:
-    - docker build -t "$IMAGE:$VERSION" .
+    # --build-arg BASE: the runner cannot reach openresty.org, so build from a base
+    # that already has OpenResty. The Dockerfile detects that and skips the install.
+    - docker build --build-arg BASE="$OPENRESTY_BASE" -t "$IMAGE:$VERSION" .
     - docker push "$IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$IMAGE:$VERSION" "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
@@ -74,7 +84,7 @@ build:openresty:
 build:bodylog:
   extends: [.build-job, .on-bodylog]
   script:
-    - docker build -f Dockerfile.bodylog -t "$BODYLOG_IMAGE:$VERSION" .
+    - docker build -f Dockerfile.bodylog --build-arg REGISTRY="$GO_DEBIAN_REGISTRY" -t "$BODYLOG_IMAGE:$VERSION" .
     - docker push "$BODYLOG_IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$BODYLOG_IMAGE:$VERSION" "$BODYLOG_IMAGE:latest" && docker push "$BODYLOG_IMAGE:latest"; fi
@@ -84,19 +94,18 @@ build:bodylog:
 build:exporter:
   extends: [.build-job, .on-exporter]
   script:
-    - docker build -f bodylog-exporter-go/Dockerfile -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
+    - docker build -f bodylog-exporter-go/Dockerfile --build-arg REGISTRY="$GO_DEBIAN_REGISTRY" -t "$EXPORTER_IMAGE:$VERSION" bodylog-exporter-go
     - docker push "$EXPORTER_IMAGE:$VERSION"
     # 预发布跳过 :latest(见 .build-job 的 PRERELEASE)
     - if [ -z "$PRERELEASE" ]; then docker tag "$EXPORTER_IMAGE:$VERSION" "$EXPORTER_IMAGE:latest" && docker push "$EXPORTER_IMAGE:latest"; fi
 
 # helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
-# push-chart 自处理 harbor ChartMuseum 鉴权(cm-push 到 harbor-chart-repo = https://registry.example.com/chartrepo/llm)。
+# push-chart 自处理 ChartMuseum 鉴权(cm-push 到 $REGISTRY_HOST/chartrepo/$REGISTRY_PROJECT)。
 # 三个 chart 各自一个 job:除了能分别触发,也不再是「第一个 push 失败带走后两个」。
 # 三个 chart 的 values.yaml 都是 image.tag="" → 回落 appVersion,所以只 sed chart 的 version/appVersion。
 .chart-job:
   extends: .build-job
-  variables:
-    REGISTRY_PROJECT: llm
+  # REGISTRY_PROJECT comes from the CI/CD variables (push-chart reads it).
 
 chart:openresty:
   extends: [.chart-job, .on-openresty]

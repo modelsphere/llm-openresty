@@ -1,37 +1,53 @@
 # OpenResty session router image.
 #
-# Single stage on purpose. This used to be split into Dockerfile.base (install
-# OpenResty) and Dockerfile (copy config), because the internal CI runner could not
-# reach docker.io or openresty.org and therefore could not run apt inside a build.
-# That constraint is specific to one build environment; for anyone else the split
-# just means two files and an extra registry hop to understand. Merged back into one.
+# One stage, but the base is a build argument, because two environments need
+# different things from it:
+#
+#   BASE=ubuntu:22.04 (default)   installs OpenResty from openresty.org. This is what
+#                                 anyone building from a checkout gets.
+#   BASE=<registry>/openresty-base:<ver>
+#                                 a base that already carries OpenResty. Needed where
+#                                 the build runner cannot reach openresty.org or the
+#                                 Ubuntu archive; the install step below detects that
+#                                 OpenResty is already present and skips apt entirely.
+#
+# That detection is what lets one file serve both. Without it the second case dies on
+# `apt-get update` with no network, and we are back to two Dockerfiles that drift.
 #
 #   docker build -t llm-openresty:dev .
-#   docker run --rm -p 8080:8080 -p 8090:8090 llm-openresty:dev
+#   docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 -t llm-openresty:x .
 #
 # The image ships the engine and the framework config only. Per-route configs
 # (session_route_<route>.conf) are NOT baked in -- they are mounted into
 # conf.d/routes/ at runtime, so adding a model never requires rebuilding.
 
-FROM ubuntu:22.04
+ARG BASE=ubuntu:22.04
+FROM ${BASE}
 
-ENV DEBIAN_FRONTEND=noninteractive
+# ARGs are scoped to the build stage: these must be re-declared after FROM to be
+# visible in the instructions below.
 ARG OPENRESTY_VER=1.29.2.3-1~jammy1
 ARG OR=/usr/local/openresty
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        wget gnupg ca-certificates lsb-release curl iproute2 procps; \
-    wget -qO - https://openresty.org/package/pubkey.gpg \
-        | gpg --dearmor -o /usr/share/keyrings/openresty.gpg; \
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu jammy main" \
-        > /etc/apt/sources.list.d/openresty.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends "openresty=${OPENRESTY_VER}"; \
-    rm -rf /var/lib/apt/lists/*
+    if [ -x "${OR}/bin/openresty" ]; then \
+        echo "OpenResty already present in base image; skipping install"; \
+    else \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            wget gnupg ca-certificates lsb-release curl iproute2 procps; \
+        wget -qO - https://openresty.org/package/pubkey.gpg \
+            | gpg --dearmor -o /usr/share/keyrings/openresty.gpg; \
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu jammy main" \
+            > /etc/apt/sources.list.d/openresty.list; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends "openresty=${OPENRESTY_VER}"; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Vendored lua-resty-logger-socket, used by the body-log path (async, cosocket).
+# Copied unconditionally: harmless when the base already has it, required otherwise.
 COPY vendor/resty/logger/socket.lua ${OR}/lualib/resty/logger/socket.lua
 
 RUN set -eux; \
