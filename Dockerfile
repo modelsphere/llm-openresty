@@ -1,27 +1,26 @@
 # OpenResty session router image.
 #
-# One stage, but the base is a build argument, because two environments need
-# different things from it:
+# BASE defaults to a base that already carries OpenResty, because the build runner
+# here cannot reach openresty.org or the Ubuntu archive. Building from a plain
+# ubuntu:22.04 instead works anywhere with network access:
 #
-#   BASE=ubuntu:22.04 (default)   installs OpenResty from openresty.org. This is what
-#                                 anyone building from a checkout gets.
-#   BASE=<registry>/openresty-base:<ver>
-#                                 a base that already carries OpenResty. Needed where
-#                                 the build runner cannot reach openresty.org or the
-#                                 Ubuntu archive; the install step below detects that
-#                                 OpenResty is already present and skips apt entirely.
+#   docker build --build-arg BASE=ubuntu:22.04 -t llm-openresty:dev .
 #
-# That detection is what lets one file serve both. Without it the second case dies on
-# `apt-get update` with no network, and we are back to two Dockerfiles that drift.
+# NOTE on why the default carries the address rather than CI passing it: with the
+# classic builder (DOCKER_BUILDKIT=0, set below for the manifest format) --build-arg
+# does NOT override an ARG declared before FROM. The default value does take effect.
+# Verified in this repo's own history: Dockerfile.bodylog has always put the address
+# in the ARG default and builds fine, while passing it via --build-arg silently fell
+# back to the default and broke the build.
 #
-#   docker build -t llm-openresty:dev .
-#   docker build --build-arg BASE=<registry>/openresty-base:1.29.2.3 -t llm-openresty:x .
+# The install step below detects OpenResty in the base and skips apt, so either
+# base works from one file.
 #
 # The image ships the engine and the framework config only. Per-route configs
 # (session_route_<route>.conf) are NOT baked in -- they are mounted into
 # conf.d/routes/ at runtime, so adding a model never requires rebuilding.
 
-ARG BASE=ubuntu:22.04
+ARG BASE=harbor.4pd.io/hardcore-tech/openresty-base:1.29.2.3
 FROM ${BASE}
 
 # ARGs are scoped to the build stage: these must be re-declared after FROM to be
