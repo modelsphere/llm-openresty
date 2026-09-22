@@ -13,7 +13,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata: { name: bodylog-exporter-modelroute-reader }
 # Keep in step with the bodylog-exporter chart's rbac.yaml in
-# project-modelpilot/helm-charts, which is the authoritative copy. This manifest
+# modelsphere/helm-charts, which is the authoritative copy. This manifest
 # is the escape hatch for clusters not using Helm.
 rules:
   - apiGroups: [ "routing.gpucluster.io" ]

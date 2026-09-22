@@ -230,20 +230,20 @@ spec:
 
 exporter 是**独立 chart**(不再是 bodylog chart 的 sidecar):只读 tail listener 落在**节点本地盘**的明细(`bodylog_*`)+ poll 集群内 openresty(`openresty_*`)。**一个实例 = tail + poll 两半全出**。独立部署的好处是升级 exporter 不重启 listener,收帧/落盘零中断;代价是**必须与 listener 钉在同一节点**(明细在该节点本地盘)。
 
-chart 发布在 [project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts):
+chart 发布在 [modelsphere/helm-charts](https://github.com/modelsphere/helm-charts):
 
 ```bash
-helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
+helm repo add modelsphere https://modelsphere.github.io/helm-charts
 helm repo update
 
 # 先装 listener
-helm -n <ns> upgrade --install bodylog modelpilot/bodylog \
+helm -n <ns> upgrade --install bodylog modelsphere/bodylog \
   --set-string secret.token=<token> \
   --set persistence.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
 
 # 再装 exporter:同节点 + hostPath 与 listener 一致 + 复用它的 Secret
-helm -n <ns> upgrade --install bodylog-exporter modelpilot/bodylog-exporter \
+helm -n <ns> upgrade --install bodylog-exporter modelsphere/bodylog-exporter \
   --set data.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
 ```
@@ -275,7 +275,7 @@ Service 自动加 `metrics:9110` 口 + ServiceMonitor(集群内直接抓,已置 
 
 ```bash
 # 复用宿主机裸盘(如 bodylog 从裸机迁进 k8s,续用原数据目录)
-helm -n <ns> upgrade --install bodylog modelpilot/bodylog --version <tag> \
+helm -n <ns> upgrade --install bodylog modelsphere/bodylog --version <tag> \
   --set-string secret.token=<token> \
   --set persistence.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
@@ -306,7 +306,7 @@ git tag exporter/v0.2.0 && git push origin exporter/v0.2.0
 预发布 tag(带 `-`,如 `0.2.0-rc1`)照常出镜像,但**不动 `:latest`**。
 
 chart 不在本仓发布:三个 chart 在
-[project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts),
+[modelsphere/helm-charts](https://github.com/modelsphere/helm-charts),
 由那个仓的 chart-releaser 发到 GitHub Pages。
 
 ---
