@@ -14,13 +14,13 @@ ConfigMap into `conf.d/routes/`, so adding a model never rebuilds anything.
 | **`deployment.yaml`** (standalone) | Trying it out | You fill in the `openresty-routes` ConfigMap yourself | single replica, no sidecars — a config change means a manual reload |
 
 The charts are published from
-[project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts),
+[modelsphere/helm-charts](https://github.com/modelsphere/helm-charts),
 not from this repository:
 
 ```bash
-helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
+helm repo add modelsphere https://modelsphere.github.io/helm-charts
 helm repo update
-helm -n openresty upgrade --install openresty modelpilot/openresty --create-namespace
+helm -n openresty upgrade --install openresty modelsphere/openresty --create-namespace
 ```
 
 For the standalone manifest instead:

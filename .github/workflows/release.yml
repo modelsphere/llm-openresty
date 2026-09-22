@@ -26,7 +26,7 @@
 # The openresty image needs no overrides: its defaults (ubuntu:22.04 plus
 # INSTALL_OPENRESTY=1) are already the public path.
 #
-# Charts are NOT published here -- they live in project-modelpilot/helm-charts and
+# Charts are NOT published here -- they live in modelsphere/helm-charts and
 # are released by that repository's own chart-releaser workflow.
 name: release
 

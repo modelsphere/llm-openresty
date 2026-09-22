@@ -68,7 +68,7 @@ lua/                    the engine (12 modules)
   debug_endpoints.lua     everything under /_*
   util.lua                shared helpers
 k8s/                    a standalone Deployment manifest (the Helm charts live in
-                        project-modelpilot/helm-charts)
+                        modelsphere/helm-charts)
 bodylog-listener-go/    receives body-log frames, writes JSONL
 bodylog-exporter-go/    turns body-log details into Prometheus metrics
 test/                   self-contained test harnesses (see Testing)
@@ -214,13 +214,13 @@ docker run --rm -p 8080:8080 -p 8090:8090 \
 ### Kubernetes
 
 The charts are published from
-[project-modelpilot/helm-charts](https://github.com/project-modelpilot/helm-charts):
+[modelsphere/helm-charts](https://github.com/modelsphere/helm-charts):
 
 ```bash
-helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
+helm repo add modelsphere https://modelsphere.github.io/helm-charts
 helm repo update
 
-helm -n llm upgrade --install openresty modelpilot/openresty --create-namespace \
+helm -n llm upgrade --install openresty modelsphere/openresty --create-namespace \
   --set existingSecret=openresty-api-keys
 ```
 
