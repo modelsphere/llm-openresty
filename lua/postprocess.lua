@@ -238,6 +238,21 @@ local function vllm_normalize(obj)
             changed = true
         end
     end
+    local usage = obj.usage
+    local details = type(usage) == "table" and usage.prompt_tokens_details
+    if type(details) == "table" then
+        if details.multimodal_tokens == json_null then
+            details.multimodal_tokens = nil
+            changed = true
+        end
+        if details.created_cache_tokens ~= nil then
+            if details.cache_write_tokens == nil then
+                details.cache_write_tokens = details.created_cache_tokens
+            end
+            details.created_cache_tokens = nil
+            changed = true
+        end
+    end
     for _, ch in ipairs(obj.choices) do
         if type(ch) == "table" then
             if vllm_drop_null_fields(ch, vllm_choice_null_fields) then changed = true end
