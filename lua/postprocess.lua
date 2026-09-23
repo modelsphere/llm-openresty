@@ -3,9 +3,8 @@
 -- client. Motivating case: normalizing vLLM response-format quirks so clients
 -- see a consistent shape regardless of which backend served the request.
 --
--- SKELETON ONLY. The plumbing (phase hooks, per-route selection, streaming vs
--- buffered handling, status gating, Content-Length handling, buffer cap,
--- fail-open) is here; the actual rewriting lives in handlers and is left as TODO.
+-- The plumbing handles phase hooks, per-route selection, streaming vs buffered
+-- responses, status gating, Content-Length, buffer caps, and fail-open behavior.
 --
 -- Entry points (called from router_locations.inc, which has no module handle, so
 -- they hang on _G like bodylog_filter_chunk / do_emit_peer_header):
@@ -51,6 +50,7 @@
 local M = {}
 
 local cjson = require "cjson.safe"   -- decode/encode return nil on error (no throw)
+local json_null = (require "cjson").null
 
 -- Cap on how much of a response a buffered handler may accumulate in memory, so a
 -- large (multi-MB) LLM response cannot OOM the router. Per-handler overridable.
@@ -195,10 +195,20 @@ function _G.do_postprocess_body(opts)
 end
 
 -- ---- handlers -----------------------------------------------------------
--- Rewrite one SSE "data: {json}\n" frame. Returns the original `line` untouched
--- for anything that is not a JSON data frame we changed, so unchanged frames stay
--- byte-identical (no gratuitous re-serialization). EXAMPLE transform: normalize a
--- non-standard finish_reason -- replace with the real vLLM quirk you need to fix.
+local vllm_null_fields = { "prompt_token_ids", "prompt_text", "logprobs", "token_ids" }
+
+local function vllm_drop_null_fields(obj)
+    local changed = false
+    for _, field in ipairs(vllm_null_fields) do
+        if obj[field] == json_null then
+            obj[field] = nil
+            changed = true
+        end
+    end
+    return changed
+end
+
+-- Rewrite one SSE data frame. Leave unchanged frames byte-identical.
 local function vllm_rewrite_sse_line(line)
     local payload = line:match("^data:%s*(.-)%s*\r?\n?$")
     if not payload or payload == "" or payload == "[DONE]" then
@@ -208,17 +218,38 @@ local function vllm_rewrite_sse_line(line)
     if type(obj) ~= "table" or type(obj.choices) ~= "table" then
         return line                                  -- not the shape we understand
     end
-    local changed = false
+    local changed = vllm_drop_null_fields(obj)
+    if obj.system_fingerprint ~= nil then
+        obj.system_fingerprint = nil
+        changed = true
+    end
     for _, ch in ipairs(obj.choices) do
-        if ch.finish_reason == "eos_token" then
-            ch.finish_reason = "stop"
-            changed = true
+        if type(ch) == "table" then
+            if vllm_drop_null_fields(ch) then changed = true end
+            local delta = ch.delta
+            if type(delta) == "table" and delta.reasoning ~= nil then
+                delta.reasoning_content = delta.reasoning
+                delta.reasoning = nil
+                changed = true
+            end
+            if type(delta) == "table" and vllm_drop_null_fields(delta) then
+                changed = true
+            end
+            if ch.finish_reason == "eos_token" then
+                ch.finish_reason = "stop"
+                changed = true
+            end
+            if ch.finish_reason ~= nil and ch.finish_reason ~= json_null
+                    and ch.stop_reason ~= nil then
+                ch.stop_reason = nil
+                changed = true
+            end
         end
     end
     if not changed then return line end              -- nothing to fix -> keep original bytes
     local enc = cjson.encode(obj)
     if not enc then return line end                  -- encode failed -> keep original
-    return "data: " .. enc .. "\n"
+    return "data: " .. enc .. (line:match("\r?\n$") or "")
 end
 
 -- vllm_format: normalize vLLM response-format quirks. Streaming (SSE) handler --
@@ -227,6 +258,7 @@ end
 -- 2xx and to text/event-stream; anything else passes through untouched.
 M.register("vllm_format", {
     buffered = false,
+    rewrites_length = true,
     accept_status = function(status) return status >= 200 and status < 300 end,
     header = function(ctx, opts)
         ctx.pp_sse = (ngx.header.content_type or ""):find("text/event-stream", 1, true) ~= nil
@@ -241,7 +273,7 @@ M.register("vllm_format", {
             if not nl then
                 local rest = pending:sub(pos)        -- incomplete trailing line
                 if eof then
-                    out[#out + 1] = rest             -- last chunk: nothing more is coming
+                    out[#out + 1] = vllm_rewrite_sse_line(rest)
                 else
                     ctx.pp_leftover = rest           -- stash; the next chunk completes it
                 end
