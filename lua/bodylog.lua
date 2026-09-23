@@ -127,14 +127,35 @@ function _G.bodylog_filter_chunk()
         ngx.ctx.tps_on = (tps.tps_dict_if_on(_ro) and true) or false
     end
     local _tps_on = ngx.ctx.tps_on
-    if _ro and not ngx.ctx.ttft_first_chunk_t and (ttft.ttft_dict_if_on(_ro) or _tps_on) then
-        local c0 = ngx.arg[1]
-        if c0 and #c0 > 0 then
-            ngx.update_time()
-            ngx.ctx.ttft_first_chunk_t = ngx.now() - ngx.req.start_time()
-            local ct = ngx.header["Content-Type"]
-            ngx.ctx.ttft_is_stream =
-                (type(ct) == "string" and ct:find("event-stream", 1, true)) and true or false
+    if _ro and not ngx.ctx.ttft_first_chunk_t then
+        local _ttft_td = ttft.ttft_dict_if_on(_ro)
+        if _ttft_td or _tps_on then
+            local c0 = ngx.arg[1]
+            if c0 and #c0 > 0 then
+                ngx.update_time()
+                ngx.ctx.ttft_first_chunk_t = ngx.now() - ngx.req.start_time()
+                local ct = ngx.header["Content-Type"]
+                ngx.ctx.ttft_is_stream =
+                    (type(ct) == "string" and ct:find("event-stream", 1, true)) and true or false
+                -- Fold the TTFT sample into the pool EWMA the moment the first token
+                -- arrives, not at request end (moved out of do_log_release). On a long
+                -- stream (minutes) the log-phase record reached the EWMA a whole
+                -- request-duration late, so the overload signal lagged exactly when it
+                -- mattered most; recording here makes AIMD/TTFT-429 react a request
+                -- sooner, and feeds half-open probes back faster so the pool leaves the
+                -- limited state quicker. The response status is already final at
+                -- body_filter time (headers precede the body), so we can gate on
+                -- 2xx + streaming just like the old log-phase record. Only the first
+                -- chunk reaches this branch (ttft_first_chunk_t guards re-entry), so the
+                -- sample is recorded exactly once. Non-stream responses stay excluded
+                -- (ttft_is_stream=false): their "first chunk" is the whole response and
+                -- carries no first-token meaning. TPS still records at log phase --
+                -- it needs completion_tokens, which only appears at the stream tail.
+                if _ttft_td and ngx.ctx.ttft_is_stream
+                   and ngx.status and ngx.status >= 200 and ngx.status < 300 then
+                    ttft.ttft_record(_ro, _ttft_td, ngx.ctx.ttft_first_chunk_t * 1000)
+                end
+            end
         end
     end
     -- TPS:维护 ~2KB 滚动尾缓冲(usage chunk 永远在流末尾;不在单 chunk 上 find,防 usage 被切到
