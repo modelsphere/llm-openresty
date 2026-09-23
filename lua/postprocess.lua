@@ -52,8 +52,8 @@ local M = {}
 local cjson = require "cjson.safe"   -- decode/encode return nil on error (no throw)
 local json_null = (require "cjson").null
 
--- Cap on how much of a response a buffered handler may accumulate in memory, so a
--- large (multi-MB) LLM response cannot OOM the router. Per-handler overridable.
+-- Cap on how much of a response may be accumulated in memory, so a large
+-- (multi-MB) LLM response cannot OOM the router. Buffered handlers may override it.
 M.DEFAULT_MAX_BUFFER = 8 * 1024 * 1024   -- 8 MiB
 
 -- Global config knob, read lazily by resolve(): _G.POSTPROCESS_DEFAULT is the
@@ -195,11 +195,22 @@ function _G.do_postprocess_body(opts)
 end
 
 -- ---- handlers -----------------------------------------------------------
-local vllm_null_fields = { "prompt_token_ids", "prompt_text", "logprobs", "token_ids" }
+local vllm_top_null_fields = {
+    "prompt_logprobs", "prompt_token_ids", "prompt_text", "metrics",
+    "logprobs", "token_ids", -- retain the existing cleanup at the top level
+}
+local vllm_choice_null_fields = {
+    "logprobs", "token_ids", "routed_experts",
+    "prompt_token_ids", "prompt_text", -- retain the existing choice cleanup
+}
+local vllm_message_null_fields = { "refusal", "annotations", "audio", "function_call" }
+local vllm_top_drop_fields = {
+    "service_tier", "system_fingerprint", "kv_transfer_params", "ec_transfer_params",
+}
 
-local function vllm_drop_null_fields(obj)
+local function vllm_drop_null_fields(obj, fields)
     local changed = false
-    for _, field in ipairs(vllm_null_fields) do
+    for _, field in ipairs(fields) do
         if obj[field] == json_null then
             obj[field] = nil
             changed = true
@@ -208,63 +219,100 @@ local function vllm_drop_null_fields(obj)
     return changed
 end
 
+local function vllm_rename_reasoning(obj)
+    if type(obj) ~= "table" or obj.reasoning == nil then return false end
+    obj.reasoning_content = obj.reasoning
+    obj.reasoning = nil
+    return true
+end
+
+-- Apply the same field rules to a complete JSON response or one SSE chunk.
+local function vllm_normalize(obj)
+    if type(obj) ~= "table" or type(obj.choices) ~= "table" then
+        return false
+    end
+    local changed = vllm_drop_null_fields(obj, vllm_top_null_fields)
+    for _, field in ipairs(vllm_top_drop_fields) do
+        if obj[field] ~= nil then
+            obj[field] = nil
+            changed = true
+        end
+    end
+    for _, ch in ipairs(obj.choices) do
+        if type(ch) == "table" then
+            if vllm_drop_null_fields(ch, vllm_choice_null_fields) then changed = true end
+            if vllm_rename_reasoning(ch) then changed = true end
+            if vllm_rename_reasoning(ch.delta) then changed = true end
+            local message = ch.message
+            if type(message) == "table" then
+                if vllm_rename_reasoning(message) then changed = true end
+                if vllm_drop_null_fields(message, vllm_message_null_fields) then
+                    changed = true
+                end
+            end
+            if ch.stop_reason ~= nil then
+                ch.stop_reason = nil
+                changed = true
+            end
+        end
+    end
+    return changed
+end
+
+local function vllm_rewrite_json(payload)
+    local obj = cjson.decode(payload)
+    if not vllm_normalize(obj) then return payload end
+    local enc = cjson.encode(obj)
+    return enc or payload                            -- fail open on an encode error
+end
+
 -- Rewrite one SSE data frame. Leave unchanged frames byte-identical.
 local function vllm_rewrite_sse_line(line)
     local payload = line:match("^data:%s*(.-)%s*\r?\n?$")
     if not payload or payload == "" or payload == "[DONE]" then
         return line                                  -- comment/heartbeat/terminator/non-data
     end
-    local obj = cjson.decode(payload)
-    if type(obj) ~= "table" or type(obj.choices) ~= "table" then
-        return line                                  -- not the shape we understand
-    end
-    local changed = vllm_drop_null_fields(obj)
-    if obj.system_fingerprint ~= nil then
-        obj.system_fingerprint = nil
-        changed = true
-    end
-    for _, ch in ipairs(obj.choices) do
-        if type(ch) == "table" then
-            if vllm_drop_null_fields(ch) then changed = true end
-            local delta = ch.delta
-            if type(delta) == "table" and delta.reasoning ~= nil then
-                delta.reasoning_content = delta.reasoning
-                delta.reasoning = nil
-                changed = true
-            end
-            if type(delta) == "table" and vllm_drop_null_fields(delta) then
-                changed = true
-            end
-            if ch.finish_reason == "eos_token" then
-                ch.finish_reason = "stop"
-                changed = true
-            end
-            if ch.finish_reason ~= nil and ch.finish_reason ~= json_null
-                    and ch.stop_reason ~= nil then
-                ch.stop_reason = nil
-                changed = true
-            end
-        end
-    end
-    if not changed then return line end              -- nothing to fix -> keep original bytes
-    local enc = cjson.encode(obj)
-    if not enc then return line end                  -- encode failed -> keep original
-    return "data: " .. enc .. (line:match("\r?\n$") or "")
+    local rewritten = vllm_rewrite_json(payload)
+    if rewritten == payload then return line end
+    return "data: " .. rewritten .. (line:match("\r?\n$") or "")
 end
 
--- vllm_format: normalize vLLM response-format quirks. Streaming (SSE) handler --
--- SSE frames are newline-delimited but a body_filter chunk can split a frame, so
--- keep the trailing partial line on ctx and only rewrite complete lines. Gated to
--- 2xx and to text/event-stream; anything else passes through untouched.
+-- vllm_format: normalize SSE frames and complete JSON responses. SSE is handled
+-- line by line; non-stream JSON is capped and buffered until eof.
 M.register("vllm_format", {
     buffered = false,
     rewrites_length = true,
     accept_status = function(status) return status >= 200 and status < 300 end,
     header = function(ctx, opts)
-        ctx.pp_sse = (ngx.header.content_type or ""):find("text/event-stream", 1, true) ~= nil
+        local content_type = (ngx.header.content_type or ""):lower()
+        ctx.pp_sse = content_type:find("text/event-stream", 1, true) ~= nil
+        ctx.pp_json = not ctx.pp_sse and content_type:find("application/json", 1, true) ~= nil
     end,
     body = function(chunk, eof, ctx, opts)
-        if not ctx.pp_sse then return nil end        -- non-stream JSON -> leave as-is
+        if ctx.pp_json then
+            if ctx.pp_json_overflow then return nil end
+            local buf = ctx.pp_json_buf
+            if not buf then
+                buf = {}
+                ctx.pp_json_buf = buf
+                ctx.pp_json_size = 0
+            end
+            if chunk and chunk ~= "" then
+                buf[#buf + 1] = chunk
+                ctx.pp_json_size = ctx.pp_json_size + #chunk
+            end
+            if ctx.pp_json_size > M.DEFAULT_MAX_BUFFER then
+                ngx.log(ngx.ERR, "postprocess: JSON body over ", M.DEFAULT_MAX_BUFFER,
+                        " bytes; passing through un-transformed")
+                ctx.pp_json_overflow = true
+                ctx.pp_json_buf = nil
+                return table.concat(buf)
+            end
+            if not eof then return "" end
+            ctx.pp_json_buf = nil
+            return vllm_rewrite_json(table.concat(buf))
+        end
+        if not ctx.pp_sse then return nil end        -- other media types pass through
         local pending = (ctx.pp_leftover or "") .. (chunk or "")
         ctx.pp_leftover = nil
         local out, pos = {}, 1
