@@ -50,6 +50,8 @@
 
 local M = {}
 
+local cjson = require "cjson.safe"   -- decode/encode return nil on error (no throw)
+
 -- Cap on how much of a response a buffered handler may accumulate in memory, so a
 -- large (multi-MB) LLM response cannot OOM the router. Per-handler overridable.
 M.DEFAULT_MAX_BUFFER = 8 * 1024 * 1024   -- 8 MiB
@@ -193,19 +195,62 @@ function _G.do_postprocess_body(opts)
 end
 
 -- ---- handlers -----------------------------------------------------------
--- vllm_format: placeholder for normalizing vLLM response-format quirks. A no-op
--- pass-through for now so a route can already select it; the real logic lands
--- later. Gated to 2xx -- error bodies are not ours to reshape.
+-- Rewrite one SSE "data: {json}\n" frame. Returns the original `line` untouched
+-- for anything that is not a JSON data frame we changed, so unchanged frames stay
+-- byte-identical (no gratuitous re-serialization). EXAMPLE transform: normalize a
+-- non-standard finish_reason -- replace with the real vLLM quirk you need to fix.
+local function vllm_rewrite_sse_line(line)
+    local payload = line:match("^data:%s*(.-)%s*\r?\n?$")
+    if not payload or payload == "" or payload == "[DONE]" then
+        return line                                  -- comment/heartbeat/terminator/non-data
+    end
+    local obj = cjson.decode(payload)
+    if type(obj) ~= "table" or type(obj.choices) ~= "table" then
+        return line                                  -- not the shape we understand
+    end
+    local changed = false
+    for _, ch in ipairs(obj.choices) do
+        if ch.finish_reason == "eos_token" then
+            ch.finish_reason = "stop"
+            changed = true
+        end
+    end
+    if not changed then return line end              -- nothing to fix -> keep original bytes
+    local enc = cjson.encode(obj)
+    if not enc then return line end                  -- encode failed -> keep original
+    return "data: " .. enc .. "\n"
+end
+
+-- vllm_format: normalize vLLM response-format quirks. Streaming (SSE) handler --
+-- SSE frames are newline-delimited but a body_filter chunk can split a frame, so
+-- keep the trailing partial line on ctx and only rewrite complete lines. Gated to
+-- 2xx and to text/event-stream; anything else passes through untouched.
 M.register("vllm_format", {
     buffered = false,
     accept_status = function(status) return status >= 200 and status < 300 end,
-    -- rewrites_length: set true here once the body rewrite changes the length.
     header = function(ctx, opts)
-        -- TODO: inspect/adjust response headers if the body rewrite needs it.
+        ctx.pp_sse = (ngx.header.content_type or ""):find("text/event-stream", 1, true) ~= nil
     end,
     body = function(chunk, eof, ctx, opts)
-        -- TODO: rewrite the vLLM response body here. Pass through unchanged.
-        return nil   -- nil = leave the chunk as-is
+        if not ctx.pp_sse then return nil end        -- non-stream JSON -> leave as-is
+        local pending = (ctx.pp_leftover or "") .. (chunk or "")
+        ctx.pp_leftover = nil
+        local out, pos = {}, 1
+        while true do
+            local nl = pending:find("\n", pos, true)
+            if not nl then
+                local rest = pending:sub(pos)        -- incomplete trailing line
+                if eof then
+                    out[#out + 1] = rest             -- last chunk: nothing more is coming
+                else
+                    ctx.pp_leftover = rest           -- stash; the next chunk completes it
+                end
+                break
+            end
+            out[#out + 1] = vllm_rewrite_sse_line(pending:sub(pos, nl))
+            pos = nl + 1
+        end
+        return table.concat(out)
     end,
 })
 
