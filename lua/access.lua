@@ -362,10 +362,13 @@ function _G.do_log_release(opts)
         local v = d:incr(ngx.ctx.peer_counter_key, -1, 0)
         if v and v < 0 then d:set(ngx.ctx.peer_counter_key, 0) end
     end
-    -- TTFT 入账已前移到 bodylog_filter_chunk 的首-chunk 分支(body_filter 阶段),不再在 log
-    -- 阶段折 EWMA:长流下等到请求结束才入账会让过载信号滞后整整一个请求时长。判定/门控
-    -- (ttft_is_stream + 2xx + 首-chunk 计时)与旧逻辑一致,只是提前发生。见 bodylog.lua。
-    -- TPS 入账留在这里:它依赖流末尾的 completion_tokens,提前不了。
+    -- TTFT recording moved forward to the first-chunk branch of bodylog_filter_chunk
+    -- (body_filter phase); it is no longer folded into the EWMA here at log time.
+    -- On a long stream, waiting until request end lagged the overload signal by a
+    -- whole request duration. The gate (ttft_is_stream + 2xx + first-chunk timing) is
+    -- unchanged, only earlier. See bodylog.lua.
+    -- TPS recording stays here: it needs completion_tokens, which only appears at the
+    -- stream tail, so it cannot be moved earlier.
     -- TPS 入账:2xx 即采,**流式与非流式一视同仁**。从尾缓冲 parse completion_tokens;
     -- 拿不到(no-usage)→ fail-open:不采样、不进 EWMA、绝不因此限流(只 incr nousage 计数做可观测)。
     -- ⚠️ 2026-09-07 口径变更(两处同步改:本文件 + bodylog-exporter-go/metrics.go):
