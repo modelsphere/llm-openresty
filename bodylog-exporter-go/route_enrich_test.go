@@ -89,7 +89,7 @@ func newTestResolver(t *testing.T, srv *httptest.Server) *podRouteResolver {
 func TestResolverBuild(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/apis/routing.gpucluster.io/v1alpha1/modelroutes":
+		case r.URL.Path == "/apis/routing.modelsphere.dev/v1alpha1/modelroutes":
 			_, _ = w.Write([]byte(mrFullJSON))
 		case r.URL.Path == "/apis/discovery.k8s.io/v1/namespaces/model-service/endpointslices":
 			if got := r.URL.Query().Get("labelSelector"); got != "kubernetes.io/service-name=fallback-model-service-01" {
@@ -294,7 +294,7 @@ func ownerJSON(apiVersion, kind, name string) string {
 func TestDesiredReplicasWalksToTop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/apis/routing.gpucluster.io/v1alpha1/modelroutes":
+		case "/apis/routing.modelsphere.dev/v1alpha1/modelroutes":
 			_, _ = w.Write([]byte(mrFullJSON))
 
 		// ── LWS 侧:pod → StatefulSet(surge 到 3) → LeaderWorkerSet(2) ──
@@ -345,7 +345,7 @@ func TestDesiredReplicasAbsentWhenUnknown(t *testing.T) {
 	const mr = `{"items":[{"spec":{"nginx":{"route":"bare"},"discovery":{"service":"ns/bare-svc"}}}]}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/apis/routing.gpucluster.io/v1alpha1/modelroutes":
+		case "/apis/routing.modelsphere.dev/v1alpha1/modelroutes":
 			_, _ = w.Write([]byte(mr))
 		case "/apis/discovery.k8s.io/v1/namespaces/ns/endpointslices":
 			_, _ = w.Write([]byte(esWithPods("10.0.0.5|bare-pod")))

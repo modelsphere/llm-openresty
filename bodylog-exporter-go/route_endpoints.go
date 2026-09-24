@@ -85,7 +85,7 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		log.Printf("route-enrich: 读 CA %s 失败(%v),TLS 用系统根", k8sCAPath, err)
 	}
 	r := &podRouteResolver{
-		group:         envOr("MODELROUTE_GROUP", "routing.gpucluster.io"),
+		group:         envOr("MODELROUTE_GROUP", "routing.modelsphere.dev"),
 		version:       envOr("MODELROUTE_VERSION", "v1alpha1"),
 		plural:        envOr("MODELROUTE_PLURAL", "modelroutes"),
 		nginxService:  strings.TrimSpace(envOr("OPENRESTY_SERVICE", "")),

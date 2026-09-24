@@ -16,7 +16,7 @@ metadata: { name: bodylog-exporter-modelroute-reader }
 # modelsphere/helm-charts, which is the authoritative copy. This manifest
 # is the escape hatch for clusters not using Helm.
 rules:
-  - apiGroups: [ "routing.gpucluster.io" ]
+  - apiGroups: [ "routing.modelsphere.dev" ]
     resources: [ "modelroutes" ]
     verbs: [ "get", "list", "watch" ]
   - apiGroups: [ "discovery.k8s.io" ]

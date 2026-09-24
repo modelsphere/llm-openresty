@@ -175,11 +175,11 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 | `OPENRESTY_POLL_INTERVAL_MS` | `15000` | poll 周期 |
 | `OPENRESTY_POLL_TIMEOUT_MS` | `3000` | 单请求超时 |
 
-**route 集合默认【动态发现】**(不填 `OPENRESTY_POLL_ROUTES` 时):走**与富化同一个发现器**(in-cluster SA 列 **ModelRoute CR** `routing.gpucluster.io/v1alpha1`),取 `spec.nginx.route`(省略则 `metadata.name`,同 autoconfig)得 route 列表、`spec.discovery.service` 得 route→service,周期刷新、增删自动跟随 —— **无需静态配、route 变了不重启**。下面这几个 env **同时**控制富化和 poll 发现(一份 list 两用):
+**route 集合默认【动态发现】**(不填 `OPENRESTY_POLL_ROUTES` 时):走**与富化同一个发现器**(in-cluster SA 列 **ModelRoute CR** `routing.modelsphere.dev/v1alpha1`),取 `spec.nginx.route`(省略则 `metadata.name`,同 autoconfig)得 route 列表、`spec.discovery.service` 得 route→service,周期刷新、增删自动跟随 —— **无需静态配、route 变了不重启**。下面这几个 env **同时**控制富化和 poll 发现(一份 list 两用):
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.gpucluster.io` / `v1alpha1` / `modelroutes` | CR 坐标 |
+| `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.modelsphere.dev` / `v1alpha1` / `modelroutes` | CR 坐标 |
 | `ROUTE_DISCOVERY_INTERVAL_SECONDS` | `30` | list ModelRoute 周期(富化 + poll 发现共用) |
 | `ROUTE_DISCOVERY_TIMEOUT_MS` | `4000` | 单次 list/EndpointSlice 请求超时 |
 | `OPENRESTY_SERVICE` | 空 | 只把 `nginx.service` 指向本 openresty 的 route 计入 **poll 列表**(多 openresty 时用);空=全要。**富化映射/service map 不受此过滤**(全 route) |
