@@ -96,9 +96,9 @@ func TestResolverBuild(t *testing.T) {
 				t.Errorf("labelSelector = %q", got)
 			}
 			// 两个后端,第二个未就绪 → total=2、ready=1;映射仍应含两者。
-			_, _ = w.Write([]byte(esJSON("10.0.0.5", "10.0.0.5!")))
+			_, _ = w.Write([]byte(esJSON("10.0.0.5", "10.0.0.6!")))
 		case r.URL.Path == "/apis/discovery.k8s.io/v1/namespaces/kimi/endpointslices":
-			_, _ = w.Write([]byte(esJSON("10.0.0.5")))
+			_, _ = w.Write([]byte(esJSON("10.0.0.7")))
 		default:
 			t.Errorf("未预期路径: %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -111,8 +111,8 @@ func TestResolverBuild(t *testing.T) {
 
 	want := map[string]routeInfo{
 		"10.0.0.5": {route: "fallback-model-service-0.1", service: "model-service/fallback-model-service-01"},
-		"10.0.0.5":  {route: "fallback-model-service-0.1", service: "model-service/fallback-model-service-01"},
-		"10.0.0.5": {route: "kimi-k2.5", service: "kimi/k25-svc"},
+		"10.0.0.6": {route: "fallback-model-service-0.1", service: "model-service/fallback-model-service-01"},
+		"10.0.0.7": {route: "kimi-k2.5", service: "kimi/k25-svc"},
 	}
 	for ip, wi := range want {
 		gotR, gotSvc, ok := r.Lookup(ip)
@@ -299,7 +299,7 @@ func TestDesiredReplicasWalksToTop(t *testing.T) {
 
 		// ── LWS 侧:pod → StatefulSet(surge 到 3) → LeaderWorkerSet(2) ──
 		case "/apis/discovery.k8s.io/v1/namespaces/kimi/endpointslices":
-			_, _ = w.Write([]byte(esWithPods("10.0.0.5|kimi-k25-0", "10.0.0.5|kimi-k25-1!")))
+			_, _ = w.Write([]byte(esWithPods("10.0.0.7|kimi-k25-0", "10.0.0.8|kimi-k25-1!")))
 		case "/api/v1/namespaces/kimi/pods/kimi-k25-0":
 			_, _ = w.Write([]byte(ownerJSON("apps/v1", "StatefulSet", "kimi-k25")))
 		case "/apis/apps/v1/namespaces/kimi/statefulsets/kimi-k25":
