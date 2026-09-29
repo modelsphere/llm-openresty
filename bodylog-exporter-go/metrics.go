@@ -187,6 +187,24 @@ func (m *metrics) observe(d detailRecord) {
 	}
 	if d.FinishReason != "" {
 		m.finishReason.WithLabelValues(service, route, backend, model, d.FinishReason).Inc()
+	} else if d.Status == 200 {
+		// A 200 that never reported why it stopped is a response the client was
+		// handed as successful while it was in fact cut short -- the engine died
+		// mid-stream, so the headers were already sent and only the body ends
+		// early. Nothing else in the stack sees this: the status is 200, so error
+		// rate stays flat, and the client gets a plausible-looking partial answer
+		// with no signal to retry on.
+		//
+		// Observed on k8s-cpu-10 on 2026-09-23: at 22:48:53 +08:00 sixteen
+		// in-flight streams ended in the same second with no finish_reason when
+		// the sglang frontend wedged. Over that whole day 689 of 120698
+		// responses (0.57%) ended this way, clustered into a handful of minutes
+		// that line up one-for-one with engine deaths -- so the bucket is a
+		// crash signature, not background noise.
+		//
+		// Only 200s are counted: an error response legitimately has no
+		// finish_reason and is already visible through status.
+		m.finishReason.WithLabelValues(service, route, backend, model, "none").Inc()
 	}
 	if d.Rt > 0 {
 		m.rt.WithLabelValues(service, route, backend, model, sl).Observe(d.Rt)
