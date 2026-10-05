@@ -10,7 +10,7 @@
 // 这些是 bodylog 拿不到的 live 信号(每 peer 并发/被 ban 的 peer/限流档位),对自动扩缩容反应更快。
 //
 // 只 poll 一台(k8s openresty Service;HA 时 Service 只选 active leader → 天然单逻辑目标),不带 instance label。
-// URL 空 = 整个模块不启用(裸机 ts31 exporter 够不到 k8s,默认关)。
+// An empty URL turns the module off (the default: an exporter on bare metal cannot reach k8s).
 package main
 
 import (

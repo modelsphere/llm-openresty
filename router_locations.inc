@@ -25,7 +25,7 @@
     #   (p50 4.3MB / p90 7.3MB),占全天 prompt token 的 4.9%,基于 bodylog 的命中率分析
     #   系统性缺这一块;顺带省掉每天 1051 次临时文件的一写一读。
     #   内存:nginx 按 min(content-length, 本值) 分配;实测 >2MB 的请求同时在传峰值 8 条 / 45MB
-    #   (ts34 与 k8s 两套独立环境同量级)。
+    #   (same order of magnitude in two independent environments, bare metal and k8s).
     # max_body 10m:业务上限落在这一层。dispatch(:8080)已抬到 100m 只当天花板
     # (为了让视频生成那类 64MB 的 base64 请求进得来),所以经 8080 的 LLM 流量由这里兜住。
     # 10m = 与下游 CART 的 max_body_size 默认值对齐:再大也会被 CART 拒,不如在这里先拒。
@@ -280,10 +280,12 @@
                 end
             end
             if opts then
-                -- 双代兼容:新引擎 bodylog_finalize 在模块 M 上(require "bodylog");
-                -- 旧引擎(如 ts24 2026-07-22 部署的那代)挂 _G,且模块文件不 return M →
-                -- require 返回 boolean true,必须先 type 判断再取字段(直接索引会
-                -- "attempt to index a boolean value",ts24 上线时连踩两坑:先静默跳过后索引炸)
+                -- Two engine generations: the new one has bodylog_finalize on module M
+                -- (require "bodylog"); an older one (deployed 2026-07-22) hangs it on _G and
+                -- its module file does not return M, so require returns boolean true. Check
+                -- the type before reading the field: indexing directly fails with "attempt to
+                -- index a boolean value" (both traps were hit when that engine went live:
+                -- first a silent skip, then the index error).
                 local okm, bodylog = pcall(require, "bodylog")
                 local _finalize = (okm and type(bodylog) == "table" and bodylog.bodylog_finalize)
                                   or _G.bodylog_finalize

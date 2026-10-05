@@ -192,7 +192,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 
 ## 部署
 
-### 裸机 systemd(主场景,如生产 bodylog 所在的 ts31/ts34)
+### Bare-metal systemd (the main case: the host that runs bodylog)
 
 ```bash
 # 二进制放主机;编辑 bodylog-exporter.service 的 Environment
@@ -209,17 +209,17 @@ bodylog 在裸机、Prometheus 在 k8s(kube-prometheus-stack):建**无 selector 
 ```yaml
 apiVersion: v1
 kind: Service
-metadata: { name: bodylog-ts31, namespace: monitoring, labels: { app: bodylog-exporter } }
+metadata: { name: bodylog-baremetal, namespace: monitoring, labels: { app: bodylog-exporter } }
 spec: { clusterIP: None, ports: [ { name: metrics, port: 9110, targetPort: 9110 } ] }
 ---
 apiVersion: v1
 kind: Endpoints
-metadata: { name: bodylog-ts31, namespace: monitoring, labels: { app: bodylog-exporter } }
+metadata: { name: bodylog-baremetal, namespace: monitoring, labels: { app: bodylog-exporter } }
 subsets: [ { addresses: [ { ip: 10.0.0.1 } ], ports: [ { name: metrics, port: 9110 } ] } ]
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
-metadata: { name: bodylog-ts31, namespace: monitoring, labels: { release: kube-prometheus-stack } }
+metadata: { name: bodylog-baremetal, namespace: monitoring, labels: { release: kube-prometheus-stack } }
 spec:
   namespaceSelector: { matchNames: [ monitoring ] }
   selector: { matchLabels: { app: bodylog-exporter } }
