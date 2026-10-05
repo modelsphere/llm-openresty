@@ -1,12 +1,13 @@
-# bodylog-exporter:tail 明细 jsonl → Prometheus 指标。纯 Go(CGO off)静态二进制。
-# 构建上下文 = 本目录(bodylog-exporter-go/)。CI 打 tag 触发(见 openresty/.gitlab-ci.yml build:exporter)。
-# GOPROXY 默认腾讯镜像(public-buildx runner 可达),与 Dockerfile.bodylog 一致。
-# 两个 base 的 ARG 都必须声明在【任何 FROM 之前】。ARG 一旦写在某个 FROM 之后,
-# 就只属于那个 build stage;而第二个 FROM 是在【全局作用域】解析的,取不到它 ——
-# RUNTIME_BASE 曾写在下面第二个 FROM 的紧邻上方,于是解析成空串,报
-# "base name (${RUNTIME_BASE}) should not be blank"。
-# 内网 CI 一直没暴露这个问题,因为它每次都传 --build-arg RUNTIME_BASE=<harbor>,
-# 把作用域错误盖住了;不传覆盖值时才会现形。Dockerfile.bodylog 的写法是对的。
+# bodylog-exporter: tails the detail jsonl and exports Prometheus metrics. A static
+# pure-Go binary (CGO off). Build context = this directory (bodylog-exporter-go/).
+# GOPROXY defaults to a regional mirror, as in Dockerfile.bodylog; override it with
+# --build-arg (the release workflow passes the upstream proxy).
+# Both base-image ARGs must be declared before ANY FROM. An ARG written after a FROM
+# belongs to that build stage only, while the second FROM is resolved in the global
+# scope and cannot see it: RUNTIME_BASE once sat right above the second FROM, resolved
+# to an empty string and failed with "base name (${RUNTIME_BASE}) should not be
+# blank". A build that always passed --build-arg RUNTIME_BASE hid the mistake; it only
+# shows without the override. Dockerfile.bodylog does it right.
 ARG GO_BASE=golang:1.24-bookworm
 ARG RUNTIME_BASE=debian:12-slim
 FROM ${GO_BASE} AS build

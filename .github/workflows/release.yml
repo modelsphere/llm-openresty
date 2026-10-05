@@ -1,7 +1,6 @@
 # Build and publish the three images to Docker Hub on a tag.
 #
-# Tag naming matches .gitlab-ci.yml, so the same tag means the same thing to both
-# CIs:
+# Tag naming:
 #
 #   openresty/v0.2.0  -> 4pdosc/llm-openresty:0.2.0
 #   bodylog/v0.2.0    -> 4pdosc/bodylog-listener:0.2.0
@@ -15,13 +14,11 @@
 # exporter also publishes identical new versions of the other two, and moves all
 # three :latest tags onto builds nobody asked for.
 #
-# The Dockerfiles are kept byte-identical to the GitLab copy so the two
-# repositories never diverge on them. Their ARG defaults target the internal
-# build environment, so the differences that belong to *this* runner are passed
-# here as build args rather than edited into the files:
+# Some ARG defaults in the Dockerfiles target a mirror-backed build environment,
+# so the values a GitHub runner needs are passed here as build args:
 #
-#   GOPROXY  - the default is a mirror reachable from the internal network;
-#              a GitHub runner needs the upstream proxy.
+#   GOPROXY  - the default is a regional mirror; a GitHub runner needs the
+#              upstream proxy.
 #
 # The openresty image needs no overrides: its defaults (ubuntu:22.04 plus
 # INSTALL_OPENRESTY=1) are already the public path.
