@@ -1,4 +1,4 @@
-# bodylog-listener 镜像(k8s)—— 多阶段:harbor golang:1.24 编 CGO 二进制 → harbor debian:12-slim 运行。
+# bodylog-listener image (k8s). Multi-stage: build the CGO binary on golang:1.24, run on debian:12-slim.
 # 构建上下文 = openresty 仓库根(才能访问 bodylog-listener-go/)。
 #   docker build -f Dockerfile.bodylog -t bodylog-listener:dev .
 #   docker build -f Dockerfile.bodylog --build-arg GO_BASE=golang:1.24-bookworm \

@@ -195,7 +195,7 @@ func (m *metrics) observe(d detailRecord) {
 		// rate stays flat, and the client gets a plausible-looking partial answer
 		// with no signal to retry on.
 		//
-		// Observed on k8s-cpu-10 on 2026-09-23: at 22:48:53 +08:00 sixteen
+		// Observed on a production cluster on 2026-09-23: at 22:48:53 +08:00 sixteen
 		// in-flight streams ended in the same second with no finish_reason when
 		// the sglang frontend wedged. Over that whole day 689 of 120698
 		// responses (0.57%) ended this way, clustered into a handful of minutes

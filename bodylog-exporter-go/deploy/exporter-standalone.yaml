@@ -56,7 +56,7 @@ spec:
       serviceAccountName: bodylog-exporter        # 有 list modelroutes 权限(动态发现)
       containers:
         - name: exporter
-          image: 4pdosc/bodylog-exporter:1.0.0
+          image: 4pdosc/bodylog-exporter:0.2.7
           imagePullPolicy: IfNotPresent
           env:
             - { name: BODYLOG_DETAILS_DIR, value: "/tmp/details" }   # 无 bodylog:空跑 tail

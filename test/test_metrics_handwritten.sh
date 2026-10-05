@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # 直接在 session_route_<route>.conf 的 factory 里**手写** ttft_metrics / tps_metrics。
 #
-# 为什么要这条:多指标 / 自定义分位不依赖任何外部工具 —— opts.*_metrics 就是 factory 表里
-# 一个普通字段,与 ttft_limit_ms 地位相同。此前这只是「按代码推断可以」,而裸机
-# (ts24/ts31/gateway-host)是生产,推断不够。
+# Why this test: multiple metrics / custom quantiles need no external tool -- opts.*_metrics
+# is an ordinary field in the factory table, on par with ttft_limit_ms. Until now that was
+# only inferred from the code, and bare-metal deployments run in production, so inference
+# was not enough.
 #
 # 顺带守住 util.validate_metrics:手写是**人**在写,写错概率远高于工具渲染。坏表必须整份
 # 丢弃 + 回落静态,而不是半份生效、也不能把路由打死。

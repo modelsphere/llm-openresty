@@ -92,7 +92,8 @@ end
 -- ⚠️ 2026-09-01 把 override 从链首降到声明表之下。理由:声明表是权威配置(k8s 上由 operator 从
 --    LLMSLORequirement 渲染),不该被谁在**某一台** openresty 上手工压住而无人知晓 —— 生产有三处
 --    实例,压了一台其余两台行为不同,而且从 CRD 侧完全看不出来。
---    override 保留是因为**裸机(ts24/ts31/gateway-host)没有 CRD**,那里它是唯一的免 reload 调阈值手段。
+--    The override stays because bare-metal deployments have no CRD: there it is the only way
+--    to tune thresholds without a reload.
 --
 -- 顺带解掉一个真实的耦合:重排之后**指标集合不再依赖 override** ——
 --   有声明表 → 用声明表;没有 → 恒为 p80(override 与静态都是 p80)。
