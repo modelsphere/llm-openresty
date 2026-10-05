@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -41,12 +42,13 @@ const (
 type routeInfo struct{ route, service string }
 
 type podRouteResolver struct {
-	group, version, plural string
-	nginxService           string // 只把 nginx.service==此的 route 计入 poll 列表(多 openresty 用;空=全要)
-	interval, timeout      time.Duration
-	apiBase                string
-	tokenPath              string
-	client                 *http.Client
+	groups            []string // ModelRoute API groups, earliest wins for an object in more than one
+	version, plural   string
+	nginxService      string // 只把 nginx.service==此的 route 计入 poll 列表(多 openresty 用;空=全要)
+	interval, timeout time.Duration
+	apiBase           string
+	tokenPath         string
+	client            *http.Client
 
 	mu     sync.RWMutex
 	byIP   map[string]routeInfo // 后端 pod IP → {route, service}(富化用,含所有 route)
@@ -85,7 +87,9 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		log.Printf("route-enrich: 读 CA %s 失败(%v),TLS 用系统根", k8sCAPath, err)
 	}
 	r := &podRouteResolver{
-		group:         envOr("MODELROUTE_GROUP", "routing.modelsphere.dev"),
+		// Comma-separated; a deployment that has ModelRoutes under more than one group (e.g. while
+		// moving them between groups) lists them all, see listModelRoutes.
+		groups:        splitGroups(envOr("MODELROUTE_GROUP", "routing.modelsphere.dev")),
 		version:       envOr("MODELROUTE_VERSION", "v1alpha1"),
 		plural:        envOr("MODELROUTE_PLURAL", "modelroutes"),
 		nginxService:  strings.TrimSpace(envOr("OPENRESTY_SERVICE", "")),
@@ -214,7 +218,8 @@ type resolveResult struct {
 type modelRouteFull struct {
 	Items []struct {
 		Metadata struct {
-			Name string `json:"name"`
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
 		} `json:"metadata"`
 		Spec struct {
 			ModelType string `json:"modelType"` // 空 = llm(CRD 默认值)
@@ -286,13 +291,9 @@ const ownerWalkMaxDepth = 5
 // build:list ModelRoute → ① 每个有 discovery.service 的 route 查 EndpointSlice → map[podIP]{route,service} + 副本数;
 // ② route→service 映射(含所有 route);③ poll 用 route 列表(按 nginxService 过滤 + 去重排序)。
 func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
-	body, err := r.get(ctx, fmt.Sprintf("%s/apis/%s/%s/%s", r.apiBase, r.group, r.version, r.plural))
+	lst, err := r.listModelRoutes(ctx)
 	if err != nil {
 		return resolveResult{}, err
-	}
-	var lst modelRouteFull
-	if err := json.Unmarshal(body, &lst); err != nil {
-		return resolveResult{}, fmt.Errorf("decode ModelRouteList: %w", err)
 	}
 	res := resolveResult{byIP: map[string]routeInfo{}, svc: map[string]string{}}
 	seen := map[string]bool{}
@@ -349,6 +350,71 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 	}
 	sort.Strings(res.routes)
 	return res, nil
+}
+
+// listModelRoutes lists ModelRoutes from every configured group and merges them.
+//   - A group the cluster does not serve (404) is skipped: the same configuration works before,
+//     during and after a cluster moves its ModelRoutes from one group to another.
+//   - Any other failure on a served group fails the whole round, so refresh keeps the last
+//     snapshot. Half a result would drop the other group's routes from the poll list and
+//     turn their series "unknown".
+//   - An object present in more than one group (same namespace/name, copied while moving)
+//     is taken from the earliest group listed; the other copy may be stale.
+func (r *podRouteResolver) listModelRoutes(ctx context.Context) (modelRouteFull, error) {
+	var out modelRouteFull
+	seen := map[string]bool{}
+	served := 0
+	for _, g := range r.groups {
+		body, err := r.get(ctx, fmt.Sprintf("%s/apis/%s/%s/%s", r.apiBase, g, r.version, r.plural))
+		var se *httpStatusError
+		if errors.As(err, &se) && se.code == http.StatusNotFound {
+			continue
+		}
+		if err != nil {
+			return out, err
+		}
+		served++
+		var lst modelRouteFull
+		if err := json.Unmarshal(body, &lst); err != nil {
+			return out, fmt.Errorf("decode ModelRouteList (%s): %w", g, err)
+		}
+		for _, it := range lst.Items {
+			if it.Metadata.Name != "" {
+				k := it.Metadata.Namespace + "/" + it.Metadata.Name
+				if seen[k] {
+					continue
+				}
+				seen[k] = true
+			}
+			out.Items = append(out.Items, it)
+		}
+	}
+	if served == 0 {
+		return out, fmt.Errorf("no ModelRoute group served by the cluster (tried %s)", strings.Join(r.groups, ","))
+	}
+	return out, nil
+}
+
+// splitGroups parses a comma-separated MODELROUTE_GROUP.
+func splitGroups(s string) []string {
+	var out []string
+	for _, g := range strings.Split(s, ",") {
+		if g = strings.TrimSpace(g); g != "" {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// httpStatusError is a non-200 answer from the API server; callers tell 404 apart with errors.As.
+type httpStatusError struct {
+	url  string
+	code int
+	body string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("GET %s → HTTP %d: %s", e.url, e.code, e.body)
 }
 
 // podIPsForService:查某 Service 的全部 EndpointSlice(按 kubernetes.io/service-name label 归属)。
@@ -472,7 +538,7 @@ func (r *podRouteResolver) get(ctx context.Context, u string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s → HTTP %d: %s", u, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &httpStatusError{url: u, code: resp.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	return body, nil
 }

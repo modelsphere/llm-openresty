@@ -179,7 +179,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.modelsphere.dev` / `v1alpha1` / `modelroutes` | CR 坐标 |
+| `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.modelsphere.dev` / `v1alpha1` / `modelroutes` | CR coordinates. `MODELROUTE_GROUP` may list several groups, comma-separated (e.g. while ModelRoutes move from one group to another): every group is listed, an object in more than one (same namespace/name) is taken from the earliest, a group the cluster does not serve (404) is skipped, and any other error keeps the last snapshot. RBAC must grant every group listed |
 | `ROUTE_DISCOVERY_INTERVAL_SECONDS` | `30` | list ModelRoute 周期(富化 + poll 发现共用) |
 | `ROUTE_DISCOVERY_TIMEOUT_MS` | `4000` | 单次 list/EndpointSlice 请求超时 |
 | `OPENRESTY_SERVICE` | 空 | 只把 `nginx.service` 指向本 openresty 的 route 计入 **poll 列表**(多 openresty 时用);空=全要。**富化映射/service map 不受此过滤**(全 route) |

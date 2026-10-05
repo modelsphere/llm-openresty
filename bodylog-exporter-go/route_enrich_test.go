@@ -83,6 +83,7 @@ func newTestResolver(t *testing.T, srv *httptest.Server) *podRouteResolver {
 	r.apiBase = srv.URL
 	r.client = srv.Client()
 	r.tokenPath = "/nonexistent-token" // mock 不校验
+	r.groups = []string{"routing.modelsphere.dev"} // single group; the two-group cases set it themselves
 	return r
 }
 
@@ -458,5 +459,139 @@ func TestRouteName(t *testing.T) {
 		if got := routeName(c.name, c.route, c.cm, c.peers); got != c.want {
 			t.Errorf("routeName(%q,%q,%q,%d) = %q, 想要 %q", c.name, c.route, c.cm, c.peers, got, c.want)
 		}
+	}
+}
+
+// Two ModelRoute groups (ModelRoutes moving from routing.gpucluster.io to
+// routing.modelsphere.dev): what each group answers, keyed by path; a status code instead of a
+// body answers with that status.
+func twoGroupServer(t *testing.T, answers map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "endpointslices") {
+			switch {
+			case strings.Contains(r.URL.RawQuery, "svc-a"):
+				_, _ = w.Write([]byte(esJSON("10.1.0.1")))
+			case strings.Contains(r.URL.RawQuery, "svc-b"):
+				_, _ = w.Write([]byte(esJSON("10.1.0.2")))
+			case strings.Contains(r.URL.RawQuery, "svc-c"):
+				_, _ = w.Write([]byte(esJSON("10.1.0.3")))
+			default:
+				_, _ = w.Write([]byte(esJSON()))
+			}
+			return
+		}
+		switch a := answers[r.URL.Path].(type) {
+		case string:
+			_, _ = w.Write([]byte(a))
+		case int:
+			w.WriteHeader(a)
+		default:
+			t.Errorf("未预期路径: %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+}
+
+const (
+	newMR = "/apis/routing.modelsphere.dev/v1alpha1/modelroutes"
+	oldMR = "/apis/routing.gpucluster.io/v1alpha1/modelroutes"
+)
+
+func mrJSON(items ...string) string { return `{"items":[` + strings.Join(items, ",") + `]}` }
+func mrItem(name, route, svc string) string {
+	return `{"metadata":{"namespace":"m","name":"` + name + `"},"spec":{"nginx":{"route":"` + route +
+		`"},"discovery":{"service":"m/` + svc + `"}}}`
+}
+
+func newTwoGroupResolver(t *testing.T, srv *httptest.Server) *podRouteResolver {
+	r := newTestResolver(t, srv)
+	r.groups = splitGroups("routing.modelsphere.dev, routing.gpucluster.io")
+	return r
+}
+
+func TestGroupsFromEnv(t *testing.T) {
+	r := newPodRouteResolver(prometheus.NewRegistry())
+	if want := []string{"routing.modelsphere.dev"}; !reflect.DeepEqual(r.groups, want) {
+		t.Errorf("default groups = %v, want %v", r.groups, want)
+	}
+	t.Setenv("MODELROUTE_GROUP", " routing.modelsphere.dev , routing.gpucluster.io ,")
+	r = newPodRouteResolver(prometheus.NewRegistry())
+	if want := []string{"routing.modelsphere.dev", "routing.gpucluster.io"}; !reflect.DeepEqual(r.groups, want) {
+		t.Errorf("MODELROUTE_GROUP list: groups = %v, want %v", r.groups, want)
+	}
+}
+
+// Both groups served: an object in both is taken from the new group, and objects only in
+// either group are all kept.
+func TestResolverTwoGroupsMerge(t *testing.T) {
+	srv := twoGroupServer(t, map[string]any{
+		newMR: mrJSON(mrItem("a", "route-a-new", "svc-a"), mrItem("b", "route-b", "svc-b")),
+		oldMR: mrJSON(mrItem("a", "route-a-old", "svc-a"), mrItem("c", "route-c", "svc-c")),
+	})
+	defer srv.Close()
+	r := newTwoGroupResolver(t, srv)
+	r.refresh(context.Background())
+	if got, want := r.getRoutes(), []string{"route-a-new", "route-b", "route-c"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("getRoutes() = %v, want %v", got, want)
+	}
+	if route, _, _ := r.Lookup("10.1.0.1"); route != "route-a-new" {
+		t.Errorf("object in both groups: route = %q, want route-a-new", route)
+	}
+}
+
+// Before a cluster migrates (new group 404) and after (old CRD deleted, 404): the group that
+// is not served is skipped, not an error.
+func TestResolverSkipsUnservedGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		answers map[string]any
+		want    []string
+	}{
+		{"before migration", map[string]any{newMR: http.StatusNotFound, oldMR: mrJSON(mrItem("c", "route-c", "svc-c"))}, []string{"route-c"}},
+		{"after migration", map[string]any{newMR: mrJSON(mrItem("b", "route-b", "svc-b")), oldMR: http.StatusNotFound}, []string{"route-b"}},
+	} {
+		srv := twoGroupServer(t, tc.answers)
+		r := newTwoGroupResolver(t, srv)
+		r.refresh(context.Background())
+		if got := r.getRoutes(); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: getRoutes() = %v, want %v", tc.name, got, tc.want)
+		}
+		if up := testutil.ToFloat64(r.up); up != 1 {
+			t.Errorf("%s: resolver_up = %v, want 1", tc.name, up)
+		}
+		srv.Close()
+	}
+}
+
+// Any other failure on a served group (403: RBAC grants one group only) fails the round and
+// keeps the last snapshot, instead of replacing it with the other group's half.
+func TestResolverTwoGroupsFailureKeepsLast(t *testing.T) {
+	answers := map[string]any{
+		newMR: mrJSON(mrItem("b", "route-b", "svc-b")),
+		oldMR: mrJSON(mrItem("c", "route-c", "svc-c")),
+	}
+	srv := twoGroupServer(t, answers)
+	defer srv.Close()
+	r := newTwoGroupResolver(t, srv)
+	r.refresh(context.Background())
+	before := r.getRoutes()
+
+	answers[newMR] = http.StatusForbidden
+	r.refresh(context.Background())
+	if got := r.getRoutes(); !reflect.DeepEqual(got, before) {
+		t.Errorf("after 403: routes = %v, want the last snapshot %v", got, before)
+	}
+	if up := testutil.ToFloat64(r.up); up != 0 {
+		t.Errorf("after 403: resolver_up = %v, want 0", up)
+	}
+
+	answers[newMR], answers[oldMR] = http.StatusNotFound, http.StatusNotFound
+	r.refresh(context.Background())
+	if got := r.getRoutes(); !reflect.DeepEqual(got, before) {
+		t.Errorf("no group served: routes = %v, want the last snapshot %v", got, before)
+	}
+	if up := testutil.ToFloat64(r.up); up != 0 {
+		t.Errorf("no group served: resolver_up = %v, want 0", up)
 	}
 }
