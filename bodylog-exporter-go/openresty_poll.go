@@ -66,6 +66,7 @@ type orMetrics struct {
 	adaptiveCC     *prometheus.GaugeVec // {route,model}  当前动态并发上限(AIMD)
 	adaptiveCCMin  *prometheus.GaugeVec // {route,model}  生效下限
 	adaptiveCCMax  *prometheus.GaugeVec // {route,model}  静态池容量(AIMD clamp)
+	adaptiveCCInit *prometheus.GaugeVec // {route,model}  start point and low-traffic shrink floor
 	adaptiveCCConc *prometheus.GaugeVec // {route,model}  当前并发(timer 判压力用的实时在途)
 	adaptiveCCRej  *prometheus.GaugeVec // {route,model}  本区间被压抑需求(并发 429 数)
 	// /_ttft_status
@@ -108,6 +109,7 @@ func newORMetrics(reg *prometheus.Registry) *orMetrics {
 		adaptiveCC:     g("openresty_adaptive_cc", "当前动态并发上限(AIMD)", srm...),
 		adaptiveCCMin:  g("openresty_adaptive_cc_min", "自适应并发生效下限", srm...),
 		adaptiveCCMax:  g("openresty_adaptive_cc_max", "自适应并发静态池容量(AIMD clamp)", srm...),
+		adaptiveCCInit: g("openresty_adaptive_cc_init", "Adaptive concurrency start point and low-traffic shrink floor (= min unless configured)", srm...),
 		adaptiveCCConc: g("openresty_adaptive_cc_conc", "当前并发(timer 判压力用的实时在途)", srm...),
 		adaptiveCCRej:  g("openresty_adaptive_cc_rej", "本区间被压抑需求(并发 429 数)", srm...),
 
@@ -128,7 +130,7 @@ func newORMetrics(reg *prometheus.Registry) *orMetrics {
 		// 每轮 Reset 会把这条信息抹掉,失败时反而什么都看不到。
 		m.pollUp,
 		m.activeLevel, m.activeLimit, m.healthyPeers, m.peerActive, m.peerBanned, m.peerMax,
-		m.tpsActive, m.tpsEwma, m.adaptiveCC, m.adaptiveCCMin, m.adaptiveCCMax, m.adaptiveCCConc, m.adaptiveCCRej,
+		m.tpsActive, m.tpsEwma, m.adaptiveCC, m.adaptiveCCMin, m.adaptiveCCMax, m.adaptiveCCInit, m.adaptiveCCConc, m.adaptiveCCRej,
 		m.ttftActive, m.ttftEwma,
 	}
 	for _, gv := range m.resettable {
@@ -164,6 +166,7 @@ type tpsStatusResp struct {
 	AdaptiveCC     map[string]*float64 `json:"adaptive_cc"`
 	AdaptiveCCMin  map[string]*float64 `json:"adaptive_cc_min"`
 	AdaptiveCCMax  map[string]*float64 `json:"adaptive_cc_max"`
+	AdaptiveCCInit map[string]*float64 `json:"adaptive_cc_init"` // absent on older engines → no series
 	AdaptiveCCConc map[string]*float64 `json:"adaptive_cc_conc"`
 	AdaptiveCCRej  map[string]*float64 `json:"adaptive_cc_rej"`
 }
@@ -269,6 +272,7 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			setModelMap(p.m.adaptiveCC, service, route, ts.AdaptiveCC)
 			setModelMap(p.m.adaptiveCCMin, service, route, ts.AdaptiveCCMin)
 			setModelMap(p.m.adaptiveCCMax, service, route, ts.AdaptiveCCMax)
+			setModelMap(p.m.adaptiveCCInit, service, route, ts.AdaptiveCCInit)
 			setModelMap(p.m.adaptiveCCConc, service, route, ts.AdaptiveCCConc)
 			setModelMap(p.m.adaptiveCCRej, service, route, ts.AdaptiveCCRej)
 		}

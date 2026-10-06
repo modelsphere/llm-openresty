@@ -102,6 +102,7 @@
 | `openresty_route_healthy_peers` | gauge | service,route | 生效层健康 peer 数 |
 | `openresty_adaptive_cc` | gauge | service,route,model | **当前动态并发上限**(AIMD) |
 | `openresty_adaptive_cc_min` / `_max` | gauge | service,route,model | 生效下限 / 静态池容量 |
+| `openresty_adaptive_cc_init` | gauge | service,route,model | Start point and low-traffic shrink floor (= min unless `adaptive_cc_init` is set; absent on engines that predate it) |
 | `openresty_adaptive_cc_conc` | gauge | service,route,model | **当前并发**(timer 判压力用的实时在途) |
 | `openresty_adaptive_cc_rej` | gauge | service,route,model | 本区间被压抑需求(并发 429 数) |
 | `openresty_tps_ewma` | gauge | service,route,model | 输出 token 速率 EWMA(tok/s,口径同上:分母含 prefill、含非流式) |

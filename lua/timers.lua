@@ -140,6 +140,8 @@ end
 --   EWMA 过期(nil,无信号)→ 本 tick 不写 → 值持续无信号超 TTL 后老化消失 → assess_pool 读 nil →
 --   do_route 回退到 min 慢启动(不从满容量开始;健康则 ×inc 逐步爬回)。短暂信号缺口内(<TTL)仍保持
 --   当前值。阈值/max/min 在 timer 内解析,不读 ngx.ctx。
+--   With adaptive_cc_init set, "min" above reads "init" for the start point and the slack floor;
+--   min stays the floor for overload shrink only (see route.derive_initcc).
 -- ══════════════════════════════════════════════════════════════════════
 function M.do_adaptive_cc_loop(opts)
     if not opts.adaptive_cc then return end   -- 门控:未 opt-in 不启 timer
@@ -183,12 +185,13 @@ function M.do_adaptive_cc_loop(opts)
         local maxcc = route.compute_static_max_cc(opts, model)
         if maxcc <= 0 then return end
         local mincc = route.derive_mincc(opts, maxcc)
+        local initcc = route.derive_initcc(opts, maxcc, mincc)   -- start point + slack-shrink floor
         -- ⚠️ 只用来判断"本路由到底有没有可判定的阈值",不参与比较 —— 过载判定走 ta.hit
         --    (tps_assess 遍历声明的指标列表做 OR)和 ttft_over。
         -- 取自 tps_assess 而不是 thr_for:后者只看「静态 + override」,漏掉指标表 →
         --    「只声明了 tps_metrics」的路由会 ta.hit=true 却整段 AIMD 被跳过(静默冻结 cc)。
         local has_threshold = ta.has_threshold
-        local cur = td:get(pre .. "adaptive_cc") or mincc   -- 首次/过期 → 从 min 起步(慢启动,健康则 ×inc 爬升)
+        local cur = td:get(pre .. "adaptive_cc") or initcc  -- fresh/expired → start from init (= min unless configured)
         -- 修复1:读+清零本区间被压抑需求(并发 429 数)。>0 = 需求超过 cc、被拒的量 rt_sum 看不到。
         local rej = td:get(pre .. "rej") or 0
         if rej > 0 then td:delete(pre .. "rej") end
@@ -219,8 +222,10 @@ function M.do_adaptive_cc_loop(opts)
                 local at_slack    = (conc > 0) and (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
                 if at_pressure then
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired
-                elseif at_slack then
-                    cur = math.max(cur * DEC, desired)        -- 缩,但不低于 desired(留 ABS 绝对底)
+                elseif at_slack and cur > initcc then
+                    -- Low traffic shrinks only down to init, never below it; only overload goes under init.
+                    -- When cc is already below init (after an overload), slack leaves it alone.
+                    cur = math.max(cur * DEC, desired, initcc) -- 缩,但不低于 desired(留 ABS 绝对底)
                 end
             end
         end

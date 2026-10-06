@@ -356,8 +356,9 @@ function _G.dbg_tps_status(opts)
     -- 自适应并发观测:每子池当前动态上限 adaptive_cc + 生效 min(派生或显式)+ 静态 max
     -- + 当前并发 rt_sum(do_route 存的、timer 判压力用的那个,全 peer 含 banned 的真实在途)+ 是否到爬升压力门。
     local adaptive_cc, adaptive_cc_min, adaptive_cc_max, adaptive_cc_conc, adaptive_cc_at_pressure, adaptive_cc_at_slack, adaptive_cc_rej
+    local adaptive_cc_init
     if opts.adaptive_cc then
-        adaptive_cc, adaptive_cc_min, adaptive_cc_max = {}, {}, {}
+        adaptive_cc, adaptive_cc_min, adaptive_cc_max, adaptive_cc_init = {}, {}, {}, {}
         adaptive_cc_conc, adaptive_cc_at_pressure, adaptive_cc_at_slack, adaptive_cc_rej = {}, {}, {}, {}
         local ABS = opts.adaptive_cc_abs or 0
         local function fill_cc(mkey, model)
@@ -365,6 +366,7 @@ function _G.dbg_tps_status(opts)
             adaptive_cc_max[mkey] = maxcc
             -- 生效 min:derive_mincc 统一派生(与 do_route/do_adaptive_cc_loop 同 base+钳到 max),报告==强制
             adaptive_cc_min[mkey] = route.derive_mincc(opts, maxcc)
+            adaptive_cc_init[mkey] = route.derive_initcc(opts, maxcc, adaptive_cc_min[mkey])
             local pfx = tps.tps_key_prefix(opts, model)            -- 统一走 helper
             local cc  = td and td:get(pfx .. "adaptive_cc") or nil
             local rts = td and td:get(pfx .. "rt_sum") or nil     -- timer 判压力用的实时并发(nil=无近期流量)
@@ -376,7 +378,8 @@ function _G.dbg_tps_status(opts)
             --   at_slack    = conc<cc×slack(相对) 且 余量够 cc-conc>ABS(绝对)→ 缩;都 false=保持
             local c = rts or 0
             adaptive_cc_at_pressure[mkey] = (cc and ((c >= cc * opts.adaptive_cc_pressure_frac) or ((cc - c) < ABS))) and true or false
-            adaptive_cc_at_slack[mkey]    = (cc and c > 0 and (c < cc * opts.adaptive_cc_slack_frac) and ((cc - c) > ABS)) and true or false
+            adaptive_cc_at_slack[mkey]    = (cc and c > 0 and (c < cc * opts.adaptive_cc_slack_frac) and ((cc - c) > ABS)
+                                             and cc > adaptive_cc_init[mkey]) and true or false   -- slack stops at init
         end
         if opts.peers_by_model then
             for m in pairs(opts.peers_by_model) do fill_cc(m, m) end
@@ -451,9 +454,10 @@ function _G.dbg_tps_status(opts)
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
         -- 自适应并发(adaptive_cc=true 时才有;与 TPS 硬熔断互斥)
         adaptive_cc_on        = opts.adaptive_cc and true or false,
-        adaptive_cc           = adaptive_cc,         -- 各子池当前动态并发上限(nil=未初始化/过期,do_route 回退到 min 慢启动)
+        adaptive_cc           = adaptive_cc,         -- 各子池当前动态并发上限(nil=未初始化/过期,do_route 回退到 init(= min unless configured))
         adaptive_cc_min       = adaptive_cc_min,     -- 生效下限(显式配 or 静态max×frac 派生)
         adaptive_cc_max       = adaptive_cc_max,     -- 静态池容量(=AIMD max clamp)
+        adaptive_cc_init      = adaptive_cc_init,    -- start point + slack-shrink floor (= min unless configured)
         adaptive_cc_conc      = adaptive_cc_conc,    -- 当前并发 rt_sum(do_route 存,timer 判压力用,全 peer 含 banned;nil=无近期流量)
         adaptive_cc_at_pressure = adaptive_cc_at_pressure,  -- 健康时下一tick 会涨(conc>=cc×pressure_frac)
         adaptive_cc_at_slack    = adaptive_cc_at_slack,     -- 健康时下一tick 会缩(0<conc<cc×slack_frac;conc=0保持)

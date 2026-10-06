@@ -243,6 +243,11 @@ function _G.register_route(name, opts_factory)
     end
     opts.adaptive_cc_min           = opts.adaptive_cc_min           -- 可选下限;不配 = 按 min_frac 从静态 max 派生
     opts.adaptive_cc_min_frac      = opts.adaptive_cc_min_frac      or _G.ADAPTIVE_CC_MIN_FRAC  -- min 缺省 = 静态max×frac(≥1)
+    -- Optional starting point inside [min, max]: a fresh/expired cc starts here, and the slack
+    -- (low-traffic) shrink stops here instead of at min. Overload shrink can still go down to min.
+    -- Neither set → init = min (previous behaviour). No global default on purpose.
+    opts.adaptive_cc_init          = opts.adaptive_cc_init
+    opts.adaptive_cc_init_frac     = opts.adaptive_cc_init_frac
     opts.adaptive_cc_interval      = opts.adaptive_cc_interval      or opts.tps_window  -- AIMD 步长,默认=tps_window
     opts.adaptive_cc_dec           = opts.adaptive_cc_dec           or _G.ADAPTIVE_CC_DEC  -- EWMA<阈值 → ×dec(减)
     opts.adaptive_cc_inc           = opts.adaptive_cc_inc           or _G.ADAPTIVE_CC_INC  -- EWMA>=阈值 → ×inc(增)
@@ -299,6 +304,25 @@ function _G.register_route(name, opts_factory)
                     opts.adaptive_cc_min = nil
                 else
                     opts.adaptive_cc_min = math.floor(opts.adaptive_cc_min)
+                end
+            end
+            -- init must be a number >= 1 (absolute) / in (0, 1] (fraction of static max); otherwise
+            -- ignore it and fall back to init = min, the pre-init behaviour.
+            if opts.adaptive_cc_init ~= nil then
+                if type(opts.adaptive_cc_init) ~= "number" or opts.adaptive_cc_init < 1 then
+                    ngx.log(ngx.ERR, "[", name, "] adaptive_cc_init=", tostring(opts.adaptive_cc_init),
+                            " is invalid (need >= 1) - ignored")
+                    opts.adaptive_cc_init = nil
+                else
+                    opts.adaptive_cc_init = math.floor(opts.adaptive_cc_init)
+                end
+            end
+            if opts.adaptive_cc_init_frac ~= nil then
+                if type(opts.adaptive_cc_init_frac) ~= "number"
+                   or opts.adaptive_cc_init_frac <= 0 or opts.adaptive_cc_init_frac > 1 then
+                    ngx.log(ngx.ERR, "[", name, "] adaptive_cc_init_frac=", tostring(opts.adaptive_cc_init_frac),
+                            " is invalid (need 0 < frac <= 1) - ignored")
+                    opts.adaptive_cc_init_frac = nil
                 end
             end
         end
@@ -530,6 +554,22 @@ function M.derive_mincc(opts, maxcc)
     local mn = opts.adaptive_cc_min or math.max(1, math.floor(maxcc * opts.adaptive_cc_min_frac))
     if mn > maxcc then mn = maxcc end     -- 配 min>max(或 frac>1 派生越界)→ 生效 min=max
     return mn
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- M.derive_initcc(opts, maxcc, mincc) — AIMD starting point and slack-shrink floor.
+-- Explicit adaptive_cc_init wins, then adaptive_cc_init_frac × static maxcc, else mincc.
+-- Clamped into [mincc, maxcc]. Same base as derive_mincc (static maxcc, no ban), so the
+-- value /_tps_status reports is the value do_route and the timer enforce.
+-- ══════════════════════════════════════════════════════════════════════
+function M.derive_initcc(opts, maxcc, mincc)
+    local it = opts.adaptive_cc_init
+    if not it and opts.adaptive_cc_init_frac then
+        it = math.max(1, math.floor(maxcc * opts.adaptive_cc_init_frac))
+    end
+    if not it or it < mincc then it = mincc end
+    if it > maxcc then it = maxcc end
+    return it
 end
 
 -- ══════════════════════════════════════════════════════════════════════
