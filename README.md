@@ -143,7 +143,9 @@ AIMD against measured TTFT and decode rate instead of staying at a static number
 It moves within `[adaptive_cc_min, static max]`. Setting `adaptive_cc_init` (slots) or
 `adaptive_cc_init_frac` (fraction of the static max) adds a point inside that band: a
 fresh or expired limit starts there, and low traffic shrinks the limit only down to it.
-Only overload pushes the limit below `init`, toward `min`. Without it, `init` equals `min`.
+Only overload pushes the limit below `init`, toward `min`; once the backend is healthy again
+the limit climbs back to `init` by the normal growth factor per interval, even under light
+traffic. Without it, `init` equals `min`.
 
 **Content-based rejection (opt-in, off by default).** Rules match the request itself —
 `input_bytes`, `input_chars`, `messages_count`, `max_tokens`, `stream`, or any dotted

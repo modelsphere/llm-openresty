@@ -220,12 +220,19 @@ function M.do_adaptive_cc_loop(opts)
                 --   涨/缩都向 desired 收(不破 conc+ABS 绝对底);conc==0 且头寸够 → 保持(不缩回 min)。
                 local at_pressure = (conc >= cur * opts.adaptive_cc_pressure_frac) or ((cur - conc) < ABS)
                 local at_slack    = (conc > 0) and (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
+                local prev = cur
                 if at_pressure then
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired
                 elseif at_slack and cur > initcc then
                     -- Low traffic shrinks only down to init, never below it; only overload goes under init.
-                    -- When cc is already below init (after an overload), slack leaves it alone.
                     cur = math.max(cur * DEC, desired, initcc) -- 缩,但不低于 desired(留 ABS 绝对底)
+                end
+                -- Below init (an overload pushed it there) and healthy again: climb back toward init by
+                -- xINC per tick, whatever the traffic. Without this, a trickle of requests keeps rewriting
+                -- cc near its post-overload low so it never expires, and the next burst is capped far below
+                -- init. Gradual rather than a jump, so a backend that just recovered is not hit at once.
+                if prev < initcc then
+                    cur = math.max(cur, math.min(prev * INC, initcc))
                 end
             end
         end

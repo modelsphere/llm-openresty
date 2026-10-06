@@ -557,7 +557,8 @@ function M.derive_mincc(opts, maxcc)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
--- M.derive_initcc(opts, maxcc, mincc) — AIMD starting point and slack-shrink floor.
+-- M.derive_initcc(opts, maxcc, mincc) — AIMD starting point, slack-shrink floor, and the level a
+-- healthy pool climbs back to (xINC per tick) after overload pushed it below.
 -- Explicit adaptive_cc_init wins, then adaptive_cc_init_frac × static maxcc, else mincc.
 -- Clamped into [mincc, maxcc]. Same base as derive_mincc (static maxcc, no ban), so the
 -- value /_tps_status reports is the value do_route and the timer enforce.

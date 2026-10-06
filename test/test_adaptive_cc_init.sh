@@ -7,7 +7,8 @@
 #   ② fresh pool admits ~init concurrent requests (control admits ~min)
 #   ③ slack shrink stops at init (control keeps shrinking toward real concurrency)
 #   ④ overload shrink still goes below init
-#   ⑤ after the cc value expires the pool restarts from init, not min
+#   ⑤ after an overload, a healthy trickle climbs cc back to init
+#   ⑥ after the cc value expires the pool restarts from init, not min
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
@@ -45,7 +46,7 @@ cat <<'EOF'
     _G.TPS_BUCKETS = {5,10,20,40,80,150,300}
     _G.ADAPTIVE_CC_MIN_FRAC = 0.4   -- pinned: only explicit adaptive_cc_min=2 is used below
     -- static max = 2 peers x 100 = 200, min = 2, ABS = 0 so only the relative gates and init matter.
-    -- Short cc TTL (6s) + tps_ttl 8s so the expiry check (⑤) fits in the run.
+    -- Short cc TTL (6s) + tps_ttl 8s so the expiry check (⑥) fits in the run.
     local peers = {{"127.0.0.1",28971,"m1",0,100},{"127.0.0.1",28972,"m2",0,100}}
     local base = {peers=peers, tps_limit_tps=50, rt_limit_factor=1, adaptive_cc=true, adaptive_cc_min=2,
                   adaptive_cc_abs=0, adaptive_cc_interval=2, adaptive_cc_dec=0.5, adaptive_cc_inc=2.0,
@@ -123,13 +124,21 @@ c20o=$(fv $IN20 adaptive_cc); ev=$(fv $IN20 ewma_tps)
 echo "  overload: in20 cc=$c20o ewma=$ev"
 awk "BEGIN{exit !($(num $c20o)>=2 && $(num $c20o)<20)}" && ok "④ overload shrinks below init (cc=$c20o)" || no "④ overload cc=$c20o, want 2<=cc<20"
 
-# ⑤ idle until the EWMA (8s) and the cc value (6s) expire, then a burst starts from init again
+# ⑤ after the overload, light healthy traffic (~1-2 in flight) must bring cc back up to init.
+#   The trickle keeps the EWMA alive, so cc never expires; only the climb-back can restore it.
+load_n $IN20 1 20
+c20r=$(fv $IN20 adaptive_cc)
+echo "  light load after overload: in20 cc=$c20r (was $c20o)"
+[ "$c20r" = "20" ] && ok "⑤ healthy trickle climbs back to init (cc $c20o → $c20r)" || no "⑤ cc=$c20r after recovery, want 20"
+
+
+# ⑥ idle until the EWMA (8s) and the cc value (6s) expire, then a burst starts from init again
 sleep 22
 ce=$(fv $IN20 adaptive_cc)
-[ "$ce" = "None" ] && ok "⑤ cc expired after idle" || no "⑤ cc=$ce still set after idle"
+[ "$ce" = "None" ] && ok "⑥ cc expired after idle" || no "⑥ cc=$ce still set after idle"
 a20e=$(burst_ok $IN20 25)
 echo "  burst after expiry: in20 admitted=$a20e"
-[ "$a20e" -ge 17 ] && [ "$a20e" -le 21 ] && ok "⑤ restarts from init, not min (admitted=$a20e)" || no "⑤ admitted $a20e after expiry, want 17..21"
+[ "$a20e" -ge 17 ] && [ "$a20e" -le 21 ] && ok "⑥ restarts from init, not min (admitted=$a20e)" || no "⑥ admitted $a20e after expiry, want 17..21"
 
 echo "==== 结果: PASS=$P FAIL=$F ===="
 [ "$F" -eq 0 ] && echo "ALL GOOD" || echo "HAS FAILURES"
