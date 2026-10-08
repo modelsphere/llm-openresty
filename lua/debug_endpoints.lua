@@ -357,7 +357,9 @@ function _G.dbg_tps_status(opts)
     -- + 当前并发 rt_sum(do_route 存的、timer 判压力用的那个,全 peer 含 banned 的真实在途)+ 是否到爬升压力门。
     local adaptive_cc, adaptive_cc_min, adaptive_cc_max, adaptive_cc_conc, adaptive_cc_at_pressure, adaptive_cc_at_slack, adaptive_cc_rej
     local adaptive_cc_init
+    local hold_when_idle
     if opts.adaptive_cc then
+        hold_when_idle = opts.adaptive_cc_hold_when_idle == true   -- not `x and true or false`-style: keeps false
         adaptive_cc, adaptive_cc_min, adaptive_cc_max, adaptive_cc_init = {}, {}, {}, {}
         adaptive_cc_conc, adaptive_cc_at_pressure, adaptive_cc_at_slack, adaptive_cc_rej = {}, {}, {}, {}
         local ABS = opts.adaptive_cc_abs or 0
@@ -379,7 +381,8 @@ function _G.dbg_tps_status(opts)
             local c = rts or 0
             adaptive_cc_at_pressure[mkey] = (cc and ((c >= cc * opts.adaptive_cc_pressure_frac) or ((cc - c) < ABS))) and true or false
             adaptive_cc_at_slack[mkey]    = (cc and c > 0 and (c < cc * opts.adaptive_cc_slack_frac) and ((cc - c) > ABS)
-                                             and cc > adaptive_cc_init[mkey]) and true or false   -- slack stops at init
+                                             and cc > adaptive_cc_init[mkey] and not opts.adaptive_cc_hold_when_idle)
+                                             and true or false   -- slack stops at init; never fires with hold
         end
         if opts.peers_by_model then
             for m in pairs(opts.peers_by_model) do fill_cc(m, m) end
@@ -458,6 +461,7 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_min       = adaptive_cc_min,     -- 生效下限(显式配 or 静态max×frac 派生)
         adaptive_cc_max       = adaptive_cc_max,     -- 静态池容量(=AIMD max clamp)
         adaptive_cc_init      = adaptive_cc_init,    -- start point + slack-shrink floor (= min unless configured)
+        adaptive_cc_hold_when_idle = hold_when_idle,   -- true/false when adaptive_cc is on, absent otherwise
         adaptive_cc_conc      = adaptive_cc_conc,    -- 当前并发 rt_sum(do_route 存,timer 判压力用,全 peer 含 banned;nil=无近期流量)
         adaptive_cc_at_pressure = adaptive_cc_at_pressure,  -- 健康时下一tick 会涨(conc>=cc×pressure_frac)
         adaptive_cc_at_slack    = adaptive_cc_at_slack,     -- 健康时下一tick 会缩(0<conc<cc×slack_frac;conc=0保持)

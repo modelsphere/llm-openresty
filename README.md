@@ -146,6 +146,11 @@ fresh or expired limit starts there, and low traffic shrinks the limit only down
 Only overload pushes the limit below `init`, toward `min`; once the backend is healthy again
 the limit climbs back to `init` by the normal growth factor per interval, even under light
 traffic. Without it, `init` equals `min`.
+Setting `adaptive_cc_hold_when_idle = true` stops low or absent traffic from lowering the
+limit at all: no low-traffic shrink and the value never expires, while growth under
+pressure and overload shrink work as usual. It holds whatever value the limit has, including
+one an overload pushed below `init`: after such an overload followed by an idle period, the
+limit stays low and climbs back to `init` only once traffic returns.
 
 **Content-based rejection (opt-in, off by default).** Rules match the request itself —
 `input_bytes`, `input_chars`, `messages_count`, `max_tokens`, `stream`, or any dotted

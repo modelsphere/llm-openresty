@@ -248,6 +248,10 @@ function _G.register_route(name, opts_factory)
     -- Neither set → init = min (previous behaviour). No global default on purpose.
     opts.adaptive_cc_init          = opts.adaptive_cc_init
     opts.adaptive_cc_init_frac     = opts.adaptive_cc_init_frac
+    -- Optional: hold cc when traffic is low or absent. Skips the slack shrink and writes cc without a
+    -- TTL, so neither a trickle nor a long idle lowers it. Growth (pressure / 429s) and overload shrink
+    -- are unchanged. Off unless set; no global default.
+    opts.adaptive_cc_hold_when_idle = opts.adaptive_cc_hold_when_idle
     opts.adaptive_cc_interval      = opts.adaptive_cc_interval      or opts.tps_window  -- AIMD 步长,默认=tps_window
     opts.adaptive_cc_dec           = opts.adaptive_cc_dec           or _G.ADAPTIVE_CC_DEC  -- EWMA<阈值 → ×dec(减)
     opts.adaptive_cc_inc           = opts.adaptive_cc_inc           or _G.ADAPTIVE_CC_INC  -- EWMA>=阈值 → ×inc(增)
@@ -324,6 +328,12 @@ function _G.register_route(name, opts_factory)
                             " is invalid (need 0 < frac <= 1) - ignored")
                     opts.adaptive_cc_init_frac = nil
                 end
+            end
+            -- Must be a real boolean: a string like "yes" would be truthy in Lua and silently turn it on.
+            if opts.adaptive_cc_hold_when_idle ~= nil and type(opts.adaptive_cc_hold_when_idle) ~= "boolean" then
+                ngx.log(ngx.ERR, "[", name, "] adaptive_cc_hold_when_idle=", tostring(opts.adaptive_cc_hold_when_idle),
+                        " is invalid (need true/false) - treated as false")
+                opts.adaptive_cc_hold_when_idle = nil
             end
         end
     end

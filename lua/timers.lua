@@ -223,7 +223,7 @@ function M.do_adaptive_cc_loop(opts)
                 local prev = cur
                 if at_pressure then
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired
-                elseif at_slack and cur > initcc then
+                elseif at_slack and cur > initcc and not opts.adaptive_cc_hold_when_idle then
                     -- Low traffic shrinks only down to init, never below it; only overload goes under init.
                     cur = math.max(cur * DEC, desired, initcc) -- 缩,但不低于 desired(留 ABS 绝对底)
                 end
@@ -239,7 +239,9 @@ function M.do_adaptive_cc_loop(opts)
         cur = math.max(mincc, math.min(maxcc, cur))
         -- 带 TTL 写入:有 EWMA 信号就刷新(值持续有效);无信号则不写 → CC_TTL 后老化消失 →
         -- assess_pool 读 nil → do_route 回退到 init(= min unless configured)。CC_TTL 远大于 interval,短暂缺口内仍保持当前值。
-        td:set(pre .. "adaptive_cc", cur, CC_TTL)
+        -- hold_when_idle: no TTL (0 = never expires), so a long idle keeps the last value instead of
+        -- falling back to init. Turning the switch off later re-applies the TTL on the next write.
+        td:set(pre .. "adaptive_cc", cur, opts.adaptive_cc_hold_when_idle and 0 or CC_TTL)
     end
 
     local function sample()
