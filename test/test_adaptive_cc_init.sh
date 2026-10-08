@@ -108,14 +108,16 @@ echo "  fresh burst of 25: in20 admitted=$a20  in0 admitted=$a0"
 #   (~1-2 in flight) must bring it back to init and no further, while the control shrinks toward
 #   real concurrency. (A one-shot burst is not enough: no request finishes during it, so there is
 #   no TPS EWMA and the timer does not write cc at all.)
-load_n $IN20 22 10
-cpk=$(fv $IN20 adaptive_cc)
+#   The control is pushed up the same way, otherwise it sits at min and "it shrank" proves nothing.
+( load_n $IN20 22 10 ) & ( load_n $IN0 22 10 ) & wait
+cpk=$(fv $IN20 adaptive_cc); c0pk=$(fv $IN0 adaptive_cc)
 awk "BEGIN{exit !($(num $cpk)>20)}" && ok "③ high load pushed in20 above init first (cc=$cpk)" || no "③ in20 cc=$cpk after high load, want >20"
+awk "BEGIN{exit !($(num $c0pk)>20)}" && ok "③ high load pushed control above 20 too (cc=$c0pk)" || no "③ control cc=$c0pk after high load, want >20"
 ( load_n $IN20 1 16 ) & ( load_n $IN0 1 16 ) & wait
 c20=$(fv $IN20 adaptive_cc); c0=$(fv $IN0 adaptive_cc); k20=$(fv $IN20 adaptive_cc_conc)
 echo "  light load: in20 cc=$c20 (conc=$k20)  in0 cc=$c0"
 [ "$c20" = "20" ] && ok "③ slack shrink stops at init (cc=$c20)" || no "③ in20 cc=$c20, want 20"
-awk "BEGIN{exit !($(num $c0)>0 && $(num $c0)<10)}" && ok "③ control tracks real concurrency (cc=$c0)" || no "③ control cc=$c0, want 0<cc<10"
+awk "BEGIN{exit !($(num $c0)>0 && $(num $c0)<10)}" && ok "③ control shrank from $c0pk toward real concurrency (cc=$c0)" || no "③ control cc=$c0 (was $c0pk), want 0<cc<10"
 [ "$(fv $IN20 adaptive_cc_at_slack)" = "False" ] && ok "③ /_tps_status at_slack=false at init" || no "③ at_slack not false at init"
 
 # ④ overload (slow decode: 60ms/token ≈ 16 tok/s < 50) → cc may go below init
