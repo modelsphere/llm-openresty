@@ -138,8 +138,10 @@ end
 --   中间保持(防抖带)。防轻流量下 cc 跑飞到 max、也防忙→闲后卡在旧峰值。clamp 在 [min, 静态max]。
 --   写入 tps_dict "<route>[:<model>]:adaptive_cc",**带 TTL(adaptive_cc_ttl)**:有信号每 tick 刷新;
 --   EWMA 过期(nil,无信号)→ 本 tick 不写 → 值持续无信号超 TTL 后老化消失 → assess_pool 读 nil →
---   do_route 回退到 min 慢启动(不从满容量开始;健康则 ×inc 逐步爬回)。短暂信号缺口内(<TTL)仍保持
---   当前值。阈值/max/min 在 timer 内解析,不读 ngx.ctx。
+--   do_route falls back to init (= min unless configured; healthy traffic then climbs x inc per tick).
+--   Short gaps (< TTL) keep the current value. Thresholds/max/min are resolved in the timer, not from ngx.ctx.
+--   With adaptive_cc_init set, "min" above reads "init" for the start point and the slack floor;
+--   min stays the floor for overload shrink only (see route.derive_initcc).
 -- ══════════════════════════════════════════════════════════════════════
 function M.do_adaptive_cc_loop(opts)
     if not opts.adaptive_cc then return end   -- 门控:未 opt-in 不启 timer
@@ -183,12 +185,13 @@ function M.do_adaptive_cc_loop(opts)
         local maxcc = route.compute_static_max_cc(opts, model)
         if maxcc <= 0 then return end
         local mincc = route.derive_mincc(opts, maxcc)
+        local initcc = route.derive_initcc(opts, maxcc, mincc)   -- start point + slack-shrink floor
         -- ⚠️ 只用来判断"本路由到底有没有可判定的阈值",不参与比较 —— 过载判定走 ta.hit
         --    (tps_assess 遍历声明的指标列表做 OR)和 ttft_over。
         -- 取自 tps_assess 而不是 thr_for:后者只看「静态 + override」,漏掉指标表 →
         --    「只声明了 tps_metrics」的路由会 ta.hit=true 却整段 AIMD 被跳过(静默冻结 cc)。
         local has_threshold = ta.has_threshold
-        local cur = td:get(pre .. "adaptive_cc") or mincc   -- 首次/过期 → 从 min 起步(慢启动,健康则 ×inc 爬升)
+        local cur = td:get(pre .. "adaptive_cc") or initcc  -- fresh/expired → start from init (= min unless configured)
         -- 修复1:读+清零本区间被压抑需求(并发 429 数)。>0 = 需求超过 cc、被拒的量 rt_sum 看不到。
         local rej = td:get(pre .. "rej") or 0
         if rej > 0 then td:delete(pre .. "rej") end
@@ -217,17 +220,28 @@ function M.do_adaptive_cc_loop(opts)
                 --   涨/缩都向 desired 收(不破 conc+ABS 绝对底);conc==0 且头寸够 → 保持(不缩回 min)。
                 local at_pressure = (conc >= cur * opts.adaptive_cc_pressure_frac) or ((cur - conc) < ABS)
                 local at_slack    = (conc > 0) and (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
+                local prev = cur
                 if at_pressure then
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired
-                elseif at_slack then
-                    cur = math.max(cur * DEC, desired)        -- 缩,但不低于 desired(留 ABS 绝对底)
+                elseif at_slack and cur > initcc and not opts.adaptive_cc_hold_when_idle then
+                    -- Low traffic shrinks only down to init, never below it; only overload goes under init.
+                    cur = math.max(cur * DEC, desired, initcc) -- shrink, but not below desired (keeps the ABS headroom) or init
+                end
+                -- Below init (an overload pushed it there) and healthy again: climb back toward init by
+                -- xINC per tick, whatever the traffic. Without this, a trickle of requests keeps rewriting
+                -- cc near its post-overload low so it never expires, and the next burst is capped far below
+                -- init. Gradual rather than a jump, so a backend that just recovered is not hit at once.
+                if prev < initcc then
+                    cur = math.max(cur, math.min(prev * INC, initcc))
                 end
             end
         end
         cur = math.max(mincc, math.min(maxcc, cur))
         -- 带 TTL 写入:有 EWMA 信号就刷新(值持续有效);无信号则不写 → CC_TTL 后老化消失 →
-        -- assess_pool 读 nil → do_route 回退到 min 慢启动。CC_TTL 远大于 interval,短暂缺口内仍保持当前值。
-        td:set(pre .. "adaptive_cc", cur, CC_TTL)
+        -- assess_pool reads nil -> do_route falls back to init (= min unless configured). CC_TTL is much longer than the interval, so short gaps keep the current value.
+        -- hold_when_idle: no TTL (0 = never expires), so a long idle keeps the last value instead of
+        -- falling back to init. Turning the switch off later re-applies the TTL on the next write.
+        td:set(pre .. "adaptive_cc", cur, opts.adaptive_cc_hold_when_idle and 0 or CC_TTL)
     end
 
     local function sample()

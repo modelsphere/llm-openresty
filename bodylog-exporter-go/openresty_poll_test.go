@@ -21,7 +21,7 @@ func newMockOpenresty(t *testing.T) *httptest.Server {
 			_, _ = w.Write([]byte(`{"route":"r1","active_level":2,"limit":100,"healthy_peers_in_level":2,` +
 				`"by_priority":{"2":{"peers":[{"name":"n1","peer":"10.0.0.5:8050","banned":false,"active":5,"max":50}]}}}`))
 		case "/r1/_tps_status":
-			_, _ = w.Write([]byte(`{"active":true,"ewma_tps":{"_":123.0},"adaptive_cc":{"_":45.0}}`))
+			_, _ = w.Write([]byte(`{"active":true,"ewma_tps":{"_":123.0},"adaptive_cc":{"_":45.0},"adaptive_cc_init":{"_":20.0}}`))
 		case "/r1/_ttft_status":
 			_, _ = w.Write([]byte(`{"active":false,"ewma_ms":{"_":800.0}}`))
 		case "/r1/_429_status":
@@ -61,10 +61,11 @@ func TestPollerServiceLabel(t *testing.T) {
 		{"active_level", testutil.ToFloat64(m.activeLevel.WithLabelValues(svc, route))},
 		{"peer_active", testutil.ToFloat64(m.peerActive.WithLabelValues(svc, route, "10.0.0.5:8050", "n1", "2"))},
 		{"tps_ewma", testutil.ToFloat64(m.tpsEwma.WithLabelValues(svc, route, "_"))},
+		{"adaptive_cc_init", testutil.ToFloat64(m.adaptiveCCInit.WithLabelValues(svc, route, "_"))},
 		{"ttft_ewma", testutil.ToFloat64(m.ttftEwma.WithLabelValues(svc, route, "_"))},
 		{"rejected_concurrency", testutil.ToFloat64(m.rejected.WithLabelValues(svc, route, "concurrency"))},
 	}
-	want := map[string]float64{"active_level": 2, "peer_active": 5, "tps_ewma": 123, "ttft_ewma": 800, "rejected_concurrency": 10}
+	want := map[string]float64{"active_level": 2, "peer_active": 5, "tps_ewma": 123, "adaptive_cc_init": 20, "ttft_ewma": 800, "rejected_concurrency": 10}
 	for _, c := range checks {
 		if c.val != want[c.name] {
 			t.Errorf("%s{service=%q,route=%q} = %v, 想要 %v", c.name, svc, route, c.val, want[c.name])

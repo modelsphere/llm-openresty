@@ -243,10 +243,19 @@ function _G.register_route(name, opts_factory)
     end
     opts.adaptive_cc_min           = opts.adaptive_cc_min           -- 可选下限;不配 = 按 min_frac 从静态 max 派生
     opts.adaptive_cc_min_frac      = opts.adaptive_cc_min_frac      or _G.ADAPTIVE_CC_MIN_FRAC  -- min 缺省 = 静态max×frac(≥1)
+    -- Optional starting point inside [min, max]: a fresh/expired cc starts here, and the slack
+    -- (low-traffic) shrink stops here instead of at min. Overload shrink can still go down to min.
+    -- Neither set → init = min (previous behaviour). No global default on purpose.
+    opts.adaptive_cc_init          = opts.adaptive_cc_init
+    opts.adaptive_cc_init_frac     = opts.adaptive_cc_init_frac
+    -- Optional: hold cc when traffic is low or absent. Skips the slack shrink and writes cc without a
+    -- TTL, so neither a trickle nor a long idle lowers it. Growth (pressure / 429s) and overload shrink
+    -- are unchanged. Off unless set; no global default.
+    opts.adaptive_cc_hold_when_idle = opts.adaptive_cc_hold_when_idle
     opts.adaptive_cc_interval      = opts.adaptive_cc_interval      or opts.tps_window  -- AIMD 步长,默认=tps_window
     opts.adaptive_cc_dec           = opts.adaptive_cc_dec           or _G.ADAPTIVE_CC_DEC  -- EWMA<阈值 → ×dec(减)
     opts.adaptive_cc_inc           = opts.adaptive_cc_inc           or _G.ADAPTIVE_CC_INC  -- EWMA>=阈值 → ×inc(增)
-    -- adaptive_cc 值的 TTL:长时间无 EWMA 信号(过期)→ 值老化消失 → 回退到 min(慢启动,不从满容量开始)。
+    -- TTL of the adaptive_cc value: with no EWMA signal for this long it expires and the pool falls back to init (= min unless configured).
     -- 全局默认 _G.ADAPTIVE_CC_TTL(300s/5min):短暂信号缺口内保持,持续无信号才复位到 min。
     opts.adaptive_cc_ttl           = opts.adaptive_cc_ttl           or _G.ADAPTIVE_CC_TTL
     -- 爬升压力系数:cc 只在 当前并发 >= cc×frac(顶到边缘/在造成429)时才 ×inc(防轻流量跑飞)
@@ -300,6 +309,31 @@ function _G.register_route(name, opts_factory)
                 else
                     opts.adaptive_cc_min = math.floor(opts.adaptive_cc_min)
                 end
+            end
+            -- init must be a number >= 1 (absolute) / in (0, 1] (fraction of static max); otherwise
+            -- ignore it and fall back to init = min, the pre-init behaviour.
+            if opts.adaptive_cc_init ~= nil then
+                if type(opts.adaptive_cc_init) ~= "number" or opts.adaptive_cc_init < 1 then
+                    ngx.log(ngx.ERR, "[", name, "] adaptive_cc_init=", tostring(opts.adaptive_cc_init),
+                            " is invalid (need >= 1) - ignored")
+                    opts.adaptive_cc_init = nil
+                else
+                    opts.adaptive_cc_init = math.floor(opts.adaptive_cc_init)
+                end
+            end
+            if opts.adaptive_cc_init_frac ~= nil then
+                if type(opts.adaptive_cc_init_frac) ~= "number"
+                   or opts.adaptive_cc_init_frac <= 0 or opts.adaptive_cc_init_frac > 1 then
+                    ngx.log(ngx.ERR, "[", name, "] adaptive_cc_init_frac=", tostring(opts.adaptive_cc_init_frac),
+                            " is invalid (need 0 < frac <= 1) - ignored")
+                    opts.adaptive_cc_init_frac = nil
+                end
+            end
+            -- Must be a real boolean: a string like "yes" would be truthy in Lua and silently turn it on.
+            if opts.adaptive_cc_hold_when_idle ~= nil and type(opts.adaptive_cc_hold_when_idle) ~= "boolean" then
+                ngx.log(ngx.ERR, "[", name, "] adaptive_cc_hold_when_idle=", tostring(opts.adaptive_cc_hold_when_idle),
+                        " is invalid (need true/false) - treated as false")
+                opts.adaptive_cc_hold_when_idle = nil
             end
         end
     end
@@ -475,8 +509,9 @@ function M.assess_pool(opts, peers, peer_keys)
 
     -- 自适应并发上限(AIMD;do_adaptive_cc_loop 每 interval 写入,带 TTL)。经 tps_dict_if_on 读:
     -- __off / _G.TPS_ENABLED 是**所有 tps 限流的统一开关**——关它则 tpd=nil → adaptive_cc=nil 且 tps_on=false,
-    -- do_route 回退 pool_limit(统一关 = 回满容量,零滞后)。特性开(tps_on=true)但 cc=nil(首次/未初始化/
-    -- 无信号 TTL 过期)→ do_route 回退到 min 慢启动。两种 nil 由 tps_on 区分(见 do_route)。
+    -- do_route falls back to pool_limit (turning it all off restores full capacity, with no lag).
+    -- Feature on (tps_on=true) but cc=nil (first use / not initialised / expired for lack of signal) ->
+    -- do_route falls back to init (= min unless configured). tps_on tells the two nils apart (see do_route).
     local adaptive_cc, tps_prefix
     if tpd and opts.adaptive_cc then
         tps_prefix  = tps.tps_key_prefix(opts)           -- 算一次,do_route stash rt_sum 复用(免热路径重算)
@@ -530,6 +565,23 @@ function M.derive_mincc(opts, maxcc)
     local mn = opts.adaptive_cc_min or math.max(1, math.floor(maxcc * opts.adaptive_cc_min_frac))
     if mn > maxcc then mn = maxcc end     -- 配 min>max(或 frac>1 派生越界)→ 生效 min=max
     return mn
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- M.derive_initcc(opts, maxcc, mincc) — AIMD starting point, slack-shrink floor, and the level a
+-- healthy pool climbs back to (xINC per tick) after overload pushed it below.
+-- Explicit adaptive_cc_init wins, then adaptive_cc_init_frac × static maxcc, else mincc.
+-- Clamped into [mincc, maxcc]. Same base as derive_mincc (static maxcc, no ban), so the
+-- value /_tps_status reports is the value do_route and the timer enforce.
+-- ══════════════════════════════════════════════════════════════════════
+function M.derive_initcc(opts, maxcc, mincc)
+    local it = opts.adaptive_cc_init
+    if not it and opts.adaptive_cc_init_frac then
+        it = math.max(1, math.floor(maxcc * opts.adaptive_cc_init_frac))
+    end
+    if not it or it < mincc then it = mincc end
+    if it > maxcc then it = maxcc end
+    return it
 end
 
 -- ══════════════════════════════════════════════════════════════════════

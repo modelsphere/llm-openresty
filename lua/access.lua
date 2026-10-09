@@ -152,15 +152,15 @@ function _G.do_route(opts)
     local limit        = pool_limit
     -- 自适应并发(opt-in,与 TPS 硬熔断互斥):把池 limit 换成动态 adaptive_cc,hit_rt/hit_avg 一起收缩。
     -- 动态值不超当前健康池容量(有 peer 被 ban → pool_limit 降 → limit 跟着降,尊重实际容量)。
-    -- cc 未初始化/过期(nil)→ 从 min 起步(慢启动,不从满容量开始);有值则 min(cc, pool_limit)。
+    -- cc unset or expired (nil) -> start from init (= min unless adaptive_cc_init is set); otherwise min(cc, pool_limit).
     -- mincc 从**静态** maxcc 派生(derive_mincc,与 loop/dbg 同 base,报告==强制),再由外层 min(., pool_limit)
     -- 做 ban 感知封顶 —— base 不掺 ban,避免 dbg 报的 floor 与实际强制的 floor 在 peer-ban 下分叉。
     -- ⚠️ 仅当 tps 特性生效(a.tps_on)才套 min 起步:__off/_G.TPS_ENABLED 关时 tps_on=false →
     -- 保持 pool_limit(统一关掉 tps 限流 = 回满容量,不能反而掉到 min)。
     if opts.adaptive_cc and a.tps_on then
-        local mincc = route.derive_mincc(opts, route.compute_static_max_cc(opts,
-            opts.peers_by_model and ngx.ctx.req_model or nil))
-        limit = math.min(a.adaptive_cc or mincc, pool_limit)
+        local maxcc = route.compute_static_max_cc(opts, opts.peers_by_model and ngx.ctx.req_model or nil)
+        local initcc = route.derive_initcc(opts, maxcc, route.derive_mincc(opts, maxcc))
+        limit = math.min(a.adaptive_cc or initcc, pool_limit)   -- cc not set yet / expired → init
         -- 把已算好的实时并发 a.rt_sum(全 peer 含 banned 的真实在途,与下方 hit_rt 判 429 同一个值)存给 timer:
         -- do_adaptive_cc_loop 据此判压力(顶到 cc 才涨、余量太大则缩)。key 复用 a.tps_prefix(assess_pool 已算)。
         -- TTL 取 max(tps_ttl, interval×3):至少活到 ewma 过期,避免"ewma 还在但 rt_sum 过期成 0 → 拒绝爬/误缩"。
