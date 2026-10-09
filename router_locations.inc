@@ -51,6 +51,10 @@
         # body-log: 累积 SSE 响应 chunk 到 ngx.ctx (无锁，仅 active 时执行)
         body_filter_by_lua_block {
             _G.bodylog_filter_chunk()
+            -- response post-processing (framework skeleton). No-op unless the route
+            -- sets opts.postprocess. Runs AFTER bodylog so bodylog still captures the
+            -- raw upstream body, while the client sees the post-processed one.
+            _G.do_postprocess_body(_G.__route_opts[ngx.var.route])
         }
 
         # 路由决策不再写到响应 header（X-Routed-Session/Source/Mode/Retries 已删除，
@@ -59,6 +63,10 @@
         # 值为 <ip:port>[/<GPU型号>]。开关关时不写，行为与删除前一致。
         header_filter_by_lua_block {
             _G.do_emit_peer_header(_G.__route_opts[ngx.var.route])
+            -- response post-processing (framework skeleton). Selects the per-route
+            -- handler once and lets it adjust response headers. No-op unless the
+            -- route sets opts.postprocess.
+            _G.do_postprocess_header(_G.__route_opts[ngx.var.route])
         }
         # peer 连接失败/超时/502/503 时自动重试下一个 fallback peer
         # （配合 balancer_by_lua 的 set_more_tries 生效）
