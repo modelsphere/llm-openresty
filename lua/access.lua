@@ -362,14 +362,13 @@ function _G.do_log_release(opts)
         local v = d:incr(ngx.ctx.peer_counter_key, -1, 0)
         if v and v < 0 then d:set(ngx.ctx.peer_counter_key, 0) end
     end
-    -- TTFT 入账(ttft_window 秒窗口直方图 → 每窗口 P80 折进 EWMA;总开关关 / dict 未声明则跳过=特性关)。
-    -- 只采流式 + 2xx + 有首-chunk 计时的请求(含半开探测放行的请求)。
-    -- 窗口边界 lazy 折叠;EWMA 带 TTL 做无流量自愈(流量停 → 过期 → assess_pool 读 nil → 放行)。
-    local td = ttft.ttft_dict_if_on(opts)
-    if td and ngx.ctx.ttft_is_stream and ngx.ctx.ttft_first_chunk_t
-       and ngx.status and ngx.status >= 200 and ngx.status < 300 then
-        ttft.ttft_record(opts, td, ngx.ctx.ttft_first_chunk_t * 1000)   -- 秒 → 毫秒
-    end
+    -- TTFT recording moved forward to the first-chunk branch of bodylog_filter_chunk
+    -- (body_filter phase); it is no longer folded into the EWMA here at log time.
+    -- On a long stream, waiting until request end lagged the overload signal by a
+    -- whole request duration. The gate (ttft_is_stream + 2xx + first-chunk timing) is
+    -- unchanged, only earlier. See bodylog.lua.
+    -- TPS recording stays here: it needs completion_tokens, which only appears at the
+    -- stream tail, so it cannot be moved earlier.
     -- TPS 入账:2xx 即采,**流式与非流式一视同仁**。从尾缓冲 parse completion_tokens;
     -- 拿不到(no-usage)→ fail-open:不采样、不进 EWMA、绝不因此限流(只 incr nousage 计数做可观测)。
     -- ⚠️ 2026-09-07 口径变更(两处同步改:本文件 + bodylog-exporter-go/metrics.go):

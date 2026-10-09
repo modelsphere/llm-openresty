@@ -6,6 +6,7 @@
 --   * 内部 helper 用 local;仅这些【入口点】仍挂 _G——被 nginx.conf / router_locations.inc 的
 --     *_by_lua_block(或 per-model conf 的 set_by_lua)直接按名调用,无 module 句柄可用:
 --       do_route / do_log_release / do_balancer(access)、bodylog_filter_chunk(bodylog)、
+--       do_postprocess_header / do_postprocess_body(postprocess)、
 --       register_route(route)、dbg_*(debug_endpoints)。
 --   * config 数据(PEERS / __route_opts / TTFT_* / TPS_* / ADAPTIVE_CC_* / KIMI_* / BODYLOG_* / …)
 --     仍留 _G:由 session_route.conf / 各 session_route_<model>.conf 的 lua block 直读直写(用户配置面)。
@@ -15,6 +16,7 @@
 
 require "util"
 require "reqtransform"
+require "postprocess"
 require "bodylog"
 require "route"
 require "reject_rules"
