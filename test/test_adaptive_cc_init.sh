@@ -142,5 +142,5 @@ a20e=$(burst_ok $IN20 25)
 echo "  burst after expiry: in20 admitted=$a20e"
 [ "$a20e" -ge 17 ] && [ "$a20e" -le 21 ] && ok "⑥ restarts from init, not min (admitted=$a20e)" || no "⑥ admitted $a20e after expiry, want 17..21"
 
-echo "==== 结果: PASS=$P FAIL=$F ===="
+echo "==== result: PASS=$P FAIL=$F ===="
 [ "$F" -eq 0 ] && echo "ALL GOOD" || echo "HAS FAILURES"

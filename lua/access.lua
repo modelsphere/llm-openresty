@@ -152,7 +152,7 @@ function _G.do_route(opts)
     local limit        = pool_limit
     -- 自适应并发(opt-in,与 TPS 硬熔断互斥):把池 limit 换成动态 adaptive_cc,hit_rt/hit_avg 一起收缩。
     -- 动态值不超当前健康池容量(有 peer 被 ban → pool_limit 降 → limit 跟着降,尊重实际容量)。
-    -- cc 未初始化/过期(nil)→ 从 init 起步(= min unless adaptive_cc_init is set);有值则 min(cc, pool_limit)。
+    -- cc unset or expired (nil) -> start from init (= min unless adaptive_cc_init is set); otherwise min(cc, pool_limit).
     -- mincc 从**静态** maxcc 派生(derive_mincc,与 loop/dbg 同 base,报告==强制),再由外层 min(., pool_limit)
     -- 做 ban 感知封顶 —— base 不掺 ban,避免 dbg 报的 floor 与实际强制的 floor 在 peer-ban 下分叉。
     -- ⚠️ 仅当 tps 特性生效(a.tps_on)才套 min 起步:__off/_G.TPS_ENABLED 关时 tps_on=false →

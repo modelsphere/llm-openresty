@@ -126,5 +126,5 @@ ho=$(fv $HOLD adaptive_cc)
 echo "  overload: hold cc=$ho (was $hi)"
 awk "BEGIN{exit !($(num $ho)>=2 && $(num $ho)<$(num $hi))}" && ok "⑥ overload still shrinks the held cc ($hi → $ho)" || no "⑥ hold cc=$ho after overload, want < $hi"
 
-echo "==== 结果: PASS=$P FAIL=$F ===="
+echo "==== result: PASS=$P FAIL=$F ===="
 [ "$F" -eq 0 ] && echo "ALL GOOD" || echo "HAS FAILURES"

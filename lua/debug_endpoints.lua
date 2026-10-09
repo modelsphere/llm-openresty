@@ -457,7 +457,7 @@ function _G.dbg_tps_status(opts)
         probe_used_cur_window = td and (td:get(rp .. "probe:" .. win) or 0) or 0,
         -- 自适应并发(adaptive_cc=true 时才有;与 TPS 硬熔断互斥)
         adaptive_cc_on        = opts.adaptive_cc and true or false,
-        adaptive_cc           = adaptive_cc,         -- 各子池当前动态并发上限(nil=未初始化/过期,do_route 回退到 init(= min unless configured))
+        adaptive_cc           = adaptive_cc,         -- current dynamic limit per sub-pool (nil = unset/expired; do_route falls back to init, = min unless configured)
         adaptive_cc_min       = adaptive_cc_min,     -- 生效下限(显式配 or 静态max×frac 派生)
         adaptive_cc_max       = adaptive_cc_max,     -- 静态池容量(=AIMD max clamp)
         adaptive_cc_init      = adaptive_cc_init,    -- start point + slack-shrink floor (= min unless configured)

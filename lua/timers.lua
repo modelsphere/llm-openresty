@@ -138,8 +138,8 @@ end
 --   中间保持(防抖带)。防轻流量下 cc 跑飞到 max、也防忙→闲后卡在旧峰值。clamp 在 [min, 静态max]。
 --   写入 tps_dict "<route>[:<model>]:adaptive_cc",**带 TTL(adaptive_cc_ttl)**:有信号每 tick 刷新;
 --   EWMA 过期(nil,无信号)→ 本 tick 不写 → 值持续无信号超 TTL 后老化消失 → assess_pool 读 nil →
---   do_route 回退到 init(= min unless configured;健康则 ×inc 逐步爬回)。短暂信号缺口内(<TTL)仍保持
---   当前值。阈值/max/min 在 timer 内解析,不读 ngx.ctx。
+--   do_route falls back to init (= min unless configured; healthy traffic then climbs x inc per tick).
+--   Short gaps (< TTL) keep the current value. Thresholds/max/min are resolved in the timer, not from ngx.ctx.
 --   With adaptive_cc_init set, "min" above reads "init" for the start point and the slack floor;
 --   min stays the floor for overload shrink only (see route.derive_initcc).
 -- ══════════════════════════════════════════════════════════════════════
@@ -225,7 +225,7 @@ function M.do_adaptive_cc_loop(opts)
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired
                 elseif at_slack and cur > initcc and not opts.adaptive_cc_hold_when_idle then
                     -- Low traffic shrinks only down to init, never below it; only overload goes under init.
-                    cur = math.max(cur * DEC, desired, initcc) -- 缩,但不低于 desired(留 ABS 绝对底)
+                    cur = math.max(cur * DEC, desired, initcc) -- shrink, but not below desired (keeps the ABS headroom) or init
                 end
                 -- Below init (an overload pushed it there) and healthy again: climb back toward init by
                 -- xINC per tick, whatever the traffic. Without this, a trickle of requests keeps rewriting
@@ -238,7 +238,7 @@ function M.do_adaptive_cc_loop(opts)
         end
         cur = math.max(mincc, math.min(maxcc, cur))
         -- 带 TTL 写入:有 EWMA 信号就刷新(值持续有效);无信号则不写 → CC_TTL 后老化消失 →
-        -- assess_pool 读 nil → do_route 回退到 init(= min unless configured)。CC_TTL 远大于 interval,短暂缺口内仍保持当前值。
+        -- assess_pool reads nil -> do_route falls back to init (= min unless configured). CC_TTL is much longer than the interval, so short gaps keep the current value.
         -- hold_when_idle: no TTL (0 = never expires), so a long idle keeps the last value instead of
         -- falling back to init. Turning the switch off later re-applies the TTL on the next write.
         td:set(pre .. "adaptive_cc", cur, opts.adaptive_cc_hold_when_idle and 0 or CC_TTL)

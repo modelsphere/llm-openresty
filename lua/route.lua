@@ -255,7 +255,7 @@ function _G.register_route(name, opts_factory)
     opts.adaptive_cc_interval      = opts.adaptive_cc_interval      or opts.tps_window  -- AIMD 步长,默认=tps_window
     opts.adaptive_cc_dec           = opts.adaptive_cc_dec           or _G.ADAPTIVE_CC_DEC  -- EWMA<阈值 → ×dec(减)
     opts.adaptive_cc_inc           = opts.adaptive_cc_inc           or _G.ADAPTIVE_CC_INC  -- EWMA>=阈值 → ×inc(增)
-    -- adaptive_cc 值的 TTL:长时间无 EWMA 信号(过期)→ 值老化消失 → 回退到 init(= min unless configured)。
+    -- TTL of the adaptive_cc value: with no EWMA signal for this long it expires and the pool falls back to init (= min unless configured).
     -- 全局默认 _G.ADAPTIVE_CC_TTL(300s/5min):短暂信号缺口内保持,持续无信号才复位到 min。
     opts.adaptive_cc_ttl           = opts.adaptive_cc_ttl           or _G.ADAPTIVE_CC_TTL
     -- 爬升压力系数:cc 只在 当前并发 >= cc×frac(顶到边缘/在造成429)时才 ×inc(防轻流量跑飞)
@@ -509,8 +509,9 @@ function M.assess_pool(opts, peers, peer_keys)
 
     -- 自适应并发上限(AIMD;do_adaptive_cc_loop 每 interval 写入,带 TTL)。经 tps_dict_if_on 读:
     -- __off / _G.TPS_ENABLED 是**所有 tps 限流的统一开关**——关它则 tpd=nil → adaptive_cc=nil 且 tps_on=false,
-    -- do_route 回退 pool_limit(统一关 = 回满容量,零滞后)。特性开(tps_on=true)但 cc=nil(首次/未初始化/
-    -- 无信号 TTL 过期)→ do_route 回退到 init(= min unless configured)。两种 nil 由 tps_on 区分(见 do_route)。
+    -- do_route falls back to pool_limit (turning it all off restores full capacity, with no lag).
+    -- Feature on (tps_on=true) but cc=nil (first use / not initialised / expired for lack of signal) ->
+    -- do_route falls back to init (= min unless configured). tps_on tells the two nils apart (see do_route).
     local adaptive_cc, tps_prefix
     if tpd and opts.adaptive_cc then
         tps_prefix  = tps.tps_key_prefix(opts)           -- 算一次,do_route stash rt_sum 复用(免热路径重算)
