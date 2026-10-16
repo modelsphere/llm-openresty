@@ -380,7 +380,7 @@ function _G.dbg_tps_status(opts)
             --   at_slack    = conc<cc×slack(相对) 且 余量够 cc-conc>ABS(绝对)→ 缩;都 false=保持
             local c = rts or 0
             adaptive_cc_at_pressure[mkey] = (cc and ((c >= cc * opts.adaptive_cc_pressure_frac) or ((cc - c) < ABS))) and true or false
-            adaptive_cc_at_slack[mkey]    = (cc and c > 0 and (c < cc * opts.adaptive_cc_slack_frac) and ((cc - c) > ABS)
+            adaptive_cc_at_slack[mkey]    = (cc and (c < cc * opts.adaptive_cc_slack_frac) and ((cc - c) > ABS)
                                              and cc > adaptive_cc_init[mkey] and not opts.adaptive_cc_hold_when_idle)
                                              and true or false   -- slack stops at init; never fires with hold
         end
@@ -464,7 +464,7 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_hold_when_idle = hold_when_idle,   -- true/false when adaptive_cc is on, absent otherwise
         adaptive_cc_conc      = adaptive_cc_conc,    -- 当前并发 rt_sum(do_route 存,timer 判压力用,全 peer 含 banned;nil=无近期流量)
         adaptive_cc_at_pressure = adaptive_cc_at_pressure,  -- 健康时下一tick 会涨(conc>=cc×pressure_frac)
-        adaptive_cc_at_slack    = adaptive_cc_at_slack,     -- 健康时下一tick 会缩(0<conc<cc×slack_frac;conc=0保持)
+        adaptive_cc_at_slack    = adaptive_cc_at_slack,     -- 健康时下一tick 会缩(conc<cc×slack_frac,含 conc=0)
         adaptive_cc_pressure_frac = opts.adaptive_cc and opts.adaptive_cc_pressure_frac or nil,
         adaptive_cc_slack_frac    = opts.adaptive_cc and opts.adaptive_cc_slack_frac or nil,
         adaptive_cc_abs       = opts.adaptive_cc and opts.adaptive_cc_abs or nil,   -- 绝对头寸(slots)
