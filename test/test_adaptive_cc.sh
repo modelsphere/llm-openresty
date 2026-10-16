@@ -68,7 +68,8 @@ http {
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.ac) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.ac) } }
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.ac) } }
     location = /_tps_limit { content_by_lua_block { _G.dbg_tps_limit(_G.__route_opts.ac) } }
-    location = /_tps_toggle { content_by_lua_block { _G.dbg_tps_toggle(_G.__route_opts.ac) } } }
+    location = /_tps_toggle { content_by_lua_block { _G.dbg_tps_toggle(_G.__route_opts.ac) } }
+    location = /_active_conns_set { content_by_lua_block { _G.dbg_active_conns_set(_G.__route_opts.ac) } } }
   server { listen 19491; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.acd) } } }
   server { listen 19492; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
@@ -148,7 +149,10 @@ cc_lo=$(acc $AC); e2c=$(ev $AC)
 
 # AC2d 收敛到中位平衡点 + 不振荡(#2/#3/#4):把并发精确钉在 3(/_active_conns_set)→ cc 应收敛到 ~3/mid=3.75
 # (中位:>min2 且 <max6),且跨 tick 稳定(mid-clamp 不 ping-pong;若无 clamp 大步长会 6↔3 弹)。
-setc(){ curl -s "$AC/_active_conns_set?peer=127.0.0.1:28931&value=$1" >/dev/null 2>&1; }
+# Fails loudly: this endpoint was once missing on the AC server, every call 404'd into /dev/null, and
+# the step passed without ever pinning anything.
+setc(){ curl -s "$AC/_active_conns_set?peer=127.0.0.1:28931&value=$1" | grep -q '"ok":true' \
+          || no "AC2d could not pin concurrency via $AC/_active_conns_set"; }
 expire; estab_seq $AC 10 40                       # ewma 健康
 for k in 1 2 3 4 5 6; do setc 3; fire $AC 10 40 >/dev/null 2>&1; sleep 2; done  # 钉并发3:触发 do_route 存 rt_sum=3 + 喂 ewma(cc>3 后 fire 不 429)
 cc_eq1=$(acc $AC); sleep 2; cc_eq2=$(acc $AC)     # 两次读验稳定
