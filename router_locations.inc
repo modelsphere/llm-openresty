@@ -171,9 +171,9 @@
         allow 127.0.0.1; deny all;
         content_by_lua_block { _G.dbg_tps_limit(_G.__route_opts[ngx.var.route]) }
     }
-    # GET /_429_status → 全路由 429 累计计数(route × reason 聚合);?reset=1 清零(仅 127.0.0.1)。
-    # reject_stat 是全局共享 dict,dbg_429_status 忽略 opts、读全局聚合 → 每个路由端口返回相同结果。
-    # (重构前只在 k25:18080 注册;现经共享 include 在所有路由端口都可访问,输出一致。)
+    # GET /<route>/_429_status -> this route's 429 counters by reason; ?all=1 -> every route on this
+    # openresty (by_route); ?reset=1 clears the same scope (127.0.0.1 only). The counters live in one
+    # shared dict (reject_stat, key "<route>:<reason>"); dbg_429_status filters it by opts.route_name.
     location = /_429_status {
         content_by_lua_block { _G.dbg_429_status(_G.__route_opts[ngx.var.route]) }
     }

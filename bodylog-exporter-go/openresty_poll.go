@@ -4,7 +4,7 @@
 //	/<route>/_route_state      每 peer 当前并发 / 是否被 ban / max / priority / active_level
 //	/<route>/_tps_status       自适应并发 adaptive_cc(当前动态上限/min/max/当前并发/本区间被压需求)+ 解码速率 EWMA
 //	/<route>/_ttft_status      TTFT EWMA + 限流是否 active
-//	/<route>/_429_status?all=1 429 限流累计(route × reason=concurrency/ttft/tps)—— 全局,poll 一次即可
+//	/<route>/_429_status      429 rejections of this route so far, by reason (concurrency/ttft/tps)
 //
 // 与 tail 文件那套的分工:tail = 事后逐请求(counter/histogram,零丢);poll = 即时控制面态(gauge,快照)。
 // 这些是 bodylog 拿不到的 live 信号(每 peer 并发/被 ban 的 peer/限流档位),对自动扩缩容反应更快。
@@ -298,89 +298,66 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 			p.m.ttftActive.WithLabelValues(service, route).Set(b2f(tt.Active))
 			setModelMap(p.m.ttftEwma, service, route, tt.EwmaMs)
 		}
-	}
 
-	// 429 is aggregated per openresty (reject_stat is one dict per openresty), so pull it once per
-	// distinct openresty through any of its routes (?all=1), and attribute each by_route entry to the
-	// target on THAT openresty -- a route name alone is ambiguous across openrestys.
-	var bases []string
-	firstRoute := map[string]string{}
-	svcOn := map[tkey]string{}
-	for _, t := range targets {
-		b := p.baseOf(t)
-		if _, ok := firstRoute[b]; !ok {
-			firstRoute[b] = t.route
-			bases = append(bases, b)
-		}
-		svcOn[tkey{b, t.route}] = t.service
-	}
-	rejOK := map[string]bool{}
-	for _, base := range bases {
+		// 429 counters: pull this route's own view (/<route>/_429_status, no ?all=1), like the other
+		// endpoints, so a failure only marks this route down. The counters live in one dict per
+		// openresty (reject_stat, key "<route>:<reason>") and ?all=1 would return every route at once,
+		// but pulling that through one route coupled them all: a ModelRoute added before its engine is
+		// ready has no server block yet and answers 502 -- measured on a production cluster, that one
+		// cold-starting route fired OpenRestyPollDown for every route on its openresty.
 		var rj rejectStatusResp
-		if err := p.getJSON(ctx, base, "/"+firstRoute[base]+"/_429_status?all=1", &rj); err != nil {
-			p.pollErr("429_status", "*", err)
-			continue
-		}
-		rejOK[base] = true
-		// ⚠️ First pre-initialise the series for every current route x every reason to 0.
-		//
-		// Without it, a counter does not EXIST before its first Add, and openresty only puts an entry
-		// in by_route once a 429 has actually happened -- so "no 429 at all" shows up as an EMPTY
-		// vector, indistinguishable from "collection broke" (measured 2026-08-31: after openresty was
-		// recreated, by_route={} and the metric vanished entirely). An empty vector is much worse than
-		// a value of 0:
-		//   - sum()/rate() over it is still empty, it does NOT become 0;
-		//   - an alert expression built on it returns nothing -> never fires (not "judged 0, no alert":
-		//     there is no value to judge at all);
-		//   - the panel is blank and looks like monitoring is down.
-		// Contrast: adaptive_cc_rej from the same poll is a gauge, Set(0) every round, so it always has
-		// a series.
-		//
-		// Done every round rather than once at startup: routes are discovered dynamically, and a new
-		// route needs its zeros too. Add(0) has no effect on an existing series (a counter never goes
-		// back) and creates one that does not exist.
-		//
-		// -- A deliberate trade-off: route is a DYNAMIC label, yet this uses pre-initialisation, a
-		//    technique meant for FINITE labels known at compile time. Not an oversight -- a choice
-		//    made after weighing it, written down here so the next person does not take it for one.
-		//
-		// The strictly standard way is two layers:
-		//    reason (3 values, known at compile time) -> pre-initialise;
-		//    route (discovered dynamically)          -> export only the current ones and Delete the
-		//                                                gone ones, so Prometheus staleness applies.
-		// This code base does exactly that for gauges (resettable + Reset every round). Counters cannot
-		// be Reset (it would break monotonicity); the counterpart is DeleteLabelValues.
-		//
-		// That step is NOT taken here, because it costs more than it gains:
-		//  · what is left behind is only a flat line at 0, which nothing consumes today (zero
-		//    references in the alert rules);
-		//  · it is bounded and heals itself -- client_golang keeps child metrics in memory and keeps
-		//    exporting them (measured: still collected after Add stops, only Delete removes them), but
-		//    an exporter restart on a chart upgrade clears them;
-		//  · routes are rarely added or removed (a ModelRoute is a stable object, not a pod);
-		//  · and Delete would drop the accumulated value when a route is briefly recreated (e.g. a
-		//    ModelRoute deleted and created again), so increase() would undercount across that point --
-		//    trading real data continuity for removing a flat line nobody looks at is not worth it.
-		//  · Besides, refresh() KEEPS the last mapping on an apiserver error instead of clearing it, so
-		//    jitter by itself does not make routes disappear -- which narrows what Delete could save.
-		//
-		// [When to come back and add Delete]: once routes are added and removed often (e.g. ModelRoutes
-		// created per tenant), or once an alert or autoscaling starts consuming this metric -- then a
-		// flat line at 0 becomes misleading.
-		for _, t := range targets {
-			if p.baseOf(t) != base {
-				continue
-			}
+		if err := p.getJSON(ctx, base, "/"+route+"/_429_status", &rj); err != nil {
+			fail(t, "429_status", err)
+		} else {
+			// ⚠️ First pre-initialise the series for this route x every reason to 0.
+			//
+			// Without it, a counter does not EXIST before its first Add, and openresty only puts an entry
+			// in by_route once a 429 has actually happened -- so "no 429 at all" shows up as an EMPTY
+			// vector, indistinguishable from "collection broke" (measured 2026-08-31: after openresty was
+			// recreated, by_route={} and the metric vanished entirely). An empty vector is much worse than
+			// a value of 0:
+			//   - sum()/rate() over it is still empty, it does NOT become 0;
+			//   - an alert expression built on it returns nothing -> never fires (not "judged 0, no alert":
+			//     there is no value to judge at all);
+			//   - the panel is blank and looks like monitoring is down.
+			// Contrast: adaptive_cc_rej from the same poll is a gauge, Set(0) every round, so it always has
+			// a series.
+			//
+			// Done every round rather than once at startup: routes are discovered dynamically, and a new
+			// route needs its zeros too. Add(0) has no effect on an existing series (a counter never goes
+			// back) and creates one that does not exist.
+			//
+			// -- A deliberate trade-off: route is a DYNAMIC label, yet this uses pre-initialisation, a
+			//    technique meant for FINITE labels known at compile time. Not an oversight -- a choice
+			//    made after weighing it, written down here so the next person does not take it for one.
+			//
+			// The strictly standard way is two layers:
+			//    reason (3 values, known at compile time) -> pre-initialise;
+			//    route (discovered dynamically)          -> export only the current ones and Delete the
+			//                                                gone ones, so Prometheus staleness applies.
+			// This code base does exactly that for gauges (resettable + Reset every round). Counters cannot
+			// be Reset (it would break monotonicity); the counterpart is DeleteLabelValues.
+			//
+			// That step is NOT taken here, because it costs more than it gains:
+			//  · what is left behind is only a flat line at 0, which nothing consumes today (zero
+			//    references in the alert rules);
+			//  · it is bounded and heals itself -- client_golang keeps child metrics in memory and keeps
+			//    exporting them (measured: still collected after Add stops, only Delete removes them), but
+			//    an exporter restart on a chart upgrade clears them;
+			//  · routes are rarely added or removed (a ModelRoute is a stable object, not a pod);
+			//  · and Delete would drop the accumulated value when a route is briefly recreated (e.g. a
+			//    ModelRoute deleted and created again), so increase() would undercount across that point --
+			//    trading real data continuity for removing a flat line nobody looks at is not worth it.
+			//  · Besides, refresh() KEEPS the last mapping on an apiserver error instead of clearing it, so
+			//    jitter by itself does not make routes disappear -- which narrows what Delete could save.
+			//
+			// [When to come back and add Delete]: once routes are added and removed often (e.g. ModelRoutes
+			// created per tenant), or once an alert or autoscaling starts consuming this metric -- then a
+			// flat line at 0 becomes misleading.
 			for _, reason := range rejectReasons {
-				p.m.rejected.WithLabelValues(t.service, t.route, reason).Add(0)
+				p.m.rejected.WithLabelValues(service, route, reason).Add(0)
 			}
-		}
-		for route, byReason := range rj.ByRoute {
-			service, known := svcOn[tkey{base, route}]
-			if !known {
-				service = "unknown"
-			}
-			for reason, cur := range byReason {
+			for reason, cur := range rj.ByRoute[route] { // ByRoute holds only this route without ?all=1
 				key := base + "|" + route + "|" + reason
 				last := p.prev[key]
 				if cur >= last {
@@ -393,11 +370,9 @@ func (p *orPoller) pollOnce(ctx context.Context) {
 		}
 	}
 
-	// The per-openresty 429 endpoint failing counts against every route on that openresty.
 	now := float64(time.Now().Unix())
 	for _, t := range targets {
-		base := p.baseOf(t)
-		if targetOK[tkey{base, t.route}] && rejOK[base] {
+		if targetOK[tkey{p.baseOf(t), t.route}] {
 			p.m.pollUp.WithLabelValues(t.service, t.route).Set(1)
 			p.m.pollLastOK.WithLabelValues(t.service, t.route).Set(now)
 		} else {
