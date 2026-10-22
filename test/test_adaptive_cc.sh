@@ -68,7 +68,8 @@ http {
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.ac) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.ac) } }
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.ac) } }
     location = /_tps_limit { content_by_lua_block { _G.dbg_tps_limit(_G.__route_opts.ac) } }
-    location = /_tps_toggle { content_by_lua_block { _G.dbg_tps_toggle(_G.__route_opts.ac) } } }
+    location = /_tps_toggle { content_by_lua_block { _G.dbg_tps_toggle(_G.__route_opts.ac) } }
+    location = /_active_conns_set { content_by_lua_block { _G.dbg_active_conns_set(_G.__route_opts.ac) } } }
   server { listen 19491; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.acd) } } }
   server { listen 19492; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
@@ -138,7 +139,8 @@ cc_after=$(acc $AC); e2b=$(ev $AC)
   && ok "AC2b 健康无压力不涨:cc $cc_before→$cc_after(ewma=$e2b≥阈值50 但并发低 → 不爬,停在 min)" || no "AC2b cc $cc_before→$cc_after ewma=$e2b(需 ewma≥50 且 cc 不涨)"
 
 # AC2c 忙→真实低并发缩:压力 prime 到 max6 → 切**轻量重叠并发(~2,conc≥1)**(ewma健康)→ cc 往下跟到中位
-# (顺序单发 rt_sum=0 会命中"conc=0 保持"分支——那是防空闲/长请求误缩,不是这里要测的;故用重叠并发)
+# (Overlapping load, so the shrink here follows real concurrency >= 1. Sequential single requests read
+#  rt_sum=0, which also counts as slack now; test_adaptive_cc_hold.sh step 9 covers that case.)
 expire; estab_seq $AC 10 40; load $AC 10 40 8   # cc→6
 cc_hi=$(acc $AC)
 load_n 2 12                                      # ~2 重叠并发(conc≥1)+ 快解码(ewma~100)→ conc<cc×slack → 缩到中位
@@ -148,8 +150,12 @@ cc_lo=$(acc $AC); e2c=$(ev $AC)
 
 # AC2d 收敛到中位平衡点 + 不振荡(#2/#3/#4):把并发精确钉在 3(/_active_conns_set)→ cc 应收敛到 ~3/mid=3.75
 # (中位:>min2 且 <max6),且跨 tick 稳定(mid-clamp 不 ping-pong;若无 clamp 大步长会 6↔3 弹)。
-setc(){ curl -s "$AC/_active_conns_set?peer=127.0.0.1:28931&value=$1" >/dev/null 2>&1; }
-expire; estab_seq $AC 10 40                       # ewma 健康
+# Fails loudly: this endpoint was once missing on the AC server, every call 404'd into /dev/null, and
+# the step passed without ever pinning anything.
+setc(){ curl -s "$AC/_active_conns_set?peer=127.0.0.1:28931&value=$1" | grep -q '"ok":true' \
+          || no "AC2d could not pin concurrency via $AC/_active_conns_set"; }
+expire; estab_seq $AC 10 40; load $AC 10 40 8     # ewma healthy, cc primed to max (6). Sequential traffic
+                                                  # alone now shrinks cc to init, so prime it as AC2c does.
 for k in 1 2 3 4 5 6; do setc 3; fire $AC 10 40 >/dev/null 2>&1; sleep 2; done  # 钉并发3:触发 do_route 存 rt_sum=3 + 喂 ewma(cc>3 后 fire 不 429)
 cc_eq1=$(acc $AC); sleep 2; cc_eq2=$(acc $AC)     # 两次读验稳定
 setc 0

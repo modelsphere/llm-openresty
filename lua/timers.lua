@@ -241,9 +241,12 @@ function M.do_adaptive_cc_loop(opts)
                 -- 健康、无被拒需求:并发压力 AIMD,相对系数 + 绝对头寸双门。
                 --   涨门:并发顶到 cc×pressure_frac(相对) 或 绝对头寸不足 cc-conc<ABS(小并发兜底)。
                 --   缩门:并发 < cc×slack_frac(相对) 且 绝对余量够 cc-conc>ABS(降也要够绝对余量才降)。
-                --   涨/缩都向 desired 收(不破 conc+ABS 绝对底);conc==0 且头寸够 → 保持(不缩回 min)。
+                --   涨/缩都向 desired 收(不破 conc+ABS 绝对底)。
+                --   No requests in flight at the tick counts as slack too: with sparse traffic most ticks see
+                --   conc == 0, and exempting them left cc wherever the last busy spell put it, its TTL
+                --   refreshed by every stray request. Holding through quiet spells is what hold_when_idle is for.
                 local at_pressure = (conc >= cur * opts.adaptive_cc_pressure_frac) or ((cur - conc) < ABS)
-                local at_slack    = (conc > 0) and (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
+                local at_slack    = (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
                 local prev = cur
                 if at_pressure then
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired
