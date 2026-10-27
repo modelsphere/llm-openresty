@@ -294,6 +294,16 @@ cd test
 ./test_lazy_init_timing.sh      # lazy route registration across workers
 ```
 
+The Kubernetes e2e suite under `test/e2e/` runs the image built from this
+checkout on a kind cluster (CPU only): one route backed by
+modelsphere/mock-llmd, the project's standalone mock LLM server,
+exercised through the 8080 path dispatch. It is what CI runs on pull requests
+and pushes to `main`.
+
+```bash
+make test-e2e   # creates the kind cluster, builds, runs, deletes the cluster
+```
+
 Pure-Lua unit tests need only `resty`:
 
 ```bash
