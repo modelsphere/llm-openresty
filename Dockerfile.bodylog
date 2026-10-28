@@ -17,7 +17,9 @@ ARG GOPROXY=https://mirrors.tencent.com/go/,direct
 
 FROM ${GO_BASE} AS builder
 ARG GOPROXY
-ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=linux GOARCH=amd64
+# No GOARCH: CGO links go-duckdb's prebuilt libduckdb for the build's own architecture, so
+# each platform is built natively (the release workflow uses an arm64 runner for arm64).
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=linux
 WORKDIR /src
 COPY bodylog-listener-go/go.mod bodylog-listener-go/go.sum ./
 RUN go mod download
