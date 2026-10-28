@@ -10,8 +10,14 @@
 # shows without the override. Dockerfile.bodylog does it right.
 ARG GO_BASE=golang:1.24-bookworm
 ARG RUNTIME_BASE=debian:12-slim
-FROM ${GO_BASE} AS build
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOSUMDB=off GOTOOLCHAIN=local
+# Pure Go, so the compiler runs on the build host and cross-compiles for the target:
+# `docker buildx build --platform linux/arm64` needs no emulation.
+FROM --platform=$BUILDPLATFORM ${GO_BASE} AS build
+# No defaults: BuildKit fills these from --platform, but a default written here wins over
+# that value -- `ARG TARGETARCH=amd64` produced an amd64 binary in the arm64 image.
+ARG TARGETOS
+ARG TARGETARCH
+ENV CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOSUMDB=off GOTOOLCHAIN=local
 ARG GOPROXY=https://mirrors.tencent.com/go/,direct
 ENV GOPROXY=${GOPROXY}
 WORKDIR /src
