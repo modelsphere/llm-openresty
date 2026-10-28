@@ -261,11 +261,19 @@ jobs:
               ;;
             bodylog)
               # go-duckdb is native code: the listener must report duckdb ready.
+              # Read the logs into a variable before grepping. `docker logs | grep -q` under
+              # pipefail fails on a match: grep exits at the first hit, docker logs gets
+              # SIGPIPE, and the pipeline reports the 141 -- which failed bodylog/v0.1.15.
               docker run -d --name smoke "$IMG"
-              for i in $(seq 1 30); do docker logs smoke 2>&1 | grep -q 'listening on' && break; sleep 1; done
-              docker logs smoke 2>&1
-              docker logs smoke 2>&1 | grep -q 'duckdb ready' || { echo "duckdb did not load" >&2; exit 1; }
-              docker logs smoke 2>&1 | grep -q 'listening on' || { echo "listener did not start" >&2; exit 1; }
+              logs=
+              for i in $(seq 1 30); do
+                logs=$(docker logs smoke 2>&1)
+                case "$logs" in *'listening on'*) break ;; esac
+                sleep 1
+              done
+              printf '%s\n' "$logs"
+              case "$logs" in *'duckdb ready'*) ;; *) echo "duckdb did not load" >&2; exit 1 ;; esac
+              case "$logs" in *'listening on'*) ;; *) echo "listener did not start" >&2; exit 1 ;; esac
               docker rm -f smoke
               ;;
             exporter)
