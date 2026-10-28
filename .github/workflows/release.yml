@@ -241,6 +241,20 @@ jobs:
           set -euo pipefail
           got=$(docker image inspect --format '{{.Architecture}}' "$IMG")
           [ "$got" = "$WANT_ARCH" ] || { echo "image architecture is $got, want $WANT_ARCH" >&2; exit 1; }
+          # The image config's architecture is only a label. Check the main binary's ELF
+          # header too: a build can hard-code GOARCH and still produce an "arm64" image.
+          case "$COMPONENT" in
+            openresty) bin=/usr/local/openresty/nginx/sbin/nginx ;;
+            bodylog)   bin=/usr/local/bin/bodylog-listener ;;
+            exporter)  bin=/usr/local/bin/bodylog-exporter ;;
+          esac
+          case "$WANT_ARCH" in amd64) elf='x86-64' ;; arm64) elf='ARM aarch64' ;; esac
+          cid=$(docker create "$IMG")
+          docker cp -L "$cid:$bin" ./smoke-bin
+          docker rm "$cid" >/dev/null
+          desc=$(file -b ./smoke-bin)
+          echo "$bin: $desc"
+          case "$desc" in *"$elf"*) ;; *) echo "$bin is not a $WANT_ARCH binary" >&2; exit 1 ;; esac
           case "$COMPONENT" in
             openresty)
               docker run --rm "$IMG" /usr/local/openresty/bin/openresty -V
