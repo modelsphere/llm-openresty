@@ -258,6 +258,18 @@ jobs:
           case "$COMPONENT" in
             openresty)
               docker run --rm "$IMG" /usr/local/openresty/bin/openresty -V
+              # -t builds the shared zones, so a dict nginx cannot carve fails here.
+              docker run --rm "$IMG" /usr/local/openresty/bin/openresty -t
+              # The runners use 4 KiB pages, but arm64 hosts often run 64 KiB ones, where a
+              # zone of 128k or less fails at startup ("ngx_slab_alloc() failed: no memory").
+              # -t above cannot see that here, so refuse any dict the image ships under 256k.
+              docker run --rm --entrypoint sh "$IMG" -c '
+                find /usr/local/openresty/nginx/conf -name "*.conf" -o -name "*.inc" | xargs cat |
+                awk "/^[[:space:]]*lua_shared_dict[[:space:]]/ {
+                       s = \$3; sub(/;.*/, \"\", s); n = s + 0
+                       if (s ~ /[mM]\$/) n *= 1024; else if (s !~ /[kK]\$/) n /= 1024
+                       if (n < 256) { print \"too small for 64 KiB pages: \" \$2 \" \" s; bad = 1 }
+                     } END { exit bad }"'
               ;;
             bodylog)
               # go-duckdb is native code: the listener must report duckdb ready.
