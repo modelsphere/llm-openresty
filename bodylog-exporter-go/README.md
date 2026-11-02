@@ -72,6 +72,18 @@
 |---|---|---|
 | `bodylog_service_replicas` | gauge | 该 service 后端 pod **总数**(EndpointSlice endpoint 数,含未就绪) |
 | `bodylog_service_replicas_ready` | gauge | 该 service **就绪**后端 pod 数(`conditions.ready`;nil 按约定视为就绪) |
+| `bodylog_service_replicas_desired` | gauge | 该 service **期望**副本数(顶层工作负载 `spec.replicas`);查不到时**不发**这条(0 会被读成「缩到零」) |
+
+三条都带 **`role`** 标签:
+
+- 普通服务 `role=""`。
+- **prefill/decode 分离(DisaggregatedSet)服务**拆成三条:`role="router"` 是 `discovery.service` 本身数出来的那份 —— 分离部署下它选中的是各 slice 的 **router**(绑公网端口的那些 pod),不是引擎;`role="prefill"` / `role="decode"` 是引擎,来自 DisaggregatedSet 创建的那批 per-(role, slice) LeaderWorkerSet。
+
+**一个 LWS group = 一个引擎**(leader + 它的 workers),所以 role 维度上数的是引擎而不是 pod —— `leaderWorkerTemplate.size > 1` 时按 pod 数永远对不上期望值。引擎数**不**取自 per-role 的 headless Service(`<rel>-<role>-hl-s<N>`):那些 Service 带 `publishNotReadyAddresses`(让 router 在引擎加载期就能解析 upstream),EndpointSlice 会把地址一律标成就绪,据此做的 ready 永远掉不下来 —— 包括它本该显示的排空过程。
+
+`role` 加在同一条 metric 上而不是另起一条,是因为 `LLMServiceDegraded` 规则是 `_ready < _replicas`:二元运算按**完整标签集**匹配,只给一边加标签会让它静默匹配为空。
+
+> 聚合时注意:跨 role 求和要先去重再求和(`sum by(service)(max by(service, role)(...))`),因为同一 `(service, route, role)` 在 exporter 滚动重启时会短暂有两份。只按 `by(service)` 做 `avg`/`max` 会把 role 这一维一起吃掉。
 
 ### exporter 自监控
 
@@ -136,7 +148,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 2. **每 service 副本数**(`bodylog_service_replicas` / `_ready`)。
 3. **route 列表 + route→service**:给 openresty-poll 用(route 列表按 `OPENRESTY_SERVICE` 过滤;service map 含全部 route)。
 
-周期刷新(`ROUTE_DISCOVERY_INTERVAL_SECONDS`,默认 30s),pod/route 增删自动跟随;apiserver 抖动某轮失败 → **保留上次不清空**。**仅 in-cluster 启用**(需 `KUBERNETES_SERVICE_HOST` + SA);裸机 exporter 无此能力 → `service`/`route` 恒 `unknown`(其余指标照常)。**RBAC 需 `list` `modelroutes` + `endpointslices`**(helm `rbac.yaml` 已建)。
+周期刷新(`ROUTE_DISCOVERY_INTERVAL_SECONDS`,默认 30s),pod/route 增删自动跟随;apiserver 抖动某轮失败 → **保留上次不清空**。**仅 in-cluster 启用**(需 `KUBERNETES_SERVICE_HOST` + SA);裸机 exporter 无此能力 → `service`/`route` 恒 `unknown`(其余指标照常)。**RBAC 需 `list` `modelroutes` + `endpointslices`**(helm `rbac.yaml` 已建);per-role 那几条还需 `list` `leaderworkersets`,没授权或集群没装这个 CRD 时,**只是不发 role 维度的 series**,其余照常(日志一行,之后 30 分钟不再请求);明确不想要就置 `PD_ROLE_GROUP=""`,连请求都不发。另注:`_desired` 按 role 拆时,**要该 role 的每个 slice 都报了 `spec.replicas` 才发** —— 只报了一部分就求和会得到一个更小、却看着像答案的数。
 
 > **⚠️ `service` label 与 target label 撞名**:kube-prometheus-stack 抓取时会注入一个 target label `service`(= 抓的 k8s Service 名)。必须 **ServiceMonitor `honorLabels: true`**(bodylog chart 与本 README 的 manifest 都已设),让 exporter 自带的 `service`(模型 service)胜出,`by(service)` 才聚合到模型而非抓取目标。
 
@@ -183,6 +195,7 @@ route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_ro
 | `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.modelsphere.dev` / `v1alpha1` / `modelroutes` | CR coordinates. `MODELROUTE_GROUP` may list several groups, comma-separated (e.g. while ModelRoutes move from one group to another): every group is listed, an object in more than one (same namespace/name) is taken from the earliest, a group the cluster does not serve (404) is skipped, and any other error keeps the last snapshot. RBAC must grant every group listed |
 | `ROUTE_DISCOVERY_INTERVAL_SECONDS` | `30` | list ModelRoute 周期(富化 + poll 发现共用) |
 | `ROUTE_DISCOVERY_TIMEOUT_MS` | `4000` | 单次 list/EndpointSlice 请求超时 |
+| `PD_ROLE_GROUP` / `PD_ROLE_VERSION` | `leaderworkerset.x-k8s.io` / `v1` | per-role 引擎数读的 LeaderWorkerSet API 坐标。**`PD_ROLE_GROUP=""` 整个关掉**:一次都不请求(chart 的 `pdRoles.enabled=false` 就是这么传的) |
 | `OPENRESTY_SERVICE` | 空 | 只把 `nginx.service` 指向本 openresty 的 route 计入 **poll 列表**(多 openresty 时用);空=全要。**富化映射/service map 不受此过滤**(全 route) |
 | `OPENRESTY_POLL_PER_SERVICE` | `true` | Poll each ModelRoute on the openresty its `spec.nginx.service` names (`ns/name`, or `name` in the ModelRoute's namespace) at `http://<name>.<ns>.svc:<OPENRESTY_POLL_PORT>`, and label the result with that ModelRoute's service. ModelRoutes that name no openresty use `OPENRESTY_POLL_URL`. `false` = the old single-openresty behaviour, where ModelRoutes sharing a route name on different openrestys (a canary next to production) all read the one openresty and got one route's label. |
 | `OPENRESTY_POLL_PORT` | `8080` | Dispatch port of the openresty Services polled per ModelRoute |

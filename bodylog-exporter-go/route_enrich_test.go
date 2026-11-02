@@ -100,6 +100,8 @@ func TestResolverBuild(t *testing.T) {
 			_, _ = w.Write([]byte(esJSON("10.0.0.5", "10.0.0.6!")))
 		case r.URL.Path == "/apis/discovery.k8s.io/v1/namespaces/kimi/endpointslices":
 			_, _ = w.Write([]byte(esJSON("10.0.0.7")))
+		case r.URL.Path == "/apis/leaderworkerset.x-k8s.io/v1/leaderworkersets":
+			_, _ = w.Write([]byte(`{"items":[]}`)) // no disaggregated release here
 		default:
 			t.Errorf("未预期路径: %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -129,16 +131,16 @@ func TestResolverBuild(t *testing.T) {
 	}
 
 	// replicas(总数,含未就绪) vs replicas_ready(就绪):fallback 2/1,kimi 1/1。
-	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 2 {
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1", "")); n != 2 {
 		t.Errorf("fallback replicas(total) = %v, 想要 2", n)
 	}
-	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 1 {
+	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1", "")); n != 1 {
 		t.Errorf("fallback replicas_ready = %v, 想要 1", n)
 	}
-	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 1 {
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5", "")); n != 1 {
 		t.Errorf("kimi replicas(total) = %v, 想要 1", n)
 	}
-	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 1 {
+	if n := testutil.ToFloat64(r.replicasReady.WithLabelValues("kimi/k25-svc", "kimi-k2.5", "")); n != 1 {
 		t.Errorf("kimi replicas_ready = %v, 想要 1", n)
 	}
 
@@ -319,6 +321,8 @@ func TestDesiredReplicasWalksToTop(t *testing.T) {
 		case "/apis/apps/v1/namespaces/model-service/deployments/fb":
 			_, _ = w.Write([]byte(`{"metadata":{},"spec":{"replicas":20}}`))
 
+		case "/apis/leaderworkerset.x-k8s.io/v1/leaderworkersets":
+			_, _ = w.Write([]byte(`{"items":[]}`)) // no disaggregated release here
 		default:
 			t.Errorf("未预期路径: %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -329,14 +333,14 @@ func TestDesiredReplicasWalksToTop(t *testing.T) {
 	r := newTestResolver(t, srv)
 	r.refresh(context.Background())
 
-	if n := testutil.ToFloat64(r.replicasDesired.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 2 {
+	if n := testutil.ToFloat64(r.replicasDesired.WithLabelValues("kimi/k25-svc", "kimi-k2.5", "")); n != 2 {
 		t.Errorf("kimi desired = %v, 想要 2(LWS 的值,不是被 surge 抬高的 StatefulSet 的 3)", n)
 	}
 	// 实际/就绪仍按 EndpointSlice 口径:2 个 endpoint、1 个就绪。降级判定看 ready(1) < desired(2) → 确实降级。
-	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5")); n != 2 {
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("kimi/k25-svc", "kimi-k2.5", "")); n != 2 {
 		t.Errorf("kimi replicas(实际) = %v, 想要 2", n)
 	}
-	if n := testutil.ToFloat64(r.replicasDesired.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1")); n != 20 {
+	if n := testutil.ToFloat64(r.replicasDesired.WithLabelValues("model-service/fallback-model-service-01", "fallback-model-service-0.1", "")); n != 20 {
 		t.Errorf("model-service desired = %v, 想要 20(Deployment 的值,不是旧 ReplicaSet 的 7)", n)
 	}
 }
@@ -352,6 +356,8 @@ func TestDesiredReplicasAbsentWhenUnknown(t *testing.T) {
 			_, _ = w.Write([]byte(esWithPods("10.0.0.5|bare-pod")))
 		case "/api/v1/namespaces/ns/pods/bare-pod":
 			_, _ = w.Write([]byte(`{"metadata":{}}`)) // 无 ownerReferences:裸 pod,没有期望副本数可言
+		case "/apis/leaderworkerset.x-k8s.io/v1/leaderworkersets":
+			_, _ = w.Write([]byte(`{"items":[]}`)) // no disaggregated release here
 		default:
 			t.Errorf("未预期路径: %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -365,7 +371,7 @@ func TestDesiredReplicasAbsentWhenUnknown(t *testing.T) {
 	if n := testutil.CollectAndCount(r.replicasDesired); n != 0 {
 		t.Errorf("desired series 数 = %d, 想要 0(裸 pod 查不到期望副本数就不该发点)", n)
 	}
-	if n := testutil.ToFloat64(r.replicas.WithLabelValues("ns/bare-svc", "bare")); n != 1 {
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("ns/bare-svc", "bare", "")); n != 1 {
 		t.Errorf("实际副本数仍应正常上报, 得 %v", n)
 	}
 }
@@ -437,7 +443,7 @@ func TestResolverRouteDefaultsToName(t *testing.T) {
 		t.Errorf("monitor-only 不该有 route, serviceFor(m-only) = %q", got)
 	}
 	// 看板靠的就是这条 gauge:省略 route 的服务也必须有副本数。
-	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service-03-kimi/model-service-03-kimi", "model-service-03-kimi")); n != 1 {
+	if n := testutil.ToFloat64(r.replicas.WithLabelValues("model-service-03-kimi/model-service-03-kimi", "model-service-03-kimi", "")); n != 1 {
 		t.Errorf("model-service-03-kimi replicas = %v, 想要 1", n)
 	}
 }
@@ -479,6 +485,10 @@ func twoGroupServer(t *testing.T, answers map[string]any) *httptest.Server {
 			default:
 				_, _ = w.Write([]byte(esJSON()))
 			}
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/leaderworkersets") {
+			_, _ = w.Write([]byte(`{"items":[]}`)) // no disaggregated release here
 			return
 		}
 		switch a := answers[r.URL.Path].(type) {

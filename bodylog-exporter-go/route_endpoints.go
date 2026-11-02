@@ -63,13 +63,25 @@ type podRouteResolver struct {
 	perService bool
 	pollPort   int
 
-	up              prometheus.Gauge
-	pods            prometheus.Gauge
-	routesG         prometheus.Gauge
-	errs            prometheus.Counter
-	replicas        *prometheus.GaugeVec // {service, route} → 后端 pod 总数(含未就绪)
-	replicasReady   *prometheus.GaugeVec // {service, route} → 就绪后端 pod 数
-	replicasDesired *prometheus.GaugeVec // {service, route} → 期望副本数(工作负载 spec.replicas)
+	// The LeaderWorkerSet API the per-role engine counts come from, and the point in
+	// time before which not to ask again after it answered 404/403. Touched only on
+	// the refresh goroutine (see pdRoles).
+	pdGroup, pdVersion string
+	pdSkipUntil        time.Time
+
+	up      prometheus.Gauge
+	pods    prometheus.Gauge
+	routesG prometheus.Gauge
+	errs    prometheus.Counter
+	// The three replica gauges all carry role. It is "" for an ordinary service, and for a
+	// prefill/decode-disaggregated one it splits the release into the units that scale
+	// independently: "router" for the Service the route resolves to, "prefill"/"decode" for the
+	// engines behind it. They are one label on all three rather than a separate metric because
+	// the LLMServiceDegraded rule compares _ready < _replicas -- a binary operator matching on
+	// the full label set, which an asymmetric label would silently reduce to nothing.
+	replicas        *prometheus.GaugeVec // {service, route, role} → 后端 pod 总数(含未就绪)
+	replicasReady   *prometheus.GaugeVec // {service, route, role} → 就绪后端 pod 数
+	replicasDesired *prometheus.GaugeVec // {service, route, role} → 期望副本数(工作负载 spec.replicas)
 }
 
 func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
@@ -103,6 +115,8 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		nginxService:  strings.TrimSpace(envOr("OPENRESTY_SERVICE", "")),
 		perService:    envOr("OPENRESTY_POLL_PER_SERVICE", "true") != "false",
 		pollPort:      envOrInt("OPENRESTY_POLL_PORT", 8080),
+		pdGroup:       envOr("PD_ROLE_GROUP", "leaderworkerset.x-k8s.io"),
+		pdVersion:     envOr("PD_ROLE_VERSION", "v1"),
 		interval:      interval,
 		timeout:       timeout,
 		apiBase:       apiBase,
@@ -114,11 +128,11 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 		pods:          prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_pods", Help: "当前映射覆盖的后端 pod IP 数"}),
 		routesG:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_routes", Help: "当前发现的 route 数(poll 列表)"}),
 		errs:          prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "ModelRoute 发现/映射刷新出错累计"}),
-		replicas:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service(discovery.service)当前后端 pod 总数(EndpointSlice endpoint 数,含未就绪)"}, []string{"service", "route"}),
-		replicasReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端 pod 数(conditions.ready)"}, []string{"service", "route"}),
+		replicas:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service 当前后端总数(含未就绪)。role=\"\" 普通服务;PD 分离服务按角色拆:router=discovery.service 选中的路由器 pod,prefill/decode=引擎(1 个 LWS group 记 1 个)"}, []string{"service", "route", "role"}),
+		replicasReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端数。role 同 bodylog_service_replicas:\"\" / router / prefill / decode"}, []string{"service", "route", "role"}),
 		// 期望副本数:判「降级」要拿【就绪】比【期望】,不能比【实际】—— 滚动更新的 maxSurge 会把实际抬高,
 		// 拿实际当分母会在每次 rollout 期间把满员的服务误判成降级。查不到时不发这条 series(见 desiredForPod)。
-		replicasDesired: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_desired", Help: "该 service 期望副本数(顶层工作负载 spec.replicas;LWS 取 LWS 本身而非被 surge 抬高的 StatefulSet)"}, []string{"service", "route"}),
+		replicasDesired: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_desired", Help: "该 service 期望副本数(顶层工作负载 spec.replicas;LWS 取 LWS 本身而非被 surge 抬高的 StatefulSet)。role 同 bodylog_service_replicas;按角色拆时要该角色每个 slice 都报了才发"}, []string{"service", "route", "role"}),
 	}
 	reg.MustRegister(r.up, r.pods, r.routesG, r.errs, r.replicas, r.replicasReady, r.replicasDesired)
 	return r
@@ -153,9 +167,12 @@ func (r *podRouteResolver) serviceFor(route string) string {
 // desired=期望副本数,desiredOK=false 表示这轮没查出来(不发 gauge,而不是发 0 —— 0 会被读成"缩到零")。
 type svcRep struct {
 	service, route string
-	n, ready       int
-	desired        int
-	desiredOK      bool
+	// role: "" for an ordinary service; "router"/"prefill"/"decode" for a
+	// prefill/decode-disaggregated one (see pdRoles).
+	role      string
+	n, ready  int
+	desired   int
+	desiredOK bool
 }
 
 // Lookup:后端 pod IP → route/service。未命中返回 ok=false(observe 侧回退 route/service=unknown)。
@@ -203,10 +220,10 @@ func (r *podRouteResolver) refresh(ctx context.Context) {
 	r.replicasReady.Reset()
 	r.replicasDesired.Reset()
 	for _, rp := range res.reps {
-		r.replicas.WithLabelValues(rp.service, rp.route).Set(float64(rp.n))
-		r.replicasReady.WithLabelValues(rp.service, rp.route).Set(float64(rp.ready))
+		r.replicas.WithLabelValues(rp.service, rp.route, rp.role).Set(float64(rp.n))
+		r.replicasReady.WithLabelValues(rp.service, rp.route, rp.role).Set(float64(rp.ready))
 		if rp.desiredOK {
-			r.replicasDesired.WithLabelValues(rp.service, rp.route).Set(float64(rp.desired))
+			r.replicasDesired.WithLabelValues(rp.service, rp.route, rp.role).Set(float64(rp.desired))
 		}
 	}
 	r.up.Set(1)
@@ -329,6 +346,9 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 	// 同一轮内共享:多个 route 常指向同一组工作负载(如 cart 与推理服务同属一个 release),
 	// 上溯路径高度重合,缓存把 apiserver 的 GET 次数压到每个对象一次。
 	ownerCache := map[string]*ownerObj{}
+	// Engine counts per role, for the disaggregated releases among these routes.
+	// One list for the whole round; empty on a cluster that has none.
+	pdByDS := r.pdRoles(ctx)
 	for _, it := range lst.Items {
 		route := routeName(it.Metadata.Name, it.Spec.Nginx.Route, it.Spec.Nginx.OutputConfigMap, len(it.Spec.Nginx.Peers))
 		if route == "" { // monitor-only(无 nginx 路由)→ 既不 poll 也无法归属
@@ -383,6 +403,19 @@ func (r *podRouteResolver) build(ctx context.Context) (resolveResult, error) {
 			// 期望副本数走 ownerRef 上溯,失败只是这条 gauge 缺一轮,不影响富化映射。
 			if d, ok := r.desiredForPod(ctx, ns, samplePod, ownerCache); ok {
 				rep.desired, rep.desiredOK = d, true
+			}
+		}
+		// A disaggregated release: what was counted above is its routers, so say so,
+		// and publish the engines beside it. Everything here keeps the same service
+		// and route labels -- one release stays one service, split by role.
+		if byRole := pdByDS[pdKey(ns, name)]; len(byRole) > 0 {
+			rep.role = pdRoleRouter
+			for _, role := range pdRoleNames(byRole) {
+				pr := byRole[role]
+				res.reps = append(res.reps, svcRep{
+					service: svcLabel, route: route, role: role,
+					n: pr.n, ready: pr.ready, desired: pr.desired, desiredOK: pr.desiredOK(),
+				})
 			}
 		}
 		res.reps = append(res.reps, rep)

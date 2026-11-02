@@ -29,9 +29,12 @@ rules:
   - apiGroups: [ "apps" ]
     resources: [ "replicasets", "deployments", "statefulsets" ]
     verbs: [ "get" ]
+  # get: the ownerRef walk above. list: the per-role engine counts (role="prefill"
+  # / "decode" on the replica gauges), one list per refresh for the whole cluster.
+  # Without list those series are simply absent; nothing else is affected.
   - apiGroups: [ "leaderworkerset.x-k8s.io" ]
     resources: [ "leaderworkersets" ]
-    verbs: [ "get" ]
+    verbs: [ "get", "list" ]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
