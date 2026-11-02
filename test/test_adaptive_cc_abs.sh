@@ -65,15 +65,32 @@ fv(){ curl -s "$1/_tps_status" | python3 -c "import sys,json;d=json.load(sys.std
 
 echo "########## adaptive_cc 绝对头寸(ABS) ##########"
 # 同样 ~3 持续并发打两条路由(healthy 快解码 → ewma>50)。跑 ~14s(7 个 interval)让 cc 收敛。
-( load_n $AB5 3 14 ) & ( load_n $AB0 3 14 ) & wait
-cc5=$(fv $AB5 adaptive_cc); cc0=$(fv $AB0 adaptive_cc)
-ev5=$(fv $AB5 ewma_tps);    conc5=$(fv $AB5 adaptive_cc_conc); conc0=$(fv $AB0 adaptive_cc_conc)
-echo "  [ab5] cc=$cc5 conc=$conc5 ewma=$ev5   [ab0] cc=$cc0 conc=$conc0"
-# ① ABS=5:cc 收敛到 ~conc+5(绝对头寸),即 cc ≥ conc+4(留 1 容差)
-awk "BEGIN{exit !($cc5>=$conc5+4)}" && ok "① ABS=5 cc 抬到 conc+ABS (cc=$cc5 ≥ conc($conc5)+4)" || no "① cc5=$cc5 未达 conc($conc5)+ABS"
-# ② ABS=0 对照:退回旧相对逻辑 cc≈conc×1.25,无绝对头寸(cc0 < conc0+ABS,且 ≤ conc0×1.5)
-awk "BEGIN{exit !($cc0<=$conc0*1.5 && $cc0<$conc0+4)}" && ok "② ABS=0 退回旧逻辑 cc≈1.25×conc (cc=$cc0, conc=$conc0)" || no "② cc0=$cc0 未回落旧相对逻辑(conc=$conc0)"
-awk "BEGIN{exit !($cc5>$cc0+2)}" && ok "③ ABS=5 显著高于 ABS=0 (cc5=$cc5 vs cc0=$cc0)" || no "③ cc5($cc5) 未显著高于 cc0($cc0)"
+# conc is the live in-flight count, so it is read while the load runs: once the load stops it is 0.
+# (It used to be a copy taken at each arrival, which kept the last value after the load ended.)
+# Sampled once a second over the last 5s; the trajectory is printed and the checks use the peaks.
+( load_n $AB5 3 14 ) & ( load_n $AB0 3 14 ) &
+sleep 9
+samp="$PREFIX/samples"; : > "$samp"
+for i in 1 2 3 4 5; do
+  echo "$(fv $AB5 adaptive_cc_conc) $(fv $AB5 adaptive_cc) $(fv $AB0 adaptive_cc_conc) $(fv $AB0 adaptive_cc)" >> "$samp"
+  sleep 1
+done
+wait
+echo "  samples (conc5 cc5 conc0 cc0):"; sed 's/^/    /' "$samp"
+mx(){ python3 -c "v=[float(l.split()[$1]) for l in open('$samp') if l.split()[$1] not in ('None','')];print(max(v) if v else 0)"; }
+conc5=$(mx 0); cc5=$(mx 1); conc0=$(mx 2); cc0=$(mx 3)
+ev5=$(fv $AB5 ewma_tps)
+echo "  [ab5] peak cc=$cc5 conc=$conc5 ewma=$ev5   [ab0] peak cc=$cc0 conc=$conc0"
+# Peaks, not medians: this load swings between ~3 and ~6 in flight, and with hold_when_idle off
+# cc rises on the peaks and shrinks back on the troughs, a tick behind. A median of five samples
+# lands on whichever phase three of them happened to catch.
+# ① ABS=5: cc carries ABS of headroom over conc, i.e. cc >= conc+4 (1 of slack).
+awk "BEGIN{exit !($cc5>=$conc5+4)}" && ok "① ABS=5 cc 抬到 conc+ABS (峰值 cc=$cc5 ≥ conc($conc5)+4)" || no "① 峰值 cc5=$cc5 未达 conc($conc5)+ABS"
+# ② ABS=0: no absolute headroom, cc0 < conc0+4. No upper bound relative to conc: a 429 tick grows cc
+#    by xINC without the desired cap, and the peak can come from one.
+awk "BEGIN{exit !($cc0<$conc0+4)}" && ok "② ABS=0 无绝对头寸 (峰值 cc=$cc0 < conc($conc0)+4)" || no "② 峰值 cc0=$cc0 带了绝对头寸(conc=$conc0)"
+# ③ ABS=5 ends up clearly above ABS=0 under the same load.
+awk "BEGIN{exit !($cc5>=$cc0+2)}" && ok "③ ABS=5 显著高于 ABS=0 (峰值 cc5=$cc5 vs cc0=$cc0)" || no "③ 峰值 cc5($cc5) 未显著高于 cc0($cc0)"
 
 # ④ 缩保留 ABS 绝对底:ab5 停到很低并发(1),cc 应缩但不破 conc+ABS(≈6),不塌到 min=2
 load_n $AB5 1 12

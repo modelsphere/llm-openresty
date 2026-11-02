@@ -17,6 +17,9 @@
 #   ⑨ hold off, sparse traffic (each request arrives with nothing else in flight, so conc reads 0 while
 #      the TPS signal stays alive): cc shrinks toward init. It used to stay at the last busy value,
 #      because a tick with conc == 0 was exempt from the slack shrink.
+#   ⑩ long requests still running, none arriving: conc is the live in-flight count. It used to be a
+#      copy taken when a request arrived, with a TTL (8s here), so once the TTL ran out it read 0 while
+#      requests were still running, and the completions kept the TPS signal alive meanwhile.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
@@ -34,7 +37,7 @@ srv=$(grep -n "^server {" "$ENGINE"|head -1|cut -d: -f1); end=$(awk -v s="$srv" 
 sed -n "${start},${end}p" "$ENGINE" > "$PREFIX/initblock.conf"
 source "$HERE/lib_initblock.sh"; prepend_lua_path "$PREFIX/initblock.conf" "$HERE/../lua"
 
-ROUTES="hold ctl hbad late sparse"
+ROUTES="hold ctl hbad late sparse inflt"
 {
 cat <<'EOF'
 worker_processes 1; error_log logs/error.log warn; pid logs/nginx.pid;
@@ -68,6 +71,7 @@ cat <<'EOF'
     _G.register_route("late", function() return R({adaptive_cc_ttl=20}) end)              -- off, cc TTL > tps_ttl (for ⑧)
     -- off, gentler shrink and a long cc TTL so ⑨ sees steps rather than a jump to init or an expiry
     _G.register_route("sparse", function() return R({adaptive_cc_dec=0.8, adaptive_cc_ttl=60}) end)
+    _G.register_route("inflt",  function() return R({adaptive_cc_dec=0.8, adaptive_cc_ttl=60}) end)   -- ⑩
   }
 EOF
 port=19750
@@ -90,6 +94,7 @@ sleep 3; "$OPENRESTY" -p "$PREFIX" -c "$PREFIX/nginx.conf"; sleep 2
 P=0; F=0; ok(){ echo "  ✓ $1"; P=$((P+1)); }; no(){ echo "  ✗ FAIL: $1"; F=$((F+1)); }
 H="Content-Type: application/json"; A="Authorization: Bearer $KEY"
 HOLD=http://127.0.0.1:19750; CTL=http://127.0.0.1:19751; HBAD=http://127.0.0.1:19752; LATE=http://127.0.0.1:19753; SPARSE=http://127.0.0.1:19754
+INFLT=http://127.0.0.1:19755
 body(){ echo "{\"stream_options\":{\"include_usage\":true},\"model\":\"x\",\"stream\":true,\"chunk_delay_ms\":$1,\"max_tokens\":$2,\"prefill_delay_ms\":15,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"; }
 fire(){ curl -s -o /dev/null -N -H "$A" -H "$H" -d "$(body $2 $3)" "$1/v1/chat/completions"; }
 # keep ~n overlapping requests for dur seconds (chunk ms x tokens per request)
@@ -115,10 +120,9 @@ ah=$(burst_ok $HOLD 25)
 
 # ③ high load (~30 in flight) on both: both climb above 20. 16s rather than 10s: on a busy test box
 #   the climb is slower. The control's peak is read at once (its slack shrink starts as soon as load
-#   drops). The hold route then gets a short light load before its peak is read: the in-flight count
-#   from the high load (rt_sum) lingers until the next request overwrites it, and a timer tick in that
-#   gap is a legitimate pressure step -- read before it settles, ④ would mistake it for light load
-#   raising cc.
+#   drops). The hold route then gets a short light load before its peak is read: the high load's
+#   requests are still finishing at first, and a timer tick that sees them is a legitimate pressure
+#   step -- read before it settles, ④ would mistake it for light load raising cc.
 ( load_n $HOLD 22 16 ) & ( load_n $CTL 22 16 ) & wait
 cpk=$(fv $CTL adaptive_cc)
 load_n $HOLD 1 6
@@ -182,17 +186,17 @@ la=$(fv $LATE adaptive_cc)
 [ "$la" = "$lm" ] && ok "⑧ value kept after hold was switched on on an idle pool ($la)" \
                   || no "⑧ value $lm became $la after hold was switched on and the old TTL passed"
 
-# ⑨ hold off, sparse traffic: conc (the in-flight count a request sees on arrival) is 0 at every
-#   arrival, while each request still feeds the TPS signal (12ms x 40 tokens = ~0.5s of decode, above
-#   tps_min_decode_s). Every tick then sees a live signal and conc == 0; cc must shrink toward init.
+# ⑨ hold off, sparse traffic: requests go one at a time, so a tick sees at most one in flight, while
+#   each request still feeds the TPS signal (12ms x 40 tokens = ~0.5s of decode, above
+#   tps_min_decode_s). Every tick then sees a live signal and conc 0 or 1; cc must shrink toward init.
 seq_load(){ local u=$1 dur=$2; local endt=$((SECONDS+dur))
   while [ "$SECONDS" -lt "$endt" ]; do fire "$u" 12 40 >/dev/null 2>&1; sleep 0.4; done; }
 load_n $SPARSE 22 16
-seq_load $SPARSE 3    # the first sequential arrival overwrites the high-load in-flight count with 0
+seq_load $SPARSE 3    # lets the high load drain; nothing is in flight once seq_load returns
 s0=$(fv $SPARSE adaptive_cc); sc=$(fv $SPARSE adaptive_cc_conc); se=$(fv $SPARSE ewma_tps)
 echo "  sparse route: cc=$s0 conc=$sc ewma=$se"
 [ "$sc" = "0" ] && ok "⑨ precondition: conc reads 0 under sparse traffic" || no "⑨ precondition: conc=$sc, want 0"
-[ "$se" != "None" ] && ok "⑨ precondition: TPS signal present ($se)" \
+[ -n "$se" ] && [ "$se" != "None" ] && ok "⑨ precondition: TPS signal present ($se)" \
                     || no "⑨ precondition: no TPS signal; the step below would test the idle path instead"
 awk "BEGIN{exit !($(num $s0)>4)}" && ok "⑨ precondition: cc above init before the sparse phase ($s0)" \
                                  || no "⑨ precondition: cc=$s0 already near init (2); nothing left to shrink"
@@ -203,6 +207,24 @@ s1=$(fv $SPARSE adaptive_cc)
 echo "  sparse route after 12s: cc=$s1 (was $s0)"
 awk "BEGIN{exit !($(num $s1)>=2 && $(num $s1)<$(num $s0))}" && ok "⑨ sparse traffic shrinks cc ($s0 → $s1)" \
                                                            || no "⑨ cc $s0 → $s1 under sparse traffic, want lower"
+
+# ⑩ ten requests at once, lengths 300..2100 tokens at 12ms (3.6s..25.2s), and nothing after them.
+#   Read at 12s, past the 8s the old copy lived: the ones over 1000 tokens (6) are still running,
+#   and the ones that finished in the last 8s keep the TPS signal alive. conc must be that live count,
+#   not 0, and cc must still leave room for it. Under the old copy conc read None here.
+load_n $INFLT 22 16                      # raise cc first, as in ⑨, so a wrong conc 0 would have room to shrink it
+sleep 2                                  # let it drain
+for t in 300 500 700 900 1100 1300 1500 1700 1900 2100; do fire "$INFLT" 12 $t >/dev/null 2>&1 & done
+sleep 12
+ic=$(fv $INFLT adaptive_cc_conc); icc=$(fv $INFLT adaptive_cc); ie=$(fv $INFLT ewma_tps)
+echo "  in-flight route at 12s: conc=$ic cc=$icc ewma=$ie (6 expected in flight)"
+[ -n "$ie" ] && [ "$ie" != "None" ] && ok "⑩ precondition: TPS signal alive from the completions ($ie)" \
+                                   || no "⑩ precondition: no TPS signal ($ie); the tick would not run the slack branch"
+awk "BEGIN{exit !($(num $ic)>=4 && $(num $ic)<=8)}" && ok "⑩ conc is the live in-flight count ($ic, ~6) with no arrival for 12s" \
+                                                   || no "⑩ conc=$ic with ~6 requests still running, want 4..8"
+awk "BEGIN{exit !($(num $icc)>=$(num $ic))}" && ok "⑩ cc ($icc) still covers the requests in flight ($ic)" \
+                                            || no "⑩ cc=$icc shrank below the $ic requests still in flight"
+wait
 
 echo "==== result: PASS=$P FAIL=$F ===="
 [ "$F" -eq 0 ] && echo "ALL GOOD" || echo "HAS FAILURES"

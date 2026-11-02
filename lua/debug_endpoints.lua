@@ -371,7 +371,7 @@ function _G.dbg_tps_status(opts)
             adaptive_cc_init[mkey] = route.derive_initcc(opts, maxcc, adaptive_cc_min[mkey])
             local pfx = tps.tps_key_prefix(opts, model)            -- 统一走 helper
             local cc  = td and td:get(pfx .. "adaptive_cc") or nil
-            local rts = td and td:get(pfx .. "rt_sum") or nil     -- timer 判压力用的实时并发(nil=无近期流量)
+            local rts = route.pool_inflight(opts, model)           -- live in-flight count, the same one the timer reads
             adaptive_cc[mkey]      = cc
             adaptive_cc_conc[mkey] = rts
             adaptive_cc_rej[mkey]  = td and td:get(pfx .. "rej") or 0   -- 本区间被压抑需求(并发429数);只读不清零
@@ -462,9 +462,9 @@ function _G.dbg_tps_status(opts)
         adaptive_cc_max       = adaptive_cc_max,     -- 静态池容量(=AIMD max clamp)
         adaptive_cc_init      = adaptive_cc_init,    -- start point + slack-shrink floor (= min unless configured)
         adaptive_cc_hold_when_idle = hold_when_idle,   -- true/false when adaptive_cc is on, absent otherwise
-        adaptive_cc_conc      = adaptive_cc_conc,    -- 当前并发 rt_sum(do_route 存,timer 判压力用,全 peer 含 banned;nil=无近期流量)
+        adaptive_cc_conc      = adaptive_cc_conc,    -- requests in flight now, all peers incl. banned (route.pool_inflight; what the timer reads)
         adaptive_cc_at_pressure = adaptive_cc_at_pressure,  -- 健康时下一tick 会涨(conc>=cc×pressure_frac)
-        adaptive_cc_at_slack    = adaptive_cc_at_slack,     -- 健康时下一tick 会缩(conc<cc×slack_frac,含 conc=0)
+        adaptive_cc_at_slack    = adaptive_cc_at_slack,     -- healthy: the next tick shrinks (conc < cc×slack_frac, conc 0 included)
         adaptive_cc_pressure_frac = opts.adaptive_cc and opts.adaptive_cc_pressure_frac or nil,
         adaptive_cc_slack_frac    = opts.adaptive_cc and opts.adaptive_cc_slack_frac or nil,
         adaptive_cc_abs       = opts.adaptive_cc and opts.adaptive_cc_abs or nil,   -- 绝对头寸(slots)

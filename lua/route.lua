@@ -541,6 +541,28 @@ function M.resolve_pool(opts, model)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
+-- M.inflight(opts, peer_keys) — requests in flight on a pool right now: the sum of the per-peer
+-- active_conns counters over every peer, banned ones included (see rt_sum in assess_pool for why).
+-- The counters are kept live (incr on admit, decr in the log phase, moved on a balancer retry), so
+-- this is the current count whenever it is read. The admission check (assess_pool), the AIMD
+-- timer and /_tps_status all read it here, so they agree on one number.
+-- M.pool_inflight(opts, model) is the same for a sub-pool by model (false = a flat route), for
+-- callers that have a model rather than the pool's keys.
+-- ══════════════════════════════════════════════════════════════════════
+function M.inflight(opts, peer_keys)
+    local dict = ngx.shared[opts.active_conns_dict]
+    local n = 0
+    if not dict or not peer_keys then return n end
+    for _, k in ipairs(peer_keys) do n = n + (dict:get(k) or 0) end
+    return n
+end
+
+function M.pool_inflight(opts, model)
+    local _, peer_keys = M.resolve_pool(opts, model)
+    return M.inflight(opts, peer_keys)
+end
+
+-- ══════════════════════════════════════════════════════════════════════
 -- M.assess_pool(opts, peers, peer_keys) — 只读评估(无锁、无 pick、无副作用):
 -- 算 healthy_all / 优先级活跃层 healthy_peers / 容量 limit,rt_sum,avg_5min。
 -- 全 banned 时返 {empty=true}。do_route 用它先做 503/429 判定(锁不上 429 路径);
@@ -548,7 +570,6 @@ end
 -- ══════════════════════════════════════════════════════════════════════
 function M.assess_pool(opts, peers, peer_keys)
     local bad  = ngx.shared[opts.bad_peers_dict]
-    local dict = ngx.shared[opts.active_conns_dict]
     local default_max = opts.default_max
 
     local healthy_all = {}   -- {ip, port, orig_idx, "host:port", priority, max}
@@ -583,8 +604,7 @@ function M.assess_pool(opts, peers, peer_keys)
     -- 注:limit(容量)仍只算 healthy(不能往 banned 发新流量);两者不对称是有意的——
     -- drain 期 rt_sum>limit → 诚实甩负载(下游确实满),换掉"悄悄超发+降速"。
     -- 无 banned 时全 peer == healthy_all,与旧行为字节等价。
-    local rt_sum = 0
-    for _, k in ipairs(peer_keys) do rt_sum = rt_sum + (dict:get(k) or 0) end
+    local rt_sum = M.inflight(opts, peer_keys)
     local _, _, avg_5min = M.compute_cluster_avg(opts.cluster_avg_dict,
         opts.peers_by_model and ngx.ctx.req_model or nil)
 
@@ -613,7 +633,7 @@ function M.assess_pool(opts, peers, peer_keys)
     -- do_route falls back to init (= min unless configured). tps_on tells the two nils apart (see do_route).
     local adaptive_cc, tps_prefix
     if tpd and opts.adaptive_cc then
-        tps_prefix  = tps.tps_key_prefix(opts)           -- 算一次,do_route stash rt_sum 复用(免热路径重算)
+        tps_prefix  = tps.tps_key_prefix(opts)           -- computed once; do_route reuses it for the rej counter
         adaptive_cc = tpd:get(tps_prefix .. "adaptive_cc")
     end
 

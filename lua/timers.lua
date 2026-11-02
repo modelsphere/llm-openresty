@@ -220,7 +220,7 @@ function M.do_adaptive_cc_loop(opts)
         local rej = td:get(pre .. "rej") or 0
         if rej > 0 then td:delete(pre .. "rej") end
         if has_threshold then
-            local conc = td:get(pre .. "rt_sum") or 0
+            local conc = route.pool_inflight(opts, model)   -- live in-flight count, the one admission checks
             local mid  = (opts.adaptive_cc_pressure_frac + opts.adaptive_cc_slack_frac) / 2
             local ABS  = opts.adaptive_cc_abs or 0
             -- 目标 cc:相对(conc/mid≈1.25×)与绝对(conc+ABS)取大 → 任何并发下都留够 ABS 绝对头寸。
