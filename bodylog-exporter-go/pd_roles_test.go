@@ -264,3 +264,32 @@ func TestPDRolesEmptyGroupAsksNothing(t *testing.T) {
 		t.Errorf("replicas series = %d, want 1", n)
 	}
 }
+
+// The role label value would otherwise come straight off a cluster object. An
+// unknown role must not become a series: a mislabelled LeaderWorkerSet would add
+// one to three gauges for every route of that service and stay there.
+func TestPDRolesUnknownRoleIsNotASeries(t *testing.T) {
+	const odd = `{"items":[
+      {"metadata":{"namespace":"pd","name":"qwen-2p1d-0-ab12-prefill",
+        "labels":{"disaggregatedset.x-k8s.io/name":"qwen-2p1d","disaggregatedset.x-k8s.io/role":"prefill"}},
+       "spec":{"replicas":1},"status":{"replicas":1,"readyReplicas":1}},
+      {"metadata":{"namespace":"pd","name":"qwen-2p1d-0-ab12-whatever",
+        "labels":{"disaggregatedset.x-k8s.io/name":"qwen-2p1d","disaggregatedset.x-k8s.io/role":"whatever"}},
+       "spec":{"replicas":7},"status":{"replicas":7,"readyReplicas":7}}
+    ]}`
+	srv := pdServer(t, odd, 0, nil)
+	defer srv.Close()
+	r := newTestResolver(t, srv)
+	r.refresh(context.Background())
+
+	if got, ok := gauge(t, r.replicas, lbl("pd/qwen-2p1d", "qwen", "prefill")); !ok || got != 1 {
+		t.Errorf("replicas{role=\"prefill\"} = %v (present=%v), want 1", got, ok)
+	}
+	if got, ok := gauge(t, r.replicas, lbl("pd/qwen-2p1d", "qwen", "whatever")); ok {
+		t.Errorf("replicas{role=\"whatever\"} = %v, want no series", got)
+	}
+	// router + prefill, and nothing else.
+	if n := testutil.CollectAndCount(r.replicas); n != 2 {
+		t.Errorf("replicas series = %d, want 2 (router + prefill)", n)
+	}
+}

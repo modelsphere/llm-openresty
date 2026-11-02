@@ -43,6 +43,15 @@ const (
 	pdRetryAfter = 30 * time.Minute
 )
 
+// The roles a DisaggregatedSet defines, and the only values that become a metric
+// label. The label value would otherwise come straight off a cluster object, and
+// a metric label sourced from a free-form object label has no bound on its
+// cardinality -- one mislabelled LeaderWorkerSet would be a new series on three
+// gauges, for every route of that service, until someone noticed. An unknown role
+// is dropped and named in the log once, so a role this build has not heard of
+// shows up as a line to read rather than as silence.
+var pdKnownRoles = map[string]bool{"prefill": true, "decode": true}
+
 // pdRoleRep: one role's engine counts, summed over the release's slices.
 //
 // slices/withSpec exist so desired is published only when it covers the whole
@@ -123,6 +132,14 @@ func (r *podRouteResolver) pdRoles(ctx context.Context) map[string]map[string]*p
 		ds, role := it.Metadata.Labels[pdNameLabel], it.Metadata.Labels[pdRoleLabel]
 		if ds == "" || role == "" {
 			continue // owned by something that labels differently; not ours to interpret
+		}
+		if !pdKnownRoles[role] {
+			if !r.pdUnknownRoles[role] {
+				r.pdUnknownRoles[role] = true
+				log.Printf("route-enrich: ignoring LeaderWorkerSet %s/%s: role %q is not one this build reports",
+					it.Metadata.Namespace, it.Metadata.Name, role)
+			}
+			continue
 		}
 		key := it.Metadata.Namespace + "/" + ds
 		byRole := out[key]

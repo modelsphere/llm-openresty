@@ -68,6 +68,7 @@ type podRouteResolver struct {
 	// the refresh goroutine (see pdRoles).
 	pdGroup, pdVersion string
 	pdSkipUntil        time.Time
+	pdUnknownRoles     map[string]bool // roles already named in the log, so each is named once
 
 	up      prometheus.Gauge
 	pods    prometheus.Gauge
@@ -109,27 +110,28 @@ func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
 	r := &podRouteResolver{
 		// Comma-separated; a deployment that has ModelRoutes under more than one group (e.g. while
 		// moving them between groups) lists them all, see listModelRoutes.
-		groups:        splitGroups(envOr("MODELROUTE_GROUP", "routing.modelsphere.dev")),
-		version:       envOr("MODELROUTE_VERSION", "v1alpha1"),
-		plural:        envOr("MODELROUTE_PLURAL", "modelroutes"),
-		nginxService:  strings.TrimSpace(envOr("OPENRESTY_SERVICE", "")),
-		perService:    envOr("OPENRESTY_POLL_PER_SERVICE", "true") != "false",
-		pollPort:      envOrInt("OPENRESTY_POLL_PORT", 8080),
-		pdGroup:       envOr("PD_ROLE_GROUP", "leaderworkerset.x-k8s.io"),
-		pdVersion:     envOr("PD_ROLE_VERSION", "v1"),
-		interval:      interval,
-		timeout:       timeout,
-		apiBase:       apiBase,
-		tokenPath:     k8sTokenPath,
-		client:        &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tlsCfg}},
-		byIP:          map[string]routeInfo{},
-		svc:           map[string]string{},
-		up:            prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_up", Help: "上轮 ModelRoute 发现/映射刷新是否成功(1/0)"}),
-		pods:          prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_pods", Help: "当前映射覆盖的后端 pod IP 数"}),
-		routesG:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_routes", Help: "当前发现的 route 数(poll 列表)"}),
-		errs:          prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "ModelRoute 发现/映射刷新出错累计"}),
-		replicas:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service 当前后端总数(含未就绪)。role=\"\" 普通服务;PD 分离服务按角色拆:router=discovery.service 选中的路由器 pod,prefill/decode=引擎(1 个 LWS group 记 1 个)"}, []string{"service", "route", "role"}),
-		replicasReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端数。role 同 bodylog_service_replicas:\"\" / router / prefill / decode"}, []string{"service", "route", "role"}),
+		groups:         splitGroups(envOr("MODELROUTE_GROUP", "routing.modelsphere.dev")),
+		version:        envOr("MODELROUTE_VERSION", "v1alpha1"),
+		plural:         envOr("MODELROUTE_PLURAL", "modelroutes"),
+		nginxService:   strings.TrimSpace(envOr("OPENRESTY_SERVICE", "")),
+		perService:     envOr("OPENRESTY_POLL_PER_SERVICE", "true") != "false",
+		pollPort:       envOrInt("OPENRESTY_POLL_PORT", 8080),
+		pdGroup:        envOr("PD_ROLE_GROUP", "leaderworkerset.x-k8s.io"),
+		pdVersion:      envOr("PD_ROLE_VERSION", "v1"),
+		pdUnknownRoles: map[string]bool{},
+		interval:       interval,
+		timeout:        timeout,
+		apiBase:        apiBase,
+		tokenPath:      k8sTokenPath,
+		client:         &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tlsCfg}},
+		byIP:           map[string]routeInfo{},
+		svc:            map[string]string{},
+		up:             prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_up", Help: "上轮 ModelRoute 发现/映射刷新是否成功(1/0)"}),
+		pods:           prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_pods", Help: "当前映射覆盖的后端 pod IP 数"}),
+		routesG:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_route_resolver_routes", Help: "当前发现的 route 数(poll 列表)"}),
+		errs:           prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_route_resolver_errors_total", Help: "ModelRoute 发现/映射刷新出错累计"}),
+		replicas:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas", Help: "该 service 当前后端总数(含未就绪)。role=\"\" 普通服务;PD 分离服务按角色拆:router=discovery.service 选中的路由器 pod,prefill/decode=引擎(1 个 LWS group 记 1 个)"}, []string{"service", "route", "role"}),
+		replicasReady:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_ready", Help: "该 service 当前就绪后端数。role 同 bodylog_service_replicas:\"\" / router / prefill / decode"}, []string{"service", "route", "role"}),
 		// 期望副本数:判「降级」要拿【就绪】比【期望】,不能比【实际】—— 滚动更新的 maxSurge 会把实际抬高,
 		// 拿实际当分母会在每次 rollout 期间把满员的服务误判成降级。查不到时不发这条 series(见 desiredForPod)。
 		replicasDesired: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "bodylog_service_replicas_desired", Help: "该 service 期望副本数(顶层工作负载 spec.replicas;LWS 取 LWS 本身而非被 surge 抬高的 StatefulSet)。role 同 bodylog_service_replicas;按角色拆时要该角色每个 slice 都报了才发"}, []string{"service", "route", "role"}),
