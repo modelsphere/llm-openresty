@@ -109,9 +109,9 @@
 | `openresty_ttft_ewma_ms` | gauge | service,route,model | TTFT EWMA(ms) |
 | `openresty_tps_limiter_active` / `openresty_ttft_limiter_active` | gauge | service,route | 限流是否生效(1/0) |
 | `openresty_rejected_total` | **counter** | service,route,reason | 429 限流累计(reason=concurrency/ttft/tps) |
-| `openresty_poll_up` | gauge | — | 上轮 poll 是否全成功(1/0) |
+| `openresty_poll_up` | gauge | service,route | Whether all four endpoints of this route answered in the last poll (1/0); one route failing does not affect the others |
 | `openresty_poll_errors_total` | counter | — | poll 出错累计 |
-| `openresty_poll_last_success_seconds` | gauge | — | 上次成功 poll 的 unix 秒 |
+| `openresty_poll_last_success_seconds` | gauge | service,route | Unix time of this route's last fully successful poll |
 
 route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_route_resolver_*`(不再有独立的 `openresty_discovered_routes` / `openresty_route_discovery_*`)。
 

@@ -176,17 +176,63 @@ func TestPollUpIsPerRoute(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// Both orders: when 429 was pulled once per openresty through its first route, a broken route
+	// listed first took every route down with it (a route added before its engine is ready 502s).
+	for _, order := range [][]string{{"good", "bad"}, {"bad", "good"}} {
+		reg := prometheus.NewRegistry()
+		m := newORMetrics(reg)
+		cfg := orConfig{baseURL: srv.URL, interval: time.Second, timeout: 2 * time.Second}
+		p := newORPoller(cfg, m, func() []string { return order }, nil)
+		p.pollOnce(context.Background())
+
+		if got := testutil.ToFloat64(m.pollUp.WithLabelValues("unknown", "good")); got != 1 {
+			t.Errorf("order %v: openresty_poll_up{route=good} = %v, 想要 1(它自己是好的,不该被 bad 连累)", order, got)
+		}
+		if got := testutil.ToFloat64(m.pollUp.WithLabelValues("unknown", "bad")); got != 0 {
+			t.Errorf("order %v: openresty_poll_up{route=bad} = %v, 想要 0", order, got)
+		}
+	}
+}
+
+// Each route pulls its own /<route>/_429_status (no ?all=1): a 429 failure marks only that route
+// down, and entries for other routes in the reply are not attributed to it.
+func TestPoll429IsPerRoute(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/a/_429_status":
+			w.WriteHeader(502)
+		case r.URL.Path == "/b/_429_status":
+			paths = append(paths, r.URL.RequestURI())
+			_, _ = w.Write([]byte(`{"by_route":{"b":{"tps":4},"a":{"tps":99}}}`))
+		case strings.HasSuffix(r.URL.Path, "/_route_state"):
+			_, _ = w.Write([]byte(`{"route":"x","active_level":1,"limit":10,"healthy_peers_in_level":1}`))
+		default:
+			_, _ = w.Write([]byte(`{"active":false}`))
+		}
+	}))
+	defer srv.Close()
+
 	reg := prometheus.NewRegistry()
 	m := newORMetrics(reg)
 	cfg := orConfig{baseURL: srv.URL, interval: time.Second, timeout: 2 * time.Second}
-	p := newORPoller(cfg, m, func() []string { return []string{"good", "bad"} }, nil)
+	p := newORPoller(cfg, m, func() []string { return []string{"a", "b"} }, nil)
 	p.pollOnce(context.Background())
 
-	if got := testutil.ToFloat64(m.pollUp.WithLabelValues("unknown", "good")); got != 1 {
-		t.Errorf("openresty_poll_up{route=good} = %v, 想要 1(它自己是好的,不该被 bad 连累)", got)
+	if got := testutil.ToFloat64(m.pollUp.WithLabelValues("unknown", "a")); got != 0 {
+		t.Errorf("poll_up{route=a} = %v, want 0 (its 429 endpoint failed)", got)
 	}
-	if got := testutil.ToFloat64(m.pollUp.WithLabelValues("unknown", "bad")); got != 0 {
-		t.Errorf("openresty_poll_up{route=bad} = %v, 想要 0", got)
+	if got := testutil.ToFloat64(m.pollUp.WithLabelValues("unknown", "b")); got != 1 {
+		t.Errorf("poll_up{route=b} = %v, want 1 (a's failure must not affect it)", got)
+	}
+	if got := testutil.ToFloat64(m.rejected.WithLabelValues("unknown", "b", "tps")); got != 4 {
+		t.Errorf("rejected{route=b,reason=tps} = %v, want 4", got)
+	}
+	if got := testutil.CollectAndCount(m.rejected); got != 3 { // b x 3 reasons; nothing for a
+		t.Errorf("rejected series = %d, want 3 (a's entry in b's reply must not be counted)", got)
+	}
+	if len(paths) != 1 || paths[0] != "/b/_429_status" {
+		t.Errorf("429 requests = %v, want [/b/_429_status] (per-route view, no ?all=1)", paths)
 	}
 }
 
