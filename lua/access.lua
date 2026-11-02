@@ -12,6 +12,7 @@ local tps          = require "tps"
 local bodylog      = require "bodylog"
 local reqtransform = require "reqtransform"
 local api_keys     = require "api_keys"
+local session_prio = require "session_prio"
 
 -- ══════════════════════════════════════════════════════════════════════
 -- _G.do_route(opts) — access_by_lua_block 主体（参数化路由选址）
@@ -104,6 +105,25 @@ function _G.do_route(opts)
     ngx.ctx.session_id     = sid
     ngx.ctx.session_source = src or "none"
 
+    -- ── session_prio: turn-graded admission (default OFF) ──
+    -- prepare_request already settled the toggle once (ngx.ctx.sp_on) and, when on,
+    -- parsed x-phanrouter-session (ngx.ctx.phan_session). With the feature off this
+    -- block does zero dict reads and changes nothing.
+    local sp_on = ngx.ctx.sp_on and true or false
+    local sp_bucket          -- numeric index into _sp_table, or "nohdr"
+    if sp_on then
+        local class = ngx.ctx.phan_session_class or "missing"
+        local info = ngx.ctx.phan_session
+        if info then
+            sp_bucket = session_prio.bucket_of(opts._sp_table, info.turn)
+        else
+            sp_bucket = "nohdr"      -- missing/invalid header: warm (top bucket) policy, own counters
+        end
+        session_prio.count_hdr(opts, class)
+        session_prio.note_nohdr_minute(opts, class)
+        ngx.ctx.sp_bucket = sp_bucket
+    end
+
     -- ── 规则化请求拒绝(reject_rules)──
     -- 按请求内容(max_tokens/stream/input_bytes/...)匹配规则,命中即返回可配 status(默认 429)。
     -- 放在池评估之前:规则拒绝不该消耗池评估。命中时 eval_reject_rules 内部 ngx.exit 直接结束请求;
@@ -170,12 +190,24 @@ function _G.do_route(opts)
                      math.max(opts.tps_ttl or 60, opts.adaptive_cc_interval * 3))
         end
     end
-    local hit_rt  = a.rt_sum   >= limit * opts.rt_limit_factor
+    -- session_prio: the concurrency gate scales this request's ceiling by its
+    -- bucket's share. The top (warm) bucket's share is 1.0, byte-identical to
+    -- the feature being off; lower-turn buckets cede progressively. The pool
+    -- limit itself (the AIMD output) is unchanged.
+    local sp_share
+    if sp_on then
+        local b = sp_bucket == "nohdr" and opts._sp_top or sp_bucket
+        sp_share = opts._sp_table[b].share
+    end
+    local eff_limit = limit * opts.rt_limit_factor
+    if sp_share then eff_limit = eff_limit * sp_share end
+    local hit_rt  = a.rt_sum   >= eff_limit
     -- 2026-07-02 暂时禁用均值判断,只用实时值 rt_sum 判过载(原: a.avg_5min >= limit)
     local hit_avg = false
     if (hit_rt or hit_avg) and not is_probe then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":concurrency",1,0) end end
+        if sp_on then session_prio.count(opts, sp_bucket, "rej_conc") end
         -- 修复1:自适应路由的并发 429 = 需求超过当前 cc(被拒的量 rt_sum 看不到)。
         -- 记 per-pool 拒绝计数,do_adaptive_cc_loop 每 tick 读+清零当"上区间被压抑需求"信号 → 快涨。
         if opts.adaptive_cc and a.tps_prefix then
@@ -183,21 +215,32 @@ function _G.do_route(opts)
             if _tpd then _tpd:incr(a.tps_prefix .. "rej", 1, 0,
                     math.max(opts.tps_ttl or 60, opts.adaptive_cc_interval * 3)) end
         end
+        -- turn_bucket is added only when the feature is on, always appended at
+        -- the END of the body (the external contract only ever gains fields).
+        -- Assembled via a "%s}" placeholder: on -> ',"turn_bucket":N'; off ->
+        -- empty, so the two bodies stay byte-identical to today.
+        local tb_field = ""
+        if sp_on then
+            tb_field = string.format([[, "turn_bucket":%s]], sp_bucket == "nohdr" and "0"
+                or tostring(opts._sp_table[sp_bucket].min_turn))
+        end
         ngx.header["Content-Type"] = "application/json"
         ngx.header["Retry-After"]  = "1"
         local trig = hit_rt and ("realtime_" .. opts.rt_limit_factor .. "x") or "avg_5min"
         if opts.adaptive_cc then
             -- 自适应路由:limit/adaptive_cc 是浮点(AIMD 乘子),统一 %.1f;附静态 pool_limit 便于看收缩幅度
             ngx.say(string.format(
-                [[{"error":"concurrency limit exceeded","trigger":"%s","realtime":%d,"avg_5min":%.1f,"limit":%.1f,"pool_limit":%d,"adaptive_cc":%.1f,"rt_factor":%s,"healthy_peers":%d,"active_level":%d,"route":"%s"}]],
+                [[{"error":"concurrency limit exceeded","trigger":"%s","realtime":%d,"avg_5min":%.1f,"limit":%.1f,"pool_limit":%d,"adaptive_cc":%.1f,"rt_factor":%s,"healthy_peers":%d,"active_level":%d,"route":"%s"%s}]],
                 trig, a.rt_sum, a.avg_5min, limit, pool_limit, (a.adaptive_cc or pool_limit),
-                tostring(opts.rt_limit_factor), #a.healthy_peers, active_level, opts.route_name))
+                tostring(opts.rt_limit_factor), #a.healthy_peers, active_level, opts.route_name, tb_field))
         else
-            -- 非自适应路由:与改动前逐字节一致(limit=静态整数,不加新字段)
+            -- Non-adaptive route: byte-identical to before while the feature is
+            -- off (limit is a static integer, no new fields); with session_prio
+            -- on, only turn_bucket (tb_field) is appended at the end.
             ngx.say(string.format(
-                [[{"error":"concurrency limit exceeded","trigger":"%s","realtime":%d,"avg_5min":%.1f,"limit":%d,"rt_factor":%s,"healthy_peers":%d,"active_level":%d,"route":"%s"}]],
+                [[{"error":"concurrency limit exceeded","trigger":"%s","realtime":%d,"avg_5min":%.1f,"limit":%d,"rt_factor":%s,"healthy_peers":%d,"active_level":%d,"route":"%s"%s}]],
                 trig, a.rt_sum, a.avg_5min, limit,
-                tostring(opts.rt_limit_factor), #a.healthy_peers, active_level, opts.route_name))
+                tostring(opts.rt_limit_factor), #a.healthy_peers, active_level, opts.route_name, tb_field))
         end
         return ngx.exit(429)
     end
@@ -212,7 +255,108 @@ function _G.do_route(opts)
     -- 触发的是哪条指标。多指标(OR)时,光看 ttft_limit 只能反推,两条阈值相同就完全分不出来。
     local ttft_metric = hit_ttft and a.ttft_hit.hit_metric or "-"
     -- ttft_429_disabled:独立开关关掉硬 429(EWMA 测量 + cc 收缩仍在),TTFT 高只软控不硬拒。
-    if hit_ttft and not is_probe and not ttft.ttft_429_disabled(opts) and not ttft.ttft_allow_probe(opts) then
+    local ttft_hard429_off = ttft.ttft_429_disabled(opts)
+    -- ── session_prio: TTFT gate graded by turn ──
+    -- Structure (feature on, hard 429 not disabled, not a probe request):
+    --   fast path: no 1.0x trip and the turn-1 hold flag clear -> pass, with
+    --     zero extra assess calls and no ttft_dict_if_on.
+    --   hard: EWMA >= threshold x severe -> reject every bucket (turn >= 2 /
+    --     nohdr may still take a half-open probe slot).
+    --   soft: EWMA >= threshold x tol(bucket) -> reject; turn >= 2 / nohdr try
+    --     a probe slot first.
+    --   hysteresis: a 1.0x trip (any declared metric) sets the turn-1 flag;
+    --     it clears only when the release-level assess (mult = release, which
+    --     also covers EWMA expired/nil) no longer trips. While set, turn 1 is
+    --     rejected with no probe slot. The flag is written only on state change.
+    local sp_turn1_held
+    if sp_on and not ttft_hard429_off and not is_probe then
+        if hit_ttft then
+            -- 1.0x trip (any declared metric) -> set the flag (only on change).
+            local held, ftd, fkey = session_prio.turn1_held(opts)
+            sp_turn1_held = true
+            if not held and ftd then ftd:set(fkey, 1, opts.ttft_ttl) end
+        else
+            -- Fast path: flag clear -> no extra assess, no ttft_dict_if_on.
+            -- The release check runs only while the flag is held.
+            local held, ftd, fkey = session_prio.turn1_held(opts)
+            if held then
+                local td = ttft.ttft_dict_if_on(opts)
+                -- assess(mult = release) not tripping means every declared
+                -- metric's EWMA is below threshold x release, or the EWMA has
+                -- expired (nil never trips) -> turn 1 may come back.
+                if not td or not ttft.ttft_assess(opts, td, nil, false, opts.session_prio_release).hit then
+                    if ftd then ftd:set(fkey, 0, opts.ttft_ttl) end
+                    held = false
+                elseif ftd then
+                    -- Still holding: refresh the flag's TTL. Like the EWMA
+                    -- itself, the flag must live as long as the condition it
+                    -- tracks; otherwise a long, slowly draining overload
+                    -- (flags are re-written only on state change) would let
+                    -- it lapse mid-band and flap turn 1 back in early.
+                    ftd:set(fkey, 1, opts.ttft_ttl)
+                end
+            end
+            sp_turn1_held = held
+        end
+    end
+    local sp_ttft_reject, sp_ttft_hard
+    if sp_on and not is_probe and not ttft_hard429_off then
+        local tbl = opts._sp_table
+        local bidx = sp_bucket == "nohdr" and opts._sp_top or sp_bucket
+        local is_turn1 = sp_bucket ~= "nohdr" and tbl[sp_bucket].min_turn == 1
+        if hit_ttft or sp_turn1_held then
+            local td = ttft.ttft_dict_if_on(opts)
+            if td then
+                sp_ttft_hard = ttft.ttft_assess(opts, td, nil, false, opts.session_prio_severe).hit
+                if sp_ttft_hard then
+                    sp_ttft_reject = true
+                elseif is_turn1 then
+                    -- turn 1: tol is 1.0, so a 1.0x trip rejects it right here
+                    -- (and the hold flag does when there is no trip); turn 1 is
+                    -- never given a probe slot.
+                    sp_ttft_reject = true
+                else
+                    local tol = tbl[bidx].tol
+                    if ttft.ttft_assess(opts, td, nil, false, tol).hit then
+                        sp_ttft_reject = true
+                    end
+                end
+                -- Warm turns / nohdr still get the half-open probe budget
+                -- (hard and soft share the same one) so samples keep flowing;
+                -- turn 1 never reaches this, it leaves with the 429 above.
+                if sp_ttft_reject and not is_turn1 and ttft.ttft_allow_probe(opts) then
+                    sp_ttft_reject = false
+                end
+            end
+        end
+    end
+    if (sp_on and sp_ttft_reject) and not is_probe then
+        ngx.status = 429
+        do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":ttft",1,0) end end
+        session_prio.count(opts, sp_bucket, "rej_ttft")
+        local tb = sp_bucket == "nohdr" and "0" or tostring(opts._sp_table[sp_bucket].min_turn)
+        -- A hold-only rejection (flag set, no 1.0x trip) has no triggering
+        -- metric: report the first declared metric's name and threshold rather
+        -- than "-1/-", and use sp_zone="hold" so a borderline pool holding new
+        -- sessions out is obvious at a glance.
+        local body_ewma, body_limit, body_metric = ttft_ewma, ttft_limit, ttft_metric
+        local zone = sp_ttft_hard and "hard" or "soft"
+        if not hit_ttft then
+            zone = "hold"
+            local ms = ttft.ttft_metrics(opts)
+            local m1 = ms and ms[1]
+            body_metric = m1 and m1.metric or "-"
+            body_limit  = m1 and m1.threshold or nil
+        end
+        ngx.header["Content-Type"] = "application/json"
+        ngx.header["Retry-After"]  = "1"
+        ngx.say(string.format(
+            -- turn_bucket / sp_zone are appended after "metric" (tail fields only).
+            [[{"error":"ttft limit exceeded","trigger":"ttft_ewma","ttft_ewma":%.1f,"ttft_limit":%d,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s","metric":"%s","turn_bucket":%s,"sp_zone":"%s"}]],
+            body_ewma or -1, body_limit or -1, ngx.ctx.req_model or "-", #a.healthy_peers,
+            active_level, opts.route_name, body_metric, tb, zone))
+        return ngx.exit(429)
+    elseif (not sp_on) and hit_ttft and not is_probe and not ttft_hard429_off and not ttft.ttft_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":ttft",1,0) end end
         ngx.header["Content-Type"] = "application/json"
@@ -232,7 +376,51 @@ function _G.do_route(opts)
     local tps_ewma  = hit_tps and a.tps_hit.hit_ewma  or a.tps_ewma
     local tps_limit = hit_tps and a.tps_hit.hit_limit or nil
     local tps_metric = hit_tps and a.tps_hit.hit_metric or "-"   -- 同 TTFT:多指标时指出触发那一条
-    if hit_tps and not is_probe and not tps.tps_allow_probe(opts) then
+    -- ── session_prio: TPS gate graded by turn (low is bad, mirror of TTFT) ──
+    --   hard: EWMA <= threshold / severe -> reject every bucket (turn >= 2 /
+    --     nohdr may still take a probe slot).
+    --   soft: EWMA <= threshold / tol(bucket) -> reject; turn >= 2 / nohdr try
+    --     a probe slot first.
+    --   As under TTFT: turn 1 is tol 1.0, i.e. the plain 1.0x trip (tps_hit)
+    --   rejects it and it never probes. No hysteresis on TPS.
+    --   Only live on the TPS hard-fuse path (adaptive_cc off); AIMD routes are
+    --   unaffected here.
+    local sp_tps_reject
+    if sp_on and not is_probe and (not opts.adaptive_cc) and hit_tps then
+        local tbl = opts._sp_table
+        local bidx = sp_bucket == "nohdr" and opts._sp_top or sp_bucket
+        local is_turn1 = sp_bucket ~= "nohdr" and tbl[sp_bucket].min_turn == 1
+        local tpd = tps.tps_dict_if_on(opts)
+        if tpd then
+            -- 1.0x already tripped; turn 1 rejects and never probes.
+            -- turn >= 2 / nohdr take the hard/soft grading plus probes.
+            if is_turn1 then
+                sp_tps_reject = true
+            else
+                if tps.tps_assess(opts, tpd, nil, false, opts.session_prio_severe).hit then
+                    sp_tps_reject = true
+                elseif tps.tps_assess(opts, tpd, nil, false, tbl[bidx].tol).hit then
+                    sp_tps_reject = true
+                end
+                if sp_tps_reject and tps.tps_allow_probe(opts) then
+                    sp_tps_reject = false
+                end
+            end
+        end
+    end
+    if sp_on and sp_tps_reject and not is_probe then
+        ngx.status = 429
+        do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":tps",1,0) end end
+        session_prio.count(opts, sp_bucket, "rej_tps")
+        local tb = sp_bucket == "nohdr" and "0" or tostring(opts._sp_table[sp_bucket].min_turn)
+        ngx.header["Content-Type"] = "application/json"
+        ngx.header["Retry-After"]  = "1"
+        ngx.say(string.format(
+            [[{"error":"tps limit exceeded","trigger":"tps_ewma","tps_ewma":%.1f,"tps_limit":%.1f,"model":"%s","healthy_peers":%d,"active_level":%d,"route":"%s","metric":"%s","turn_bucket":%s}]],
+            tps_ewma, tps_limit, ngx.ctx.req_model or "-", #a.healthy_peers, active_level,
+            opts.route_name, tps_metric, tb))
+        return ngx.exit(429)
+    elseif (not sp_on) and hit_tps and not is_probe and not tps.tps_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":tps",1,0) end end
         ngx.header["Content-Type"] = "application/json"
@@ -243,6 +431,7 @@ function _G.do_route(opts)
         return ngx.exit(429)
     end
     -- 通过容量后才做带锁选址(与 dbg 共用 pick_from)
+    if sp_on then session_prio.count(opts, sp_bucket, "admit") end
     local chosen_hp, mode = route.pick_from(opts, a, sid)
     local peer_key  = chosen_hp[4] or (chosen_hp[1] .. ":" .. chosen_hp[2])
     dict:incr(peer_key, 1, 0)
@@ -399,6 +588,25 @@ function _G.do_log_release(opts)
             end
         elseif not ctok then
             tpd:incr(tps.tps_key_prefix(opts) .. "nousage", 1, 0, opts.tps_ttl)  -- 可观测:无 usage 样本数
+        end
+    end
+    -- session_prio prompt/cached-token accounting: ngx.ctx.sp_bucket is set in
+    -- the access phase when the feature is on, so key only off that here (the
+    -- sp_on/sp_bucket in do_route are locals of another function and invisible
+    -- across phases). tps_tail only exists while TPS measurement is on (see the
+    -- top of bodylog_filter_chunk), so routes without TPS get no ptok/ctok
+    -- stats -- an accepted limitation. Both fields must parse to count; when
+    -- cached_tokens is missing (the engine did not report
+    -- prompt_tokens_details, which vLLM needs a flag for) only no_cached_field
+    -- is incremented, so the hit rate is not silently diluted toward zero.
+    local spb = ngx.ctx.sp_bucket
+    if spb and ngx.status and ngx.status >= 200 and ngx.status < 300 then
+        local ptok, ct = session_prio.parse_usage(ngx.ctx.tps_tail)
+        if ptok and ct then
+            session_prio.count(opts, spb, "ptok", ptok)
+            session_prio.count(opts, spb, "ctok", ct)
+        else
+            session_prio.count(opts, spb, "no_cached_field")
         end
     end
     bodylog.bodylog_finalize(opts)

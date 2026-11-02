@@ -192,14 +192,21 @@ end
 --     access.lua 的 TTFT-429 用 `>=`(strict=false,默认);timers.lua 的 ttft_overloaded 用 `>`(strict=true)。
 --     两者本来就不同(EWMA 恰等于阈值时:access 拒、AIMD 不收),统一会改变边界行为。
 --     tps_assess 有完全对称的一处(access `<=` vs AIMD `<`)。
-function M.ttft_assess(opts, td, model, strict)
+-- mult scales the *severity bar*, not the reported limit: the comparison runs
+-- against mt.threshold * mult, while hit_limit stays the raw threshold (429
+-- bodies and AIMD logic keep their existing meaning). session_prio uses
+-- mult > 1 for graded rejection (soft zone at tol(bucket), hard trip at
+-- severe) and mult < 1 for the hysteresis release check. mult = nil is
+-- byte-equivalent to mult = 1: every existing call site passes neither.
+function M.ttft_assess(opts, td, model, strict, mult)
     local ms = M.ttft_metrics(opts, model)
     local first
     for i, mt in ipairs(ms) do
         local ew = td:get(M.ttft_ewma_key(opts, model, mt.metric))
         if i == 1 then first = ew end
-        if ew and mt.threshold
-           and ((strict and ew > mt.threshold) or ((not strict) and ew >= mt.threshold)) then
+        local bar = mt.threshold and (mt.threshold * (mult or 1)) or nil
+        if ew and bar
+           and ((strict and ew > bar) or ((not strict) and ew >= bar)) then
             return { ewma = first, hit = true,
                      hit_ewma = ew, hit_limit = mt.threshold, hit_metric = mt.metric }
         end

@@ -450,19 +450,46 @@ function M.prepare_request(opts)
     opts = opts or ngx.ctx.route_opts or _G.__route_opts.k25
     local h = ngx.req.get_headers()
 
-    -- 先从 header 取 sid（不能 return early，下面还要剥 body）
+    -- Take the sid from the headers first (no early return: the body must
+    -- still be read and stripped below). Header sources are ordered by
+    -- priority:
+    -- phan (session_prio on) > x-litellm-session-id > x-claude-code-session-id > x-session-id).
+    -- With session_prio on, the x-phanrouter-session session_id is the highest-
+    -- priority sid source: the gateway sends it on EVERY request, so sticking by
+    -- it keeps a session glued to one peer (the other sources may appear only on
+    -- a session's first request, or not at all). With the feature off this whole
+    -- block is skipped and the sid source chain is byte-identical to today.
+    local sp = require "session_prio"
+    -- The toggle is read exactly once per request and stashed in ngx.ctx.sp_on;
+    -- do_route's gates and counters use that same value, so a toggle flip
+    -- between two reads cannot split "parsed the header" from "counted it".
+    local sp_on = sp.enabled(opts)
+    ngx.ctx.sp_on = sp_on
     local sid_from_header, src_from_header
-    local hv = h["x-litellm-session-id"]
-    if _nonblank(hv) then
-        sid_from_header, src_from_header = tostring(hv), "header.x-litellm-session-id"
-    else
-        hv = h["x-claude-code-session-id"]
+    if sp_on then
+        local info, class = sp.parse_header(h[sp.HEADER])
+        ngx.ctx.phan_session = info            -- nil = nohdr (missing/invalid), access counts from this
+        ngx.ctx.phan_session_class = class     -- "ok" | "missing" | "bad"
+        if info then
+            sid_from_header = info.session_id
+            src_from_header = "header." .. sp.HEADER
+        end
+    end
+    -- phan wins: when the feature is on and the phan header is valid, the other
+    -- header sources are not consulted.
+    if not sid_from_header then
+        local hv = h["x-litellm-session-id"]
         if _nonblank(hv) then
-            sid_from_header, src_from_header = tostring(hv), "header.x-claude-code-session-id"
+            sid_from_header, src_from_header = tostring(hv), "header.x-litellm-session-id"
         else
-            hv = h["x-session-id"]
+            hv = h["x-claude-code-session-id"]
             if _nonblank(hv) then
-                sid_from_header, src_from_header = tostring(hv), "header.x-session-id"
+                sid_from_header, src_from_header = tostring(hv), "header.x-claude-code-session-id"
+            else
+                hv = h["x-session-id"]
+                if _nonblank(hv) then
+                    sid_from_header, src_from_header = tostring(hv), "header.x-session-id"
+                end
             end
         end
     end

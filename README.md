@@ -172,6 +172,60 @@ path in the body — with `gt/ge/lt/le/eq/ne`, `in/nin`, `match/contains/prefix`
 `exists/absent`, and `all`/`any` nesting. Invalid rules are logged and dropped at
 startup rather than taking the route down.
 
+**Session turn priority (opt-in, off by default).** The client gateway pins each
+session to the provider that served it, so a 429 on turn N loses the whole session
+and its KV cache, and the prefix-cache hit rate drops. The gateway marks requests
+with `x-phanrouter-session: {"session_id":"...","turn":N}`. With `session_prio = true`
+on a route, the three rejection gates grade by turn bucket (1 / 2-3 / 4-7 / ... up to
+`session_prio_full_turn`, default 32):
+
+- **Concurrency**: the ceiling scales by the bucket's `share` (`session_prio_r_new`,
+  default 0.85, rising to 1.0 at full warmth), so under load turn 1 is turned away
+  first while a warm session still fits.
+- **TTFT**: an EWMA at or above `threshold x session_prio_severe` (default 1.5) is a
+  hard trip and rejects every bucket; between `threshold x tol(bucket)` and that, a
+  soft zone rejects lower buckets while warmer ones keep a probe slot. Turn 1 never
+  probes, and a hysteresis flag holds turn 1 out until the EWMA falls below
+  `threshold x session_prio_release` (default 0.9) or expires.
+- **TPS** (only with adaptive concurrency off): the same grading, inverted — a hard
+  trip below `threshold / severe`, a soft zone below `threshold / tol(bucket)`.
+
+Requests without a usable header (missing, malformed, `turn` not an integer ≥ 1, or
+`session_id` blank or over 256 chars) are treated as fully warm — top-bucket policy —
+but counted separately (`bnohdr:*`), with a rate-limited WARN when their share of a
+minute exceeds `session_prio_warn_frac` (default 0.2). A route can also replace the
+whole bucket table with `session_prio_table = { {min_turn, share, tol}, ... }` (first
+`min_turn` 1, strictly ascending).
+
+The adaptive-cc controller and the TTFT/TPS EWMA measurement are unchanged: they
+still decide *how many* requests get in; the turn decides *which* ones. With the
+feature off every path is byte-identical — same 429 bodies, same sid sources, no
+counter traffic. `POST /_session_prio_toggle?on=0|1` flips it at runtime without a
+reload, and `GET /_session_status` shows the effective table, per-bucket
+admits/rejections, and the cache hit rate (`ctok/ptok`).
+
+Two known limitations. The prompt/cached token counters (`ptok`, `ctok`) are parsed
+out of the TPS response tail, which only exists while TPS measurement is on — routes
+without it get no token accounting (rejections and admits still count). The second
+is that the concurrency gate admits while in-flight is under `limit x share`, so a
+bucket can fill the pool up to `ceil(limit x share)` requests. With the default
+shares 0.85/0.88/0.91/0.94/0.97/1.0 that means:
+
+| `limit` | ceilings per bucket (`ceil(limit x share)`) |
+|---|---|
+| 6 | 6, 6, 6, 6, 6, 6 |
+| 7 | 6, 7, 7, 7, 7, 7 |
+| 10 | 9, 9, 10, 10, 10, 10 |
+| 20 | 17, 18, 19, 19, 20, 20 |
+
+At `limit = 6` the grading disappears entirely — every bucket admits the same six
+requests — and turn 1 is only first separated from the rest at `limit >= 7` (the
+criterion is `limit x (1 - r_new) >= 1`). Even at modest sizes the buckets tie in
+pairs. The fix for a small pool is to *lower* `session_prio_r_new`, or supply a
+`session_prio_table` with wider share gaps, so the gaps survive the `ceil`. Note
+also that under adaptive concurrency the limit itself is a float that moves over
+time, so the effective number of distinct ceilings moves with it.
+
 ## Authentication
 
 Keys are read from a file, default `/etc/openresty/api-keys/keys`, overridable with

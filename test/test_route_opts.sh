@@ -2,7 +2,7 @@
 # /_route_opts isolated check: builds its own openresty + mocks, cleans up after itself.
 #   ① every catalog fallback equals the engine's effective value on a route that sets nothing; fallback
 #     is read from the engine (a changed global shows up), derived ones keep the catalog's words;
-#     catalog shape (16 operator directives + 24 advanced, groups, item fields)
+#     catalog shape (17 operator directives + 30 advanced, groups, item fields)
 #   ② new defaults: hold_when_idle on, cross_tier_fallback on, derived init == min
 #   ③ strict boolean parsing: "False"/"no" read as false with a WARN, "maybe" falls back with an ERR,
 #     and the same for every other boolean option
@@ -98,11 +98,11 @@ for x in d["directives"] + d["advanced"]:
     if v != want or x["set"]: bad.append("%s: fallback=%s value=%s set=%s" % (x["key"], f, x["value"], x["set"]))
 print(checked, "|", "; ".join(bad))')
 n=${drift%% |*}; rest=${drift#*| }
-[ "$n" -eq 36 ] && [ -z "$rest" ] && ok "① $n catalog defaults match the engine" || no "① checked=$n (want 36) drift: $rest"
+[ "$n" -eq 42 ] && [ -z "$rest" ] && ok "① $n catalog defaults match the engine" || no "① checked=$n (want 42) drift: $rest"
 [ "$(ro $PLAIN 'D["tps_limit_tps"]["fallback"], D["adaptive_cc_ttl"]["fallback"], D["tps_limit_tps"]["value"]')" = "('33', '123', 33)" ] && ok "① fallback follows the host's globals (33 / 123, not 20 / 300)" || no "① override: $(ro $PLAIN 'D["tps_limit_tps"]["fallback"], D["adaptive_cc_ttl"]["fallback"], D["tps_limit_tps"]["value"]')"
 [ "$(ro $PLAIN 'D["adaptive_cc_init"]["fallback"], D["adaptive_cc_interval"]["fallback"], all(isinstance(x.get("fallback"), str) and x["fallback"] for x in d["directives"]+d["advanced"])')" = "('the floor', 'the TPS window', True)" ] && ok "① derived defaults keep the catalog's words; every option has a fallback" || no "① derived: $(ro $PLAIN '[(x["key"], x.get("fallback")) for x in d["directives"]+d["advanced"] if not isinstance(x.get("fallback"), str) or x["key"] in ("adaptive_cc_init","adaptive_cc_interval")]')"
-[ "$(ro $PLAIN 'len(d["directives"]), len(d["advanced"])')" = "(16, 24)" ] && ok "① catalog served: 16 operator directives + 24 advanced" || no "① counts: $(ro $PLAIN 'len(d["directives"]), len(d["advanced"])')"
-[ "$(ro $PLAIN 'sorted({x["group"] for x in d["directives"]})')" = "['Adaptive concurrency', 'Capacity & failover', 'Observability', 'Routing', 'Thresholds']" ] && ok "① operator groups" || no "① groups: $(ro $PLAIN 'sorted({x["group"] for x in d["directives"]})')"
+[ "$(ro $PLAIN 'len(d["directives"]), len(d["advanced"])')" = "(17, 30)" ] && ok "① catalog served: 17 operator directives + 30 advanced" || no "① counts: $(ro $PLAIN 'len(d["directives"]), len(d["advanced"])')"
+[ "$(ro $PLAIN 'sorted({x["group"] for x in d["directives"]})')" = "['Adaptive concurrency', 'Capacity & failover', 'Observability', 'Routing', 'Session priority', 'Thresholds']" ] && ok "① operator groups" || no "① groups: $(ro $PLAIN 'sorted({x["group"] for x in d["directives"]})')"
 [ "$(ro $PLAIN '"adaptive_cc_inc" in {x["key"] for x in d["advanced"]} and "adaptive_cc_inc" not in {x["key"] for x in d["directives"]}')" = "True" ] && ok "① internals listed under advanced, not directives" || no "① adaptive_cc_inc misplaced"
 [ "$(ro $PLAIN 'sorted(set(k for x in d["directives"]+d["advanced"] for k in x))')" = "['detail', 'fallback', 'group', 'key', 'kind', 'label', 'needsAdaptive', 'set', 'value']" ] && ok "① item fields match the console Directive (+value, set)" || no "① fields: $(ro $PLAIN 'sorted(set(k for x in d["directives"]+d["advanced"] for k in x))')"
 

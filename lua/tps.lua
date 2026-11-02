@@ -109,15 +109,21 @@ end
 -- 由**这里**产出而不是让调用方另外解析一次:阈值来源现在有三层(override / 指标表 / 静态),
 -- 调用方各自再解析一遍必然口径分叉 —— timers 以前就是拿 tps_limit_for(只看静态+override)当门,
 -- 于是「只声明了 tps_metrics」的路由会 ta.hit=true 却整段 AIMD 被跳过。
-function M.tps_assess(opts, td, model, strict)
+-- mult scales the severity bar like in ttft_assess, inverted for the
+-- low-is-bad direction: the comparison runs against mt.threshold / mult
+-- (mult > 1 makes rejection harder = soft zone; session_prio's hard trip is
+-- EWMA <= threshold / severe). has_threshold ignores mult (a threshold exists
+-- either way). mult = nil equals mult = 1; existing call sites pass neither.
+function M.tps_assess(opts, td, model, strict, mult)
     local ms = M.tps_metrics(opts, model)
     local first, has_thr
     for i, mt in ipairs(ms) do
         local ew = td:get(M.tps_ewma_key(opts, model, mt.metric))
         if i == 1 then first = ew end
         if mt.threshold then has_thr = true end
-        if ew and mt.threshold
-           and ((strict and ew < mt.threshold) or ((not strict) and ew <= mt.threshold)) then
+        local bar = mt.threshold and (mt.threshold / (mult or 1)) or nil
+        if ew and bar
+           and ((strict and ew < bar) or ((not strict) and ew <= bar)) then
             return { ewma = first, hit = true, has_threshold = true,
                      hit_ewma = ew, hit_limit = mt.threshold, hit_metric = mt.metric }
         end
