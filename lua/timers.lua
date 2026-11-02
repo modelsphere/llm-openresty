@@ -95,25 +95,17 @@ function M.do_cluster_avg_loop(opts)
     end
     local INTERVAL = opts.cluster_avg_interval or 30
     local function sample()
-        local ac = ngx.shared[opts.active_conns_dict]
         local ca = ngx.shared[opts.cluster_avg_dict]
         local idx = math.floor(ngx.now() / INTERVAL) % 10
         if opts.peers_by_model then
             -- 新格式：各子池独立聚合到 "<model>:<idx>" bucket，
             -- 避免跨模型容量串扰（compute_cluster_avg 按 req.model 读对应桶）。
-            for m, pool in pairs(opts.peers_by_model) do
-                local sum = 0
-                for _, p in ipairs(pool) do
-                    sum = sum + (ac:get(p[1]..":"..p[2]) or 0)
-                end
-                ca:set(m .. ":" .. tostring(idx), sum, 360)
+            -- The same in-flight sum admission and adaptive_cc read (route.inflight).
+            for m in pairs(opts.peers_by_model) do
+                ca:set(m .. ":" .. tostring(idx), route.pool_inflight(opts, m), 360)
             end
         else
-            local sum = 0
-            for _, p in ipairs(opts.peers) do
-                sum = sum + (ac:get(p[1]..":"..p[2]) or 0)
-            end
-            ca:set(tostring(idx), sum, 360)
+            ca:set(tostring(idx), route.pool_inflight(opts, false), 360)
         end
     end
     local function loop(premature)
@@ -162,12 +154,9 @@ function M.do_adaptive_cc_loop(opts)
     -- key schema 一变(加 :all:<metric>: 段)就会读到不存在的 key、静默返 false。
     -- strict=true 保留原来的 `>`(access 的 429 用 `>=`,见 ttft_assess 注释)。
     -- per-route opts.adaptive_cc_use_ttft=false 可关(缺省 nil=开)。
+    -- Lives in ttft.lua so /_tps_status reports the same signal.
     local function ttft_overloaded(model)
-        if opts.adaptive_cc_use_ttft == false then return false end
-        if not _G.TTFT_ENABLED then return false end
-        local ttd = ngx.shared[opts.ttft_dict]
-        if not ttd or ttd:get(rname .. ":__off") then return false end
-        return ttft.ttft_assess(opts, ttd, model, true).hit
+        return ttft.adaptive_cc_ttft_overloaded(opts, model)
     end
 
     -- 单子池一步 AIMD(model=false 表 flat 路由)。

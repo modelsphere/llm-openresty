@@ -373,14 +373,21 @@ function _G.dbg_tps_status(opts)
             local cc  = td and td:get(pfx .. "adaptive_cc") or nil
             local rts = route.pool_inflight(opts, model)           -- live in-flight count, the same one the timer reads
             adaptive_cc[mkey]      = cc
-            adaptive_cc_conc[mkey] = rts
-            adaptive_cc_rej[mkey]  = td and td:get(pfx .. "rej") or 0   -- 本区间被压抑需求(并发429数);只读不清零
+            adaptive_cc_conc[mkey] = rts   -- always a number now: 0 on an idle pool, where it used to be absent
+            local rej = td and td:get(pfx .. "rej") or 0
+            adaptive_cc_rej[mkey]  = rej   -- 本区间被压抑需求(并发429数);只读不清零
             -- 下一 tick 走哪个分支(与 step_one 一致:相对系数 + 绝对头寸 ABS 双门):
-            --   at_pressure = 顶到 cc×pressure(相对) 或 头寸不足 cc-conc<ABS(绝对)→ 涨(注:rej>0 会先于此直接快涨)
+            --   at_pressure = 顶到 cc×pressure(相对) 或 头寸不足 cc-conc<ABS(绝对)→ 涨
             --   at_slack    = conc<cc×slack(相对) 且 余量够 cc-conc>ABS(绝对)→ 缩;都 false=保持
-            local c = rts or 0
-            adaptive_cc_at_pressure[mkey] = (cc and ((c >= cc * opts.adaptive_cc_pressure_frac) or ((cc - c) < ABS))) and true or false
-            adaptive_cc_at_slack[mkey]    = (cc and (c < cc * opts.adaptive_cc_slack_frac) and ((cc - c) > ABS)
+            -- Both are only reachable the way step_one reaches them: with a TPS signal (no EWMA = the
+            -- timer returns early), a threshold, no overload (that branch shrinks by xDEC) and no 429s
+            -- this interval (that one grows by xINC). Otherwise both report false.
+            local ta = td and tps.tps_assess(opts, td, model, true)
+            local gated = ta and ta.ewma ~= nil and ta.has_threshold and not ta.hit
+                          and not ttft.adaptive_cc_ttft_overloaded(opts, model) and rej == 0
+            adaptive_cc_at_pressure[mkey] = (gated and cc and ((rts >= cc * opts.adaptive_cc_pressure_frac) or ((cc - rts) < ABS)))
+                                             and true or false
+            adaptive_cc_at_slack[mkey]    = (gated and cc and (rts < cc * opts.adaptive_cc_slack_frac) and ((cc - rts) > ABS)
                                              and cc > adaptive_cc_init[mkey] and not opts.adaptive_cc_hold_when_idle)
                                              and true or false   -- slack stops at init; never fires with hold
         end

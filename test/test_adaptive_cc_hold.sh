@@ -207,21 +207,32 @@ s1=$(fv $SPARSE adaptive_cc)
 echo "  sparse route after 12s: cc=$s1 (was $s0)"
 awk "BEGIN{exit !($(num $s1)>=2 && $(num $s1)<$(num $s0))}" && ok "⑨ sparse traffic shrinks cc ($s0 → $s1)" \
                                                            || no "⑨ cc $s0 → $s1 under sparse traffic, want lower"
+# ⑨b then fully idle past tps_ttl (8s): the timer has no signal and returns before any branch, so
+#   /_tps_status must not report a shrink coming, though conc is 0 and cc (TTL 60s) is above init.
+sleep 10
+s2=$(fv $SPARSE adaptive_cc)
+[ "$(fv $SPARSE ewma_tps)" = "None" ] && awk "BEGIN{exit !($(num $s2)>2)}" \
+    && ok "⑨b precondition: idle, no TPS signal, cc=$s2 above init" \
+    || no "⑨b precondition: ewma=$(fv $SPARSE ewma_tps) cc=$s2; the step below would not test the idle path"
+[ "$(fv $SPARSE adaptive_cc_at_slack)" = "False" ] && ok "⑨b /_tps_status at_slack=false on an idle pool" \
+                                                  || no "⑨b /_tps_status at_slack true on an idle pool, where the timer does not shrink"
 
 # ⑩ ten requests at once, lengths 300..2100 tokens at 12ms (3.6s..25.2s), and nothing after them.
 #   Read at 12s, past the 8s the old copy lived: the ones over 1000 tokens (6) are still running,
 #   and the ones that finished in the last 8s keep the TPS signal alive. conc must be that live count,
 #   not 0, and cc must still leave room for it. Under the old copy conc read None here.
 load_n $INFLT 22 16                      # raise cc first, as in ⑨, so a wrong conc 0 would have room to shrink it
-sleep 2                                  # let it drain
+# Let it drain: wait for conc 0 rather than a fixed sleep, so stragglers are not counted below.
+for i in $(seq 1 20); do [ "$(fv $INFLT adaptive_cc_conc)" = "0" ] && break; sleep 1; done
 for t in 300 500 700 900 1100 1300 1500 1700 1900 2100; do fire "$INFLT" 12 $t >/dev/null 2>&1 & done
 sleep 12
 ic=$(fv $INFLT adaptive_cc_conc); icc=$(fv $INFLT adaptive_cc); ie=$(fv $INFLT ewma_tps)
 echo "  in-flight route at 12s: conc=$ic cc=$icc ewma=$ie (6 expected in flight)"
 [ -n "$ie" ] && [ "$ie" != "None" ] && ok "⑩ precondition: TPS signal alive from the completions ($ie)" \
                                    || no "⑩ precondition: no TPS signal ($ie); the tick would not run the slack branch"
-awk "BEGIN{exit !($(num $ic)>=4 && $(num $ic)<=8)}" && ok "⑩ conc is the live in-flight count ($ic, ~6) with no arrival for 12s" \
-                                                   || no "⑩ conc=$ic with ~6 requests still running, want 4..8"
+# 4..10: a slow box only keeps more of the ten running (up to all of them), never fewer than the 6.
+awk "BEGIN{exit !($(num $ic)>=4 && $(num $ic)<=10)}" && ok "⑩ conc is the live in-flight count ($ic, ~6) with no arrival for 12s" \
+                                                    || no "⑩ conc=$ic with ~6 requests still running, want 4..10"
 awk "BEGIN{exit !($(num $icc)>=$(num $ic))}" && ok "⑩ cc ($icc) still covers the requests in flight ($ic)" \
                                             || no "⑩ cc=$icc shrank below the $ic requests still in flight"
 wait

@@ -1,7 +1,8 @@
 #!/bin/bash
 # adaptive_cc TTFT-aware 收缩验证(方案②:TTFT EWMA > 阈值也触发 cc ×DEC 收缩,压过「并发429→×INC」)。
-# 隔离 openresty(ENGINE=重构版),不需要 mock 后端——直接给 ttft_stat / tps_stat dict 灌 EWMA/rej,
-# and pins the in-flight count on the route's active_conns counters (what the timer reads, live),
+# Isolated openresty (ENGINE=refactored engine), no mock backend: it seeds EWMA and rej straight into
+# the ttft_stat / tps_stat dicts and pins the in-flight count on the route's active_conns counters
+# (what the timer reads, live),
 # 让 do_adaptive_cc_loop 的 timer 驱动 cc 演化(比跑真流量建 EWMA 确定得多、不 flaky)。
 #
 # 两条路由(共享 ttft_stat/tps_stat,key 按 route 前缀隔离):

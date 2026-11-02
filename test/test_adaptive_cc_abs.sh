@@ -71,8 +71,9 @@ echo "########## adaptive_cc 绝对头寸(ABS) ##########"
 ( load_n $AB5 3 14 ) & ( load_n $AB0 3 14 ) &
 sleep 9
 samp="$PREFIX/samples"; : > "$samp"
+fvs(){ local v; v=$(fv "$1" "$2"); echo "${v:-None}"; }   # never empty: an empty field would shift the columns
 for i in 1 2 3 4 5; do
-  echo "$(fv $AB5 adaptive_cc_conc) $(fv $AB5 adaptive_cc) $(fv $AB0 adaptive_cc_conc) $(fv $AB0 adaptive_cc)" >> "$samp"
+  echo "$(fvs $AB5 adaptive_cc_conc) $(fvs $AB5 adaptive_cc) $(fvs $AB0 adaptive_cc_conc) $(fvs $AB0 adaptive_cc)" >> "$samp"
   sleep 1
 done
 wait
@@ -84,13 +85,15 @@ echo "  [ab5] peak cc=$cc5 conc=$conc5 ewma=$ev5   [ab0] peak cc=$cc0 conc=$conc
 # Peaks, not medians: this load swings between ~3 and ~6 in flight, and with hold_when_idle off
 # cc rises on the peaks and shrinks back on the troughs, a tick behind. A median of five samples
 # lands on whichever phase three of them happened to catch.
+# The peaks of cc and conc may come from different samples, and cc lags conc by a tick, so these
+# show the headroom cc reaches at the load's peak, not that cc >= conc+ABS held at every instant.
 # ① ABS=5: cc carries ABS of headroom over conc, i.e. cc >= conc+4 (1 of slack).
-awk "BEGIN{exit !($cc5>=$conc5+4)}" && ok "① ABS=5 cc 抬到 conc+ABS (峰值 cc=$cc5 ≥ conc($conc5)+4)" || no "① 峰值 cc5=$cc5 未达 conc($conc5)+ABS"
+awk "BEGIN{exit !($cc5>=$conc5+4)}" && ok "① ABS=5 lifts cc to conc+ABS (peak cc=$cc5 >= conc($conc5)+4)" || no "① peak cc5=$cc5 below conc($conc5)+ABS"
 # ② ABS=0: no absolute headroom, cc0 < conc0+4. No upper bound relative to conc: a 429 tick grows cc
 #    by xINC without the desired cap, and the peak can come from one.
-awk "BEGIN{exit !($cc0<$conc0+4)}" && ok "② ABS=0 无绝对头寸 (峰值 cc=$cc0 < conc($conc0)+4)" || no "② 峰值 cc0=$cc0 带了绝对头寸(conc=$conc0)"
+awk "BEGIN{exit !($cc0<$conc0+4)}" && ok "② ABS=0 has no absolute headroom (peak cc=$cc0 < conc($conc0)+4)" || no "② peak cc0=$cc0 carries absolute headroom (conc=$conc0)"
 # ③ ABS=5 ends up clearly above ABS=0 under the same load.
-awk "BEGIN{exit !($cc5>=$cc0+2)}" && ok "③ ABS=5 显著高于 ABS=0 (峰值 cc5=$cc5 vs cc0=$cc0)" || no "③ 峰值 cc5($cc5) 未显著高于 cc0($cc0)"
+awk "BEGIN{exit !($cc5>=$cc0+2)}" && ok "③ ABS=5 clearly above ABS=0 (peak cc5=$cc5 vs cc0=$cc0)" || no "③ peak cc5($cc5) not clearly above cc0($cc0)"
 
 # ④ 缩保留 ABS 绝对底:ab5 停到很低并发(1),cc 应缩但不破 conc+ABS(≈6),不塌到 min=2
 load_n $AB5 1 12
