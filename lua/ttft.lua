@@ -207,6 +207,17 @@ function M.ttft_assess(opts, td, model, strict)
     return { ewma = first, hit = false }
 end
 
+-- The adaptive_cc timer's TTFT overload signal: slow first tokens shrink cc like slow decode does.
+-- Shared with /_tps_status so the branch it reports is the one the timer takes.
+-- opts.adaptive_cc_use_ttft = false turns it off per route; strict = `>` (see ttft_assess).
+function M.adaptive_cc_ttft_overloaded(opts, model)
+    if opts.adaptive_cc_use_ttft == false then return false end
+    if not _G.TTFT_ENABLED then return false end
+    local ttd = ngx.shared[opts.ttft_dict]
+    if not ttd or ttd:get((opts.route_name or "?") .. ":__off") then return false end
+    return M.ttft_assess(opts, ttd, model, true).hit
+end
+
 -- 半开探测(circuit-breaker half-open)：限流态下不 100% 拒,每个时间窗口放行
 -- 至多 ttft_probe_per_window 个探测请求打到后端,持续产生新 TTFT 样本喂 EWMA。
 -- 否则全拒 → 无新样本 → EWMA 永远停在高位 → 永久限流(死锁)。

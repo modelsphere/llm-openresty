@@ -95,25 +95,17 @@ function M.do_cluster_avg_loop(opts)
     end
     local INTERVAL = opts.cluster_avg_interval or 30
     local function sample()
-        local ac = ngx.shared[opts.active_conns_dict]
         local ca = ngx.shared[opts.cluster_avg_dict]
         local idx = math.floor(ngx.now() / INTERVAL) % 10
         if opts.peers_by_model then
             -- 新格式：各子池独立聚合到 "<model>:<idx>" bucket，
             -- 避免跨模型容量串扰（compute_cluster_avg 按 req.model 读对应桶）。
-            for m, pool in pairs(opts.peers_by_model) do
-                local sum = 0
-                for _, p in ipairs(pool) do
-                    sum = sum + (ac:get(p[1]..":"..p[2]) or 0)
-                end
-                ca:set(m .. ":" .. tostring(idx), sum, 360)
+            -- The same in-flight sum admission and adaptive_cc read (route.inflight).
+            for m in pairs(opts.peers_by_model) do
+                ca:set(m .. ":" .. tostring(idx), route.pool_inflight(opts, m), 360)
             end
         else
-            local sum = 0
-            for _, p in ipairs(opts.peers) do
-                sum = sum + (ac:get(p[1]..":"..p[2]) or 0)
-            end
-            ca:set(tostring(idx), sum, 360)
+            ca:set(tostring(idx), route.pool_inflight(opts, false), 360)
         end
     end
     local function loop(premature)
@@ -162,12 +154,9 @@ function M.do_adaptive_cc_loop(opts)
     -- key schema 一变(加 :all:<metric>: 段)就会读到不存在的 key、静默返 false。
     -- strict=true 保留原来的 `>`(access 的 429 用 `>=`,见 ttft_assess 注释)。
     -- per-route opts.adaptive_cc_use_ttft=false 可关(缺省 nil=开)。
+    -- Lives in ttft.lua so /_tps_status reports the same signal.
     local function ttft_overloaded(model)
-        if opts.adaptive_cc_use_ttft == false then return false end
-        if not _G.TTFT_ENABLED then return false end
-        local ttd = ngx.shared[opts.ttft_dict]
-        if not ttd or ttd:get(rname .. ":__off") then return false end
-        return ttft.ttft_assess(opts, ttd, model, true).hit
+        return ttft.adaptive_cc_ttft_overloaded(opts, model)
     end
 
     -- 单子池一步 AIMD(model=false 表 flat 路由)。
@@ -220,7 +209,7 @@ function M.do_adaptive_cc_loop(opts)
         local rej = td:get(pre .. "rej") or 0
         if rej > 0 then td:delete(pre .. "rej") end
         if has_threshold then
-            local conc = td:get(pre .. "rt_sum") or 0
+            local conc = route.pool_inflight(opts, model)   -- live in-flight count, the one admission checks
             local mid  = (opts.adaptive_cc_pressure_frac + opts.adaptive_cc_slack_frac) / 2
             local ABS  = opts.adaptive_cc_abs or 0
             -- 目标 cc:相对(conc/mid≈1.25×)与绝对(conc+ABS)取大 → 任何并发下都留够 ABS 绝对头寸。
@@ -241,9 +230,12 @@ function M.do_adaptive_cc_loop(opts)
                 -- 健康、无被拒需求:并发压力 AIMD,相对系数 + 绝对头寸双门。
                 --   涨门:并发顶到 cc×pressure_frac(相对) 或 绝对头寸不足 cc-conc<ABS(小并发兜底)。
                 --   缩门:并发 < cc×slack_frac(相对) 且 绝对余量够 cc-conc>ABS(降也要够绝对余量才降)。
-                --   涨/缩都向 desired 收(不破 conc+ABS 绝对底);conc==0 且头寸够 → 保持(不缩回 min)。
+                --   涨/缩都向 desired 收(不破 conc+ABS 绝对底)。
+                --   No requests in flight at the tick counts as slack too: with sparse traffic most ticks see
+                --   conc == 0, and exempting them left cc wherever the last busy spell put it, its TTL
+                --   refreshed by every stray request. Holding through quiet spells is what hold_when_idle is for.
                 local at_pressure = (conc >= cur * opts.adaptive_cc_pressure_frac) or ((cur - conc) < ABS)
-                local at_slack    = (conc > 0) and (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
+                local at_slack    = (conc < cur * opts.adaptive_cc_slack_frac) and ((cur - conc) > ABS)
                 local prev = cur
                 if at_pressure then
                     cur = math.min(cur * INC, desired)        -- 涨,但不越过 desired

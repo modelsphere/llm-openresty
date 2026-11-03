@@ -161,14 +161,10 @@ function _G.do_route(opts)
         local maxcc = route.compute_static_max_cc(opts, opts.peers_by_model and ngx.ctx.req_model or nil)
         local initcc = route.derive_initcc(opts, maxcc, route.derive_mincc(opts, maxcc))
         limit = math.min(a.adaptive_cc or initcc, pool_limit)   -- cc not set yet / expired → init
-        -- 把已算好的实时并发 a.rt_sum(全 peer 含 banned 的真实在途,与下方 hit_rt 判 429 同一个值)存给 timer:
-        -- do_adaptive_cc_loop 据此判压力(顶到 cc 才涨、余量太大则缩)。key 复用 a.tps_prefix(assess_pool 已算)。
-        -- TTL 取 max(tps_ttl, interval×3):至少活到 ewma 过期,避免"ewma 还在但 rt_sum 过期成 0 → 拒绝爬/误缩"。
-        local _tpd = ngx.shared[opts.tps_dict]
-        if _tpd and a.tps_prefix then
-            _tpd:set(a.tps_prefix .. "rt_sum", a.rt_sum,
-                     math.max(opts.tps_ttl or 60, opts.adaptive_cc_interval * 3))
-        end
+        -- The AIMD timer reads the in-flight count itself (route.pool_inflight), live at each tick. It
+        -- used to read a copy of a.rt_sum stored here, which only changed when a request arrived: between
+        -- arrivals it froze (completions never lowered it), and once its TTL ran out it read 0 while
+        -- requests were still running.
     end
     local hit_rt  = a.rt_sum   >= limit * opts.rt_limit_factor
     -- 2026-07-02 暂时禁用均值判断,只用实时值 rt_sum 判过载(原: a.avg_5min >= limit)

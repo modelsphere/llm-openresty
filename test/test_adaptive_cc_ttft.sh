@@ -1,6 +1,8 @@
 #!/bin/bash
 # adaptive_cc TTFT-aware 收缩验证(方案②:TTFT EWMA > 阈值也触发 cc ×DEC 收缩,压过「并发429→×INC」)。
-# 隔离 openresty(ENGINE=重构版),不需要 mock 后端——直接给 ttft_stat / tps_stat dict 灌 EWMA/rt_sum/rej,
+# Isolated openresty (ENGINE=refactored engine), no mock backend: it seeds EWMA and rej straight into
+# the ttft_stat / tps_stat dicts and pins the in-flight count on the route's active_conns counters
+# (what the timer reads, live),
 # 让 do_adaptive_cc_loop 的 timer 驱动 cc 演化(比跑真流量建 EWMA 确定得多、不 flaky)。
 #
 # 两条路由(共享 ttft_stat/tps_stat,key 按 route 前缀隔离):
@@ -67,7 +69,12 @@ http {
         if a.ttft then ts:set(ttft_m.ttft_ewma_key(o, false, "p80"), tonumber(a.ttft), 60) end
         if a.tps  then tp:set(tps_m.tps_ewma_key(o, false, "p80"),  tonumber(a.tps),  60) end
         if a.cc   then tp:set(rt..":adaptive_cc", tonumber(a.cc), 60) end
-        if a.rt   then tp:set(rt..":rt_sum", tonumber(a.rt), 60) end
+        -- In flight: the timer sums the per-peer active_conns counters (route.pool_inflight), so pin
+        -- them -- all on the first peer, 0 on the rest -- rather than a key the timer does not read.
+        if a.rt then
+            local ac = ngx.shared[o.active_conns_dict]
+            for i, k in ipairs(o.peer_keys) do ac:set(k, i == 1 and tonumber(a.rt) or 0) end
+        end
         if a.rej  then tp:set(rt..":rej", tonumber(a.rej), 60) end
         ngx.say("ok") } }
     # 读当前 cc:/_cc?route=r
