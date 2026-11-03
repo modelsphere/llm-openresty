@@ -24,6 +24,8 @@
 #   S9  TPS gate grading (adaptive_cc off): soft zone turn1 429 vs warm 200;
 #       hard trip probes only for turn>=2
 #   S10 runtime toggle off restores today's behaviour
+#   S12 hold band on the DEFAULT t1 budget: turn 1 gets no probe without a trip
+#   S13 unknown model on a peers_by_model route: 400, no session_stat keys minted
 #   S11 turn-1 probe budget: N turn-1 passes per window on its own counter,
 #       0 passes once a warm probe opened a slot that window, reset next window
 #
@@ -64,6 +66,7 @@ http {
   lua_shared_dict ttft_stat 1m; lua_shared_dict tps_stat 1m; lua_shared_dict api_keys 1m; lua_shared_dict session_stat 1m;
   lua_shared_dict active_conns_off 4m; lua_shared_dict cluster_avg_off 16k; lua_shared_dict lc_locks_off 1m; lua_shared_dict bad_peers_off 1m; lua_shared_dict bodylog_ctl_off 1m; lua_shared_dict cch_ctl_off 1m;
   lua_shared_dict active_conns_sp 4m; lua_shared_dict cluster_avg_sp 16k; lua_shared_dict lc_locks_sp 1m; lua_shared_dict bad_peers_sp 1m; lua_shared_dict bodylog_ctl_sp 1m; lua_shared_dict cch_ctl_sp 1m;
+  lua_shared_dict active_conns_spm 4m; lua_shared_dict cluster_avg_spm 16k; lua_shared_dict lc_locks_spm 1m; lua_shared_dict bad_peers_spm 1m; lua_shared_dict bodylog_ctl_spm 1m; lua_shared_dict cch_ctl_spm 1m;
   lua_shared_dict active_conns_tpx 4m; lua_shared_dict cluster_avg_tpx 16k; lua_shared_dict lc_locks_tpx 1m; lua_shared_dict bad_peers_tpx 1m; lua_shared_dict bodylog_ctl_tpx 1m; lua_shared_dict cch_ctl_tpx 1m;
   lua_shared_dict active_conns_spc 4m; lua_shared_dict cluster_avg_spc 16k; lua_shared_dict lc_locks_spc 1m; lua_shared_dict bad_peers_spc 1m; lua_shared_dict bodylog_ctl_spc 1m; lua_shared_dict cch_ctl_spc 1m;
   lua_shared_dict active_conns_tp 4m; lua_shared_dict cluster_avg_tp 16k; lua_shared_dict lc_locks_tp 1m; lua_shared_dict bad_peers_tp 1m; lua_shared_dict bodylog_ctl_tp 1m; lua_shared_dict cch_ctl_tp 1m;
@@ -113,7 +116,14 @@ http {
                                                   adaptive_cc=false, tps_limit_tps=50, session_prio_t1_probes=0}) end)
     -- tpx: identical gates with the DEFAULT turn-1 probe budget (1): S11.
     _G.register_route("tpx", function() return R({peers=mkt, default_max=10, session_prio=true,
-                                                  adaptive_cc=false, tps_limit_tps=50, ttft_limit_ms=400}) end)
+                                                  adaptive_cc=false, tps_limit_tps=50, ttft_limit_ms=400,
+                                                  -- S12: same widened hold band as sp, so a P80 walk can
+                                                  -- reach [release x 400, 400) on the default t1 budget.
+                                                  session_prio_release=0.6}) end)
+    -- spm: S13, a peers_by_model route with the feature on. An unknown model
+    -- must 400 without minting session_stat keys (the keys carry the model).
+    _G.register_route("spm", function() return R({peers_by_model={["sp-model-a"]=mk}, default_max=10,
+                                                  session_prio=true, adaptive_cc=false}) end)
   }
   server { listen 19100; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.off) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.off) } }
@@ -134,7 +144,15 @@ http {
     location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.tp) } } }
   server { listen 19105; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.tpx) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.tpx) } }
+    location = /_ttft_status { content_by_lua_block { _G.dbg_ttft_status(_G.__route_opts.tpx) } }
     location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.tpx) } } }
+  server { listen 19106; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
+    location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.spm) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.spm) } }
+    # test-only: count session_stat keys containing ?m=<substring>
+    location = /_t_keys { content_by_lua_block {
+      local n, m = 0, ngx.var.arg_m or ""
+      for _, k in ipairs(ngx.shared.session_stat:get_keys(0)) do if k:find(m, 1, true) then n = n + 1 end end
+      ngx.say(n) } } }
   server { listen 19104; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.offC) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.offC) } }
     location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.offC) } } }
@@ -459,6 +477,48 @@ done
 { [ "$n200" = "1" ] && [ "$n429" = "2" ] && [ "$ntf" -ge 2 ]; } \
   && ok "S11c fresh window, fresh trip: exactly 1 pass then ttft-429s ($n200/$n429, bodies=$ntf)"   || no "S11c 200=$n200 429=$n429 bodies=$ntf"
 
+
+echo "########## S12 hold band on the default turn-1 budget ##########"
+# tpx has session_prio_t1_probes=1. In the hold band (flag set, no 1.0x trip)
+# warm requests pass without touching the gate, so the warm probe counter
+# stays 0; turn 1 must still get NO probe slot there -- the budget is only for
+# a real trip. Same walk as S5: trip, then fold P80-380 windows into the band.
+expire; estab2 $TPX "600 600 600" 600
+e12=""
+for i in 1 2 3 4 5 6 7; do
+  estab_ttft $TPX "350 350 350" 350
+  e12=$(ewv $TPX)
+  [ -n "$e12" ] && awk "BEGIN{exit !($e12>=240 && $e12<400)}" && break
+done
+[ -n "$e12" ] && awk "BEGIN{exit !($e12>=240 && $e12<400)}" && ok "S12a EWMA=$e12 in the hold band [240,400)" || no "S12a ewma=${e12:-EMPTY}"
+align                                   # fresh probe window: the t1 budget is unused
+n200=0; nhold=0
+for i in 1 2 3; do
+  b=$(curl -s -N -H "$A" -H "$H" -H "x-phanrouter-session: {\"session_id\":\"s12-$i\",\"turn\":1}" \
+       -d '{"model":"x","stream":true,"prefill_delay_ms":50,"max_tokens":1,"messages":[]}' \
+       -w "\n%{http_code}" "$TPX/v1/chat/completions")
+  c=${b##*$'\n'}
+  [ "$c" = 200 ] && n200=$((n200+1))
+  case "$b" in *'"sp_zone":"hold"'*) nhold=$((nhold+1));; esac
+done
+{ [ "$n200" = "0" ] && [ "$nhold" = "3" ]; } \
+  && ok "S12b hold band, default budget: turn1 0 passes, 3 x sp_zone=hold" || no "S12b 200=$n200 hold=$nhold"
+c12=$(fire $TPX 50 40 s12)
+[ "$c12" = "200" ] && ok "S12c hold band: turn40 200" || no "S12c t40=$c12"
+
+echo "########## S13 unknown model: 400, no session_stat keys ##########"
+SPM=http://127.0.0.1:19106
+fm(){ curl -s -o /dev/null -w "%{http_code}" -N -H "$A" -H "$H" -H "x-phanrouter-session: {\"session_id\":\"s13-$2\",\"turn\":3}" \
+       -d "{\"model\":\"$1\",\"stream\":true,\"prefill_delay_ms\":50,\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+       "$SPM/v1/chat/completions"; }
+c13=""; for i in 1 2 3; do c13="$c13 $(fm made-up-model-q7 $i)"; done
+k13=$(curl -s "$SPM/_t_keys?m=made-up-model-q7")
+{ [ "$c13" = " 400 400 400" ] && [ "$k13" = "0" ]; } \
+  && ok "S13a unknown model: 3 x 400 and 0 session_stat keys" || no "S13a codes=$c13 keys=$k13"
+c13k=$(fm sp-model-a k)
+k13k=$(curl -s "$SPM/_t_keys?m=:sp-model-a:hdr:ok")
+{ [ "$c13k" = "200" ] && [ "${k13k:-0}" -ge 1 ]; } \
+  && ok "S13b known model: 200 and its hdr:ok key exists" || no "S13b code=$c13k keys=$k13k"
 
 echo
 echo "########## PASS=$P FAIL=$F ##########"

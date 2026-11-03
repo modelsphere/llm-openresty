@@ -112,16 +112,16 @@ function _G.do_route(opts)
     local sp_on = ngx.ctx.sp_on and true or false
     local sp_bucket          -- numeric index into _sp_table, or "nohdr"
     if sp_on then
-        local class = ngx.ctx.phan_session_class or "missing"
         local info = ngx.ctx.phan_session
         if info then
             sp_bucket = session_prio.bucket_of(opts._sp_table, info.turn)
         else
             sp_bucket = "nohdr"      -- missing/invalid header: warm (top bucket) policy, own counters
         end
-        session_prio.count_hdr(opts, class)
-        session_prio.note_nohdr_minute(opts, class)
         ngx.ctx.sp_bucket = sp_bucket
+        -- Header counters are written further down, after the model check:
+        -- their keys carry ngx.ctx.req_model, so counting here would let any
+        -- client mint session_stat keys with made-up model names.
     end
 
     -- ── 规则化请求拒绝(reject_rules)──
@@ -149,6 +149,14 @@ function _G.do_route(opts)
             }))
             return ngx.exit(400)
         end
+    end
+    -- session_prio header counters: only now, once the model (part of the key)
+    -- is known to be configured. Requests stopped earlier (reject_rules, the
+    -- unknown-model 400) are not counted.
+    if sp_on then
+        local class = ngx.ctx.phan_session_class or "missing"
+        session_prio.count_hdr(opts, class)
+        session_prio.note_nohdr_minute(opts, class)
     end
     -- 暴露到 nginx var 给 access_log 用（截断 128 防 header 变量爆）
     local log_sid = sid or "-"
@@ -331,10 +339,15 @@ function _G.do_route(opts)
                 -- (hard and soft share the same one) so samples keep flowing.
                 -- Turn 1 draws on its OWN tiny budget, and only while no warm
                 -- request has probed this window (its samples then add
-                -- nothing). See session_prio.t1_allow_probe.
+                -- nothing). See session_prio.t1_allow_probe. Only on a real
+                -- trip (hit_ttft): in the hold band (flag set, no trip) warm
+                -- requests pass without touching the gate, so the warm probe
+                -- counter stays 0 and turn 1 would leak in every window. The
+                -- hold keeps turn 1 out until the EWMA drops under
+                -- threshold x release, with no probe slot.
                 if sp_ttft_reject and not is_turn1 and ttft.ttft_allow_probe(opts) then
                     sp_ttft_reject = false
-                elseif sp_ttft_reject and is_turn1 and session_prio.t1_allow_probe(opts, "ttft") then
+                elseif sp_ttft_reject and is_turn1 and hit_ttft and session_prio.t1_allow_probe(opts, "ttft") then
                     sp_ttft_reject = false
                 end
             end
@@ -392,7 +405,8 @@ function _G.do_route(opts)
     --   soft: EWMA <= threshold / tol(bucket) -> reject; turn >= 2 / nohdr try
     --     a probe slot first.
     --   As under TTFT: turn 1 is tol 1.0, i.e. the plain 1.0x trip (tps_hit)
-    --   rejects it and it never probes. No hysteresis on TPS.
+    --   rejects it unless its own turn-1 probe budget has a slot. TPS has no
+    --   hold flag, so that budget is only ever used under a real trip.
     --   Only live on the TPS hard-fuse path (adaptive_cc off); AIMD routes are
     --   unaffected here.
     local sp_tps_reject

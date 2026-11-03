@@ -189,13 +189,14 @@ on a route, the three rejection gates grade by turn bucket (1 / 2-3 / 4-7 / ... 
   `session_prio_t1_probes` per-probe-window slots (default 1, 0 restores the
   earlier never-probe behaviour), and only while no warm request has probed that
   window yet — a pool of almost-only-new sessions keeps trickling samples
-  through, so recovery does not wait for the whole EWMA to expire. A hysteresis
-  flag holds turn 1 out until the EWMA falls below
+  through, so recovery does not wait for the whole EWMA to expire. That budget
+  applies only while the gate is actually tripped. A hysteresis flag holds turn 1
+  out, with no probe slot, until the EWMA falls below
   `threshold x session_prio_release` (default 0.9) or expires.
 - **TPS** (only with adaptive concurrency off): the same grading, inverted — a hard
   trip below `threshold / severe`, a soft zone below `threshold / tol(bucket)`.
 
-Requests without a usable header (missing, malformed, `turn` not an integer ≥ 1, or
+Requests without a usable header (missing, malformed, `turn` not an integer from 1 to 10^9, or
 `session_id` blank or over 256 chars) are treated as fully warm — top-bucket policy —
 but counted separately (`bnohdr:*`), with a rate-limited WARN when their share of a
 minute exceeds `session_prio_warn_frac` (default 0.2). A route can also replace the

@@ -61,7 +61,7 @@ end
 -- ── Header parsing ──────────────────────────────────────────────────────────
 -- Returns (info, class) where info = { turn = <int>, session_id = <str> } for
 -- class "ok", else nil. class: "ok" | "missing" | "bad".
--- Valid = turn integer >= 1 AND session_id non-blank string of <= 256 chars.
+-- Valid = turn integer in [1, 1e9] AND session_id non-blank string of <= 256 chars.
 -- Anything else (absent header, malformed JSON, wrong shape) does not block
 -- the request: it lands in the "nohdr" pseudo-bucket treated as warm.
 function M.parse_header(hv)
@@ -73,7 +73,10 @@ function M.parse_header(hv)
         return nil, "bad"
     end
     local t, sid = obj.turn, obj.session_id
-    if type(t) ~= "number" or t < 1 or t ~= math.floor(t) then
+    -- The upper cap matters: cjson decodes 1e999 to inf, which passes the
+    -- integer check (inf == floor(inf)), and cjson.encode later refuses inf,
+    -- so the bodylog record carrying phan_turn would be lost.
+    if type(t) ~= "number" or t < 1 or t > 1e9 or t ~= math.floor(t) then
         return nil, "bad"
     end
     if type(sid) ~= "string" or not sid:match("%S") or #sid > 256 then
