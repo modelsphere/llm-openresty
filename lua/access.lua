@@ -255,7 +255,14 @@ function _G.do_route(opts)
     -- 触发的是哪条指标。多指标(OR)时,光看 ttft_limit 只能反推,两条阈值相同就完全分不出来。
     local ttft_metric = hit_ttft and a.ttft_hit.hit_metric or "-"
     -- ttft_429_disabled:独立开关关掉硬 429(EWMA 测量 + cc 收缩仍在),TTFT 高只软控不硬拒。
-    local ttft_hard429_off = ttft.ttft_429_disabled(opts)
+    -- Evaluated lazily: the function costs one dict get, so keep the
+    -- feature-off ordering identical to main (consulted only after hit_ttft,
+    -- via the short-circuit at the legacy branch below). With session_prio on
+    -- it is read once here and memoised for the grading blocks.
+    local ttft_hard429_off
+    if sp_on then
+        ttft_hard429_off = ttft.ttft_429_disabled(opts)
+    end
     -- ── session_prio: TTFT gate graded by turn ──
     -- Structure (feature on, hard 429 not disabled, not a probe request):
     --   fast path: no 1.0x trip and the turn-1 hold flag clear -> pass, with
@@ -312,8 +319,7 @@ function _G.do_route(opts)
                     sp_ttft_reject = true
                 elseif is_turn1 then
                     -- turn 1: tol is 1.0, so a 1.0x trip rejects it right here
-                    -- (and the hold flag does when there is no trip); turn 1 is
-                    -- never given a probe slot.
+                    -- (and the hold flag does when there is no trip).
                     sp_ttft_reject = true
                 else
                     local tol = tbl[bidx].tol
@@ -322,9 +328,13 @@ function _G.do_route(opts)
                     end
                 end
                 -- Warm turns / nohdr still get the half-open probe budget
-                -- (hard and soft share the same one) so samples keep flowing;
-                -- turn 1 never reaches this, it leaves with the 429 above.
+                -- (hard and soft share the same one) so samples keep flowing.
+                -- Turn 1 draws on its OWN tiny budget, and only while no warm
+                -- request has probed this window (its samples then add
+                -- nothing). See session_prio.t1_allow_probe.
                 if sp_ttft_reject and not is_turn1 and ttft.ttft_allow_probe(opts) then
+                    sp_ttft_reject = false
+                elseif sp_ttft_reject and is_turn1 and session_prio.t1_allow_probe(opts, "ttft") then
                     sp_ttft_reject = false
                 end
             end
@@ -356,7 +366,7 @@ function _G.do_route(opts)
             body_ewma or -1, body_limit or -1, ngx.ctx.req_model or "-", #a.healthy_peers,
             active_level, opts.route_name, body_metric, tb, zone))
         return ngx.exit(429)
-    elseif (not sp_on) and hit_ttft and not is_probe and not ttft_hard429_off and not ttft.ttft_allow_probe(opts) then
+    elseif (not sp_on) and hit_ttft and not is_probe and not ttft.ttft_429_disabled(opts) and not ttft.ttft_allow_probe(opts) then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":ttft",1,0) end end
         ngx.header["Content-Type"] = "application/json"
@@ -392,10 +402,15 @@ function _G.do_route(opts)
         local is_turn1 = sp_bucket ~= "nohdr" and tbl[sp_bucket].min_turn == 1
         local tpd = tps.tps_dict_if_on(opts)
         if tpd then
-            -- 1.0x already tripped; turn 1 rejects and never probes.
-            -- turn >= 2 / nohdr take the hard/soft grading plus probes.
+            -- 1.0x already tripped; turn >= 2 / nohdr take the hard/soft
+            -- grading plus the warm probe budget; turn 1 rejects unless its
+            -- own tiny budget still has a slot this window (and no warm probe
+            -- has opened one first).
             if is_turn1 then
                 sp_tps_reject = true
+                if session_prio.t1_allow_probe(opts, "tps") then
+                    sp_tps_reject = false
+                end
             else
                 if tps.tps_assess(opts, tpd, nil, false, opts.session_prio_severe).hit then
                     sp_tps_reject = true

@@ -28,6 +28,7 @@ M.HEADER = "x-phanrouter-session"
 -- route, so validate_* logs ERR and swaps in these.
 local DEF_R_NEW, DEF_SEVERE, DEF_FULL_TURN = 0.85, 1.5, 32
 local DEF_RELEASE, DEF_WARN_FRAC = 0.9, 0.2
+local DEF_T1_PROBES = 1
 
 M.DEFAULTS = {
     r_new     = DEF_R_NEW,
@@ -35,6 +36,7 @@ M.DEFAULTS = {
     full_turn = DEF_FULL_TURN,
     release   = DEF_RELEASE,
     warn_frac = DEF_WARN_FRAC,
+    t1_probes = DEF_T1_PROBES,
 }
 
 -- ── Effective on/off ─────────────────────────────────────────────────────────
@@ -152,6 +154,7 @@ function M.validate_opts(opts, name)
     opts.session_prio_full_turn = num("session_prio_full_turn", DEF_FULL_TURN, 2, nil, false, false, true)
     opts.session_prio_release   = num("session_prio_release", DEF_RELEASE, 0, 1, true, true)
     opts.session_prio_warn_frac = num("session_prio_warn_frac", DEF_WARN_FRAC, 0, 1, true, true)
+    opts.session_prio_t1_probes = num("session_prio_t1_probes", DEF_T1_PROBES, 0, nil, false, false, true)
     if opts.session_prio_table ~= nil then
         if M.validate_table(opts.session_prio_table) then
             opts._sp_table = opts.session_prio_table
@@ -236,12 +239,61 @@ function M.count(opts, bucket, what, n) incr(opts, M.ctr_key(opts, bucket, what)
 -- JSON echo), so gmatch keeps the final occurrence. The closing quote in
 -- "prompt_tokens" is load-bearing: without it "prompt_tokens_details" matches.
 -- Returns (ptok, ct); either is nil when absent from the tail.
+-- The TPS tail is ~2 KB and the usage chunk is by contract the LAST chunk, so
+-- anchor on the last literal `"usage":{` with plain finds and only gmatch from
+-- there on. The object brace is part of the anchor so a bare-content mention
+-- like "usage": null (or a string echo) cannot steer the scan; with no
+-- `"usage":{` at all, fall back to the full scan (the old semantics).
+-- Measured at ~21 us for the two full-tail gmatch scans vs ~2 us anchored.
 function M.parse_usage(tail)
     if type(tail) ~= "string" then return nil, nil end
+    local pos
+    local i = 1
+    while true do
+        local j = tail:find('"usage":{', i, true)
+        if not j then break end
+        pos = j
+        i = j + 1
+    end
+    local scan = pos and tail:sub(pos) or tail
     local ptok, ct
-    for n in tail:gmatch('"prompt_tokens"%s*:%s*(%d+)') do ptok = tonumber(n) end
-    for n in tail:gmatch('"cached_tokens"%s*:%s*(%d+)') do ct = tonumber(n) end
+    for n in scan:gmatch('"prompt_tokens"%s*:%s*(%d+)') do ptok = tonumber(n) end
+    for n in scan:gmatch('"cached_tokens"%s*:%s*(%d+)') do ct = tonumber(n) end
     return ptok, ct
+end
+
+-- ── Turn-1 probe budget (separate counter, per window) ──────────────────────
+-- A tripped gate gives turn 1 no probe slots, so a pool of almost-only-new
+-- sessions records no samples until the EWMA expires, then opens all at once.
+-- This lets up to session_prio_t1_probes turn-1 requests per window through,
+-- ONLY while no warm request has hit the gate in the current window (a warm
+-- probe means samples are flowing already). The budget lives on its OWN
+-- counter and never touches the warm one.
+-- kind: "ttft" or "tps" (dict, window and key prefix follow the gate).
+-- Returns true if this turn-1 request may pass as a probe.
+function M.t1_allow_probe(opts, kind)
+    local budget = tonumber(opts.session_prio_t1_probes) or 0
+    if budget <= 0 then return false end
+    local dict_name = kind == "tps" and opts.tps_dict or opts.ttft_dict
+    local window    = kind == "tps" and opts.tps_probe_window or opts.ttft_probe_window
+    local prefix_fn = kind == "tps"
+        and require("tps").tps_key_prefix or require("ttft").ttft_key_prefix
+    local td = dict_name and ngx.shared[dict_name]
+    if not td then return false end
+    local win = math.floor(ngx.now() / window)
+    local pre = prefix_fn(opts)
+    -- Warm probe counter for THIS window: if anything above zero exists, warm
+    -- traffic has already re-opened a slot and turn 1 stays out.
+    local warm = td:get(pre .. "probe:" .. win)
+    if warm and warm > 0 then return false end
+    -- Same window/expiry handling as the warm counter: rolling key, fresh keys
+    -- expire after 2 windows. incr is atomic; a nil (full dict) fails closed
+    -- here -- refusing a probe slot is safe, unlike the warm path's fail-open.
+    local key = pre .. "probe_t1:" .. win
+    local n = td:incr(key, 1, 0)
+    if not n then return false end
+    if n == 1 then td:expire(key, window * 2) end
+    return n <= budget
 end
 
 -- ── Turn-1 hysteresis flag (ttft_dict, per pool) ────────────────────────────
@@ -252,16 +304,19 @@ end
 -- Read cheaply every request; WRITTEN ONLY ON STATE CHANGE (dict get before
 -- set) so the hot path never writes. The flag carries ttft_ttl: if the feature
 -- is hot-toggled off mid-trip the flag ages away instead of holding forever.
-function M.turn1_flag_key(opts)
+function M.turn1_flag_key(opts, model)
     local ttft = require "ttft"
-    return ttft.ttft_key_prefix(opts) .. "turn1_hold"
+    return ttft.ttft_key_prefix(opts, model) .. "turn1_hold"
 end
 
 -- Returns (held:bool, td, key). td/key are nil when the ttft dict is missing.
-function M.turn1_held(opts)
+-- model is optional: on peers_by_model routes pass it explicitly. Without a
+-- request context (admin endpoint, timer) ngx.ctx.req_model is nil and the
+-- key would silently land on the "?"-prefixed layout that never holds flags.
+function M.turn1_held(opts, model)
     local td = opts.ttft_dict and ngx.shared[opts.ttft_dict]
     if not td then return false, nil, nil end
-    local key = M.turn1_flag_key(opts)
+    local key = M.turn1_flag_key(opts, model)
     return td:get(key) == 1, td, key
 end
 

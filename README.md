@@ -185,7 +185,12 @@ on a route, the three rejection gates grade by turn bucket (1 / 2-3 / 4-7 / ... 
 - **TTFT**: an EWMA at or above `threshold x session_prio_severe` (default 1.5) is a
   hard trip and rejects every bucket; between `threshold x tol(bucket)` and that, a
   soft zone rejects lower buckets while warmer ones keep a probe slot. Turn 1 never
-  probes, and a hysteresis flag holds turn 1 out until the EWMA falls below
+  takes from the warm probe budget; instead it gets its own tiny budget of
+  `session_prio_t1_probes` per-probe-window slots (default 1, 0 restores the
+  earlier never-probe behaviour), and only while no warm request has probed that
+  window yet — a pool of almost-only-new sessions keeps trickling samples
+  through, so recovery does not wait for the whole EWMA to expire. A hysteresis
+  flag holds turn 1 out until the EWMA falls below
   `threshold x session_prio_release` (default 0.9) or expires.
 - **TPS** (only with adaptive concurrency off): the same grading, inverted — a hard
   trip below `threshold / severe`, a soft zone below `threshold / tol(bucket)`.
@@ -197,21 +202,27 @@ minute exceeds `session_prio_warn_frac` (default 0.2). A route can also replace 
 whole bucket table with `session_prio_table = { {min_turn, share, tol}, ... }` (first
 `min_turn` 1, strictly ascending).
 
-The adaptive-cc controller and the TTFT/TPS EWMA measurement are unchanged: they
-still decide *how many* requests get in; the turn decides *which* ones. With the
-feature off every path is byte-identical — same 429 bodies, same sid sources, no
-counter traffic. `POST /_session_prio_toggle?on=0|1` flips it at runtime without a
-reload, and `GET /_session_status` shows the effective table, per-bucket
-admits/rejections, and the cache hit rate (`ctok/ptok`).
+The adaptive-cc controller and the TTFT/TPS EWMA measurement are unchanged: the
+SLO guard itself is not touched. One interaction to know about: on an
+adaptive-cc route, a turn-1 request rejected by the reserve (in-flight between
+`limit x share` and `limit`) still counts as unmet demand in the controller's
+per-pool `rej` counter, so on a healthy route the controller keeps growing the
+limit to make room inside the reserve — exactly what the reserve is for. With
+the feature off every path is byte-identical — same 429 bodies, same sid
+sources, no counter traffic. `POST /_session_prio_toggle?on=0|1` flips it at
+runtime without a reload, and `GET /_session_status` shows the effective table,
+per-bucket admits/rejections, and the cache hit rate (`ctok/ptok`).
 
 Two known limitations. The prompt/cached token counters (`ptok`, `ctok`) are parsed
 out of the TPS response tail, which only exists while TPS measurement is on — routes
 without it get no token accounting (rejections and admits still count). The second
-is that the concurrency gate admits while in-flight is under `limit x share`, so a
-bucket can fill the pool up to `ceil(limit x share)` requests. With the default
-shares 0.85/0.88/0.91/0.94/0.97/1.0 that means:
+is that the concurrency gate admits while in-flight is under
+`limit x rt_limit_factor x share`, so a bucket can fill the pool up to
+`ceil(limit x rt_limit_factor x share)` requests; the table below assumes the
+default `rt_limit_factor = 1`. With the default shares
+0.85/0.88/0.91/0.94/0.97/1.0 that means:
 
-| `limit` | ceilings per bucket (`ceil(limit x share)`) |
+| `limit` | ceilings per bucket (`ceil(limit x share)`, `rt_limit_factor = 1`) |
 |---|---|
 | 6 | 6, 6, 6, 6, 6, 6 |
 | 7 | 6, 7, 7, 7, 7, 7 |

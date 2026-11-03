@@ -24,6 +24,8 @@
 #   S9  TPS gate grading (adaptive_cc off): soft zone turn1 429 vs warm 200;
 #       hard trip probes only for turn>=2
 #   S10 runtime toggle off restores today's behaviour
+#   S11 turn-1 probe budget: N turn-1 passes per window on its own counter,
+#       0 passes once a warm probe opened a slot that window, reset next window
 #
 # Harness notes (learned the hard way):
 #   * TTFT samples only come from STREAMING requests; the concurrency holders
@@ -62,6 +64,7 @@ http {
   lua_shared_dict ttft_stat 1m; lua_shared_dict tps_stat 1m; lua_shared_dict api_keys 1m; lua_shared_dict session_stat 1m;
   lua_shared_dict active_conns_off 4m; lua_shared_dict cluster_avg_off 16k; lua_shared_dict lc_locks_off 1m; lua_shared_dict bad_peers_off 1m; lua_shared_dict bodylog_ctl_off 1m; lua_shared_dict cch_ctl_off 1m;
   lua_shared_dict active_conns_sp 4m; lua_shared_dict cluster_avg_sp 16k; lua_shared_dict lc_locks_sp 1m; lua_shared_dict bad_peers_sp 1m; lua_shared_dict bodylog_ctl_sp 1m; lua_shared_dict cch_ctl_sp 1m;
+  lua_shared_dict active_conns_tpx 4m; lua_shared_dict cluster_avg_tpx 16k; lua_shared_dict lc_locks_tpx 1m; lua_shared_dict bad_peers_tpx 1m; lua_shared_dict bodylog_ctl_tpx 1m; lua_shared_dict cch_ctl_tpx 1m;
   lua_shared_dict active_conns_spc 4m; lua_shared_dict cluster_avg_spc 16k; lua_shared_dict lc_locks_spc 1m; lua_shared_dict bad_peers_spc 1m; lua_shared_dict bodylog_ctl_spc 1m; lua_shared_dict cch_ctl_spc 1m;
   lua_shared_dict active_conns_tp 4m; lua_shared_dict cluster_avg_tp 16k; lua_shared_dict lc_locks_tp 1m; lua_shared_dict bad_peers_tp 1m; lua_shared_dict bodylog_ctl_tp 1m; lua_shared_dict cch_ctl_tp 1m;
   upstream vllm_backends { server 0.0.0.1:1; balancer_by_lua_block { _G.do_balancer() } }
@@ -96,7 +99,10 @@ http {
     _G.register_route("sp",  function() return R({peers=mk,  default_max=10, session_prio=true, adaptive_cc=false,
                                                   -- S5 needs the hold band [release x 400, 400) reachable by a
                                                   -- P80 walk before the flag ttl (8s) runs out; 0.6 widens it.
-                                                  session_prio_release=0.6}) end)
+                                                  session_prio_release=0.6,
+                                                  -- 0 = turn 1 never probes (the shape S3-S6 pin); the
+                                                  -- budget lives on tpx, exercised by S11.
+                                                  session_prio_t1_probes=0}) end)
     -- spc: S8 hit-rate pool. Token accounting reads the TPS tail, which only
     -- exists while TPS measurement is on -- so this route KEEPS a TPS
     -- threshold (the AIMD default then also applies, harmless for two
@@ -104,7 +110,10 @@ http {
     _G.register_route("spc", function() return R({peers=mkc, default_max=10, session_prio=true, tps_limit_tps=50}) end)
     -- tp: S9, TPS hard-fuse gate under the feature.
     _G.register_route("tp",  function() return R({peers=mkt, default_max=10, session_prio=true,
-                                                  adaptive_cc=false, tps_limit_tps=50}) end)
+                                                  adaptive_cc=false, tps_limit_tps=50, session_prio_t1_probes=0}) end)
+    -- tpx: identical gates with the DEFAULT turn-1 probe budget (1): S11.
+    _G.register_route("tpx", function() return R({peers=mkt, default_max=10, session_prio=true,
+                                                  adaptive_cc=false, tps_limit_tps=50, ttft_limit_ms=400}) end)
   }
   server { listen 19100; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.off) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.off) } }
@@ -123,6 +132,9 @@ http {
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.tp) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.tp) } }
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.tp) } }
     location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.tp) } } }
+  server { listen 19105; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
+    location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.tpx) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.tpx) } }
+    location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.tpx) } } }
   server { listen 19104; server_name _; set $routed_session_id "-"; set $routed_source "-"; set $routed_mode "-"; set $routed_peer "-"; set $routed_dict "";
     location /v1/ { access_by_lua_block { _G.do_route(_G.__route_opts.offC) } body_filter_by_lua_block { _G.bodylog_filter_chunk() } proxy_next_upstream error timeout http_502 http_503 non_idempotent; proxy_pass http://vllm_backends; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 3600s; log_by_lua_block { _G.do_log_release(_G.__route_opts.offC) } }
     location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.offC) } } }
@@ -172,7 +184,7 @@ slow(){ local sid="hold-${3:-x}-$RANDOM"
 # hold $1=url $2=N $3=pre-sleep: park rt_sum at N with 5s prefills
 hold(){ for i in $(seq 1 "$2"); do slow "$1" 5000 "${2}h"; done; sleep "${3:-1}"; }
 drain(){ wait; sleep 1; }
-OFF=http://127.0.0.1:19100; SP=http://127.0.0.1:19101; SPC=http://127.0.0.1:19102; TP=http://127.0.0.1:19103; OFFC=http://127.0.0.1:19104
+OFF=http://127.0.0.1:19100; SP=http://127.0.0.1:19101; SPC=http://127.0.0.1:19102; TP=http://127.0.0.1:19103; TPX=http://127.0.0.1:19105; OFFC=http://127.0.0.1:19104
 
 echo "########## S1 feature off: byte-identical to today ##########"
 expire; c=$(fire $OFF 100 5)
@@ -398,6 +410,55 @@ expire; estab2 $SP "600 600 600" 600   # 1.0x trip, probe budget fresh
 c10=$(fire $SP 50 1 s10)
 [ "$c10" = "200" ] && ok "S10b toggle off: turn1 probes like any request (today's behaviour)" || no "S10b c=$c10"
 curl -s "$SP/_session_prio_toggle?on=1" >/dev/null   # restore for a clean teardown
+
+echo "########## S11 turn-1 probe budget ##########"
+# tpx carries the DEFAULT budget of 1 per probe window (sp/tp run with 0).
+# Every sub-case re-establishes a FRESH hard trip first, fires the turn-1
+# requests while capturing the body of ONE of them, and asserts the trip is
+# live (ttft error) in that body. A bare status sweep cannot tell "the
+# budget behaved" from "nothing was tripped" -- exactly how the earlier
+# S11c/mutation-(a) muddle happened.
+# r11: fire one turn-1 request, print "code|has-ttft-error" (one request,
+# both facts, no second budget-consuming probe).
+r11(){ local body code
+  body=$(curl -s -N -H "$A" -H "$H" -H "x-phanrouter-session: {\"session_id\":\"s11-$3\",\"turn\":1}" \
+    -d "{\"model\":\"x\",\"stream\":true,\"prefill_delay_ms\":50,\"max_tokens\":1,\"messages\":[]}" \
+    -w "\n%{http_code}" "$1/v1/chat/completions")
+  code=${body##*$'\n'}
+  case "$body" in *"ttft limit exceeded"*) echo "$code 1";; *) echo "$code 0";; esac
+}
+# --- S11a: turn-1-only traffic in a hard trip: exactly 1 pass per window ---
+expire; estab2 $TPX "600 600 600" 600
+align                                        # start the loop at a window boundary
+n200=0; n429=0; ntf=0
+for i in 1 2 3 4 5; do
+  read -r c tf <<<"$(r11 $TPX x a)"
+  [ "$c" = 200 ] && n200=$((n200+1)); [ "$c" = 429 ] && n429=$((n429+1)); ntf=$((ntf+tf))
+done
+{ [ "$n200" = "1" ] && [ "$n429" = "4" ] && [ "$ntf" -ge 4 ]; } \
+  && ok "S11a hard trip: 1 t1-probe pass, 4 ttft-429s ($n200/$n429, ttft bodies=$ntf)"   || no "S11a 200=$n200 429=$n429 ttft-bodies=$ntf"
+# --- S11b: warm probed first in THIS window -> turn 1 gets 0 passes ---
+expire; estab2 $TPX "600 600 600" 600   # re-establish, no carry-over from S11a
+align
+w40a=$(fire $TPX 50 40 s11b)             # warm probe consumes its own window slot
+n200=0; ntf=0; n429=0
+for i in 1 2 3; do
+  read -r c tf <<<"$(r11 $TPX x b)"
+  [ "$c" = 200 ] && n200=$((n200+1)); [ "$c" = 429 ] && n429=$((n429+1)); ntf=$((ntf+tf))
+done
+{ [ "$w40a" = "200" ] && [ "$n200" = "0" ] && [ "$ntf" -ge 2 ]; } \
+  && ok "S11b warm probed first: 0 t1 passes, ttft bodies=$ntf ($w40a)"   || no "S11b w40a=$w40a 200=$n200 429=$n429 ttft-bodies=$ntf"
+# --- S11c: self-contained window reset; trip re-established. Exactly 1 pass. ---
+expire; estab2 $TPX "600 600 600" 600
+align
+n200=0; n429=0; ntf=0
+for i in 1 2 3; do
+  read -r c tf <<<"$(r11 $TPX x c)"
+  [ "$c" = 200 ] && n200=$((n200+1)); [ "$c" = 429 ] && n429=$((n429+1)); ntf=$((ntf+tf))
+done
+{ [ "$n200" = "1" ] && [ "$n429" = "2" ] && [ "$ntf" -ge 2 ]; } \
+  && ok "S11c fresh window, fresh trip: exactly 1 pass then ttft-429s ($n200/$n429, bodies=$ntf)"   || no "S11c 200=$n200 429=$n429 bodies=$ntf"
+
 
 echo
 echo "########## PASS=$P FAIL=$F ##########"

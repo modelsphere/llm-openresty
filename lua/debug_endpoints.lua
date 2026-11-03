@@ -1275,6 +1275,10 @@ function _G.dbg_session_status(opts)
             header_counts = hdr,
             buckets = buckets,
             nohdr_last_minute = nohdr_minute,
+            -- the flag lives per pool (<route>[:<model>]:turn1_hold): read it
+            -- with THIS pool's model, never from ngx.ctx (an admin endpoint
+            -- has no request model, and the flat layout would silently be "?").
+            turn1_hold = session_prio.turn1_held(opts, p.model ~= false and p.model or nil),
         }
     end
     ngx.say(cjson_dbg.encode({
@@ -1288,7 +1292,6 @@ function _G.dbg_session_status(opts)
         release         = opts.session_prio_release,
         warn_frac       = opts.session_prio_warn_frac,
         effective_table = eff,
-        turn1_hold      = session_prio.turn1_held(opts),
         pools           = out_pools,
         session_stat_present = (d ~= nil),
     }))

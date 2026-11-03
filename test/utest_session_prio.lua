@@ -205,6 +205,26 @@ local p4, c4 = PU(nil)
 eq("nil tail -> nil, nil", p4 == nil and c4 == nil, true)
 local p5, c5 = PU("no tokens here")
 eq("tail without fields -> nil, nil", p5 == nil and c5 == nil, true)
+-- a decoy "usage" earlier plus the real one last: only the real chunk counts
+local p6, c6 = PU('"usage":{"prompt_tokens":1} ... "usage":{"prompt_tokens":42,"prompt_tokens_details":{"cached_tokens":7}}')
+eq("decoy earlier usage ignored, real wins (ptok)", p6, 42)
+eq("decoy earlier usage ignored, real wins (ctok)", c6, 7)
+-- a tail with no "usage" anywhere falls back to the full scan and still finds the fields
+local p7, c7 = PU('{"prompt_tokens":33, "cached_tokens": 9}')
+eq("no usage anywhere: fallback full scan finds ptok", p7, 33)
+eq("no usage anywhere: fallback full scan finds ctok", c7, 9)
+-- prompt_tokens_details is still not read as prompt_tokens after the anchor
+local p8, c8 = PU('"usage":{"prompt_tokens_details":{"cached_tokens":80},"prompt_tokens":55}')
+eq("details still not mistaken after anchor (ptok)", p8, 55)
+eq("details still not mistaken after anchor (ctok)", c8, 80)
+-- a bare-content "usage": null does not steer the anchor; the fallback finds the fields
+local p9, c9 = PU('"prompt_tokens":77,"cached_tokens":11 ... "usage": null')
+eq("usage-null does not steer or break the fallback (ptok)", p9, 77)
+eq("usage-null does not steer or break the fallback (ctok)", c9, 11)
+-- whitespace after "usage": falls back to the full scan (kept semantics)
+local p10, c10 = PU('"usage": { "prompt_tokens": 21, "cached_tokens": 4 }')
+eq("whitespace usage falls back to full scan (ptok)", p10, 21)
+eq("whitespace usage falls back to full scan (ctok)", c10, 4)
 
 -- == pure entry points backing the factory path (derive_table / validate_table) ==
 print("== pure entry points ==")

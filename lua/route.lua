@@ -99,6 +99,7 @@ M.DEFAULTS = {
     session_prio_full_turn     = session_prio.DEFAULTS.full_turn,
     session_prio_release       = session_prio.DEFAULTS.release,
     session_prio_warn_frac     = session_prio.DEFAULTS.warn_frac,
+    session_prio_t1_probes     = session_prio.DEFAULTS.t1_probes,
 }
 function M.default_of(key)
     local d = M.DEFAULTS[key]
