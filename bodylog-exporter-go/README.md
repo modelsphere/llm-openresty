@@ -1,48 +1,76 @@
 # bodylog-exporter
 
-把 `bodylog-listener` 落的**每请求明细 jsonl** 翻译成 **Prometheus 指标**的独立小工具。用于把 LLM 网关的**流量侧**指标(QPS、token 速率、延迟/TTFT 分位、错误率)接进 Prometheus,供 Grafana 看板与**自动扩缩容(LLMScaler / KEDA / HPA)**消费。
+A small standalone tool that turns the **per-request detail jsonl** written by
+`bodylog-listener` into **Prometheus metrics**. It brings the LLM gateway's
+**traffic-side** numbers (QPS, token rates, latency/TTFT quantiles, error rates)
+into Prometheus, for Grafana boards and for **autoscaling** (LLMScaler / KEDA / HPA).
 
-- **不改 `bodylog-listener`**:按字节 offset `tail` append-only 的 `details/<date>.jsonl`,逐行增量 `observe`。
-- **零丢**:文件当持久缓冲;offset checkpoint 续读;跨天 `jsonl→parquet` 轮转的缺口走 bodylog `/metrics` HTTP 补读(request_id 去重)。
-- **Prometheus 原生**:counter 单调累计、histogram 桶累计 → `rate()`/`histogram_quantile()` 正确(不是 scrape 时现算的窗口 gauge)。
+- **Does not touch `bodylog-listener`**: it `tail`s the append-only
+  `details/<date>.jsonl` by byte offset and `observe`s each new line.
+- **Loses nothing**: the file is the durable buffer; an offset checkpoint resumes
+  reading; the gap left by the day's `jsonl -> parquet` rotation is filled over
+  bodylog's `/metrics` HTTP endpoint (de-duplicated by request_id).
+- **Native Prometheus semantics**: counters accumulate monotonically and
+  histograms accumulate buckets, so `rate()` and `histogram_quantile()` are
+  correct -- these are not windowed gauges computed at scrape time.
 
 ---
 
-## 暴露的指标
+## Exposed metrics
 
-端点:`GET <listen>/metrics`(默认 `:9110`,Prometheus 文本格式,无鉴权 —— 只有聚合值、无请求正文)。
+Endpoint: `GET <listen>/metrics` (default `:9110`, Prometheus text format, no
+authentication -- it carries aggregates only, never request bodies).
 
-### 业务指标(维度:`service` / `route` / `backend` / `model`)
+### Traffic metrics (dimensions: `service` / `route` / `backend` / `model`)
 
-**每条业务指标都带 4 个维度**:`service`(= ModelRoute 的 `discovery.service`,`ns/name` 形式,**用户主聚合维度**)、`route`(= `nginx.route`,省略则 ModelRoute 的 `metadata.name`,与 autoconfig 一致)、`backend`(真后端 pod IP:port,会漂移)、`model`(明细里的 served-model-name,可能空)。`service`/`route` 由**富化**据 `backend` pod IP 反查 ModelRoute 得到(见下方「富化:podIP→service/route」);in-cluster 才有,裸机退化为 `unknown`。
+**Every traffic metric carries four dimensions**: `service` (the ModelRoute's
+`discovery.service`, as `ns/name`, **the dimension to aggregate by**), `route`
+(the `nginx.route`, or the ModelRoute's `metadata.name` when omitted, matching
+autoconfig), `backend` (the real backend pod `IP:port`, which drifts), and
+`model` (the served-model-name from the detail line, possibly empty).
+`service` and `route` come from **enrichment**, which looks a `backend` pod IP
+back up to its ModelRoute (see "Enrichment: podIP -> service/route" below); they
+exist only in-cluster and degrade to `unknown` on bare metal.
 
-| 指标 | 类型 | 额外 label | 含义 |
+| Metric | Type | Extra labels | Meaning |
 |---|---|---|---|
-| `bodylog_requests_total` | counter | `status_class`,`stream` | 请求数 |
-| `bodylog_prompt_tokens_total` | counter | — | prompt token 累计 |
-| `bodylog_completion_tokens_total` | counter | — | completion token 累计 |
-| `bodylog_cached_tokens_total` | counter | — | cached(命中前缀)token 累计 |
-| `bodylog_reasoning_tokens_total` | counter | — | reasoning token 累计(仅推理模型) |
-| `bodylog_total_tokens_total` | counter | — | total token 累计 |
-| `bodylog_req_bytes_total` | counter | — | 请求体字节累计 |
-| `bodylog_resp_bytes_total` | counter | — | 响应体字节累计 |
-| `bodylog_finish_reason_total` | counter | `finish_reason` | 按停止原因计数 |
-| `bodylog_rt_seconds` | **histogram**(native-only) | `stream` | 总响应时间(秒) |
-| `bodylog_ttft_seconds` | **histogram**(native-only) | **`prompt_bucket`** | 首 token 时间/TTFT(秒,**仅流式**) |
-| `bodylog_output_tok_per_second` | **histogram**(native-only) | **`prompt_bucket`** | **单请求输出 token 速率** `completion_tokens/rt`(tok/s,**分母为总时长、含 prefill**;流式与非流式均计,过滤 `ctok>=16` + `rt>=0.5s`) |
-| `bodylog_overall_output_tok_per_second` | **histogram**(native-only) | — | **总体输出 token 速率** `completion_tokens/rt`(tok/s);仅 `status` 为 2xx、`completion_tokens>0`、`rt>0` 的请求,不带 `prompt_bucket`/`stream` 过滤 |
-| `bodylog_decode_output_tok_per_second` | **histogram**(native-only) | — | **解码输出 token 速率** `completion_tokens/(lct-frt)`(tok/s);仅 2xx、`completion_tokens>0` 且 `lct-frt>0.3s` 的请求,不带 `prompt_bucket`/`stream` 过滤 |
+| `bodylog_requests_total` | counter | `status_class`, `stream` | Requests |
+| `bodylog_prompt_tokens_total` | counter | — | Prompt tokens |
+| `bodylog_completion_tokens_total` | counter | — | Completion tokens |
+| `bodylog_cached_tokens_total` | counter | — | Cached (prefix-hit) tokens |
+| `bodylog_reasoning_tokens_total` | counter | — | Reasoning tokens (reasoning models only) |
+| `bodylog_total_tokens_total` | counter | — | Total tokens |
+| `bodylog_req_bytes_total` | counter | — | Request body bytes |
+| `bodylog_resp_bytes_total` | counter | — | Response body bytes |
+| `bodylog_finish_reason_total` | counter | `finish_reason` | Requests by stop reason |
+| `bodylog_rt_seconds` | **histogram** (native-only) | `stream` | Total response time (seconds) |
+| `bodylog_ttft_seconds` | **histogram** (native-only) | **`prompt_bucket`** | Time to first token (seconds, **streaming only**) |
+| `bodylog_output_tok_per_second` | **histogram** (native-only) | **`prompt_bucket`** | **Per-request output token rate**, `completion_tokens/rt` (tok/s; **the denominator is the whole duration and includes prefill**; streaming and non-streaming alike, filtered to `ctok>=16` and `rt>=0.5s`) |
+| `bodylog_overall_output_tok_per_second` | **histogram** (native-only) | — | **Overall output token rate**, `completion_tokens/rt` (tok/s); only requests with a 2xx `status`, `completion_tokens>0` and `rt>0`, with no `prompt_bucket`/`stream` filter |
+| `bodylog_decode_output_tok_per_second` | **histogram** (native-only) | — | **Decode output token rate**, `completion_tokens/(lct-frt)` (tok/s); only 2xx requests with `completion_tokens>0` and `lct-frt>0.3s`, with no `prompt_bucket`/`stream` filter |
 
-> **⚠️ 2026-08-31(exporter 0.2.0)起,上述五个 histogram 均为 native-only** —— 不再双发经典桶,
-> `bodylog_*_bucket` / `_sum` / `_count` 这些 series **不再产生**。求分位数必须用**裸名、不带 `le`**:
-> `histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`。
-> 起因:Prometheus 侧开了 `scrapeClassicHistograms`,双发会真被抓进 TSDB(实测 12x series 膨胀)。
+> **⚠️ Since 2026-08-31 (exporter 0.2.0) all five histograms are native-only** --
+> classic buckets are no longer emitted in parallel, so the
+> `bodylog_*_bucket` / `_sum` / `_count` series **no longer exist**. Take quantiles
+> from the **bare metric name, with no `le`**:
+> `histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`.
+> Why: Prometheus has `scrapeClassicHistograms` enabled, so emitting both really
+> did land both in the TSDB (measured: 12x the series).
 
-`bodylog_output_tok_per_second` 是历史 legacy 指标,语义和 HELP 保持不变(含 `prompt_bucket`、`completion_tokens>=16`、`rt>=0.5s`),不得作为新实验的 TPS 口径；Watchmen 使用的 overall/decode 指标是新增指标,不能用旧指标替代。`decode` 明确使用明细 JSON 的 `lct-frt`，只要求 `lct-frt>0.3s`，不额外限定 `stream`；三个 TPS 指标的 observation 都是单请求直方图样本,Prometheus 查询时按 `service` 聚合即可。
+`bodylog_output_tok_per_second` is the legacy metric. Its meaning and HELP stay
+as they are (`prompt_bucket`, `completion_tokens>=16`, `rt>=0.5s`) and it must
+not be used as the TPS definition for new experiments; the overall/decode
+metrics that Watchmen consumes are new metrics and the old one is not a
+substitute. `decode` deliberately uses `lct-frt` from the detail JSON, requires
+only `lct-frt>0.3s`, and does not additionally constrain `stream`. All three TPS
+metrics observe one histogram sample per request, so a query only has to
+aggregate by `service`.
 
-#### `prompt_bucket`:按输入长度分档(ttft / output_tok_per_second)
+#### `prompt_bucket`: input-length bands (ttft / output_tok_per_second)
 
-回答「某 context 区间的 TTFT p80」这类问题。**26 档 + `unknown`**,左闭右开,4 位零填充保证字典序 == 数值序:
+For questions like "the TTFT p80 for this context range". **26 bands plus
+`unknown`**, left-closed and right-open, zero-padded to four digits so
+lexical order equals numeric order:
 
 ```
 0000k_0001k 0001k_0002k 0002k_0003k 0003k_0004k 0004k_0006k 0006k_0008k
@@ -52,162 +80,297 @@
 0768k_1024k 1024k_inf   unknown
 ```
 
-- 边界含 6/16/32/64/128/256k 等业务关注点,查询时用正则**合并相邻档**(只能变粗、不能变细):
+- The boundaries fall on the sizes that get asked about (6/16/32/64/128/256k and
+  so on). A query **merges adjacent bands** with a regex -- it can only go
+  coarser, never finer:
   ```promql
-  # 6~16K 输入的 TTFT p80
+  # TTFT p80 for 6~16K of input
   histogram_quantile(0.8, sum(rate(bodylog_ttft_seconds{
     model="kimi-k2.5", prompt_bucket=~"0006k_0008k|0008k_0010k|0010k_0012k|0012k_0016k"}[5m])))
   ```
-- **`unknown`** = `prompt_tokens<=0`(usage 缺失)。实测这批多是 `status` 400/429 的**失败请求**,
-  `frt` 反映的是错误返回耗时,与输入长度无关 —— 单列出来避免污染首档(混入会让首档 TTFT p80 从 0.11s 虚高到 1.37s)。
-- `1024k_inf` 是溢出哨兵(超模型 context 上限),正常应为空。空档不产生 series,零成本。
-- ⚠️ **档位边界上线后不可再改**:改档位 = 旧 label 停更、新值从零、跨改动点的 `histogram_quantile` 不可信。
-  需要任意区间/任意分位 → 查明细 parquet(保留 365 天),见 `metrics.go` 注释里的 DuckDB 示例。
+- **`unknown`** means `prompt_tokens<=0` (usage missing). Measured, these are
+  mostly **failed requests** with `status` 400/429, where `frt` is how long the
+  error took to come back and has nothing to do with input length -- keeping
+  them in their own band avoids polluting the first one (mixing them in inflated
+  the first band's TTFT p80 from 0.11s to 1.37s).
+- `1024k_inf` is an overflow sentinel (past the model's context limit) and should
+  normally be empty. An empty band produces no series, so it costs nothing.
+- ⚠️ **Band boundaries cannot be changed once in use**: changing them stops the
+  old labels, starts the new values from zero, and makes any
+  `histogram_quantile` spanning the change untrustworthy. For an arbitrary range
+  or quantile, query the detail parquet instead (kept 365 days); there is a
+  DuckDB example in the comments in `metrics.go`.
 
-### 服务副本数(富化,维度 `service` / `route`)
+### Service replica counts (enrichment; dimensions `service` / `route`)
 
-据 ModelRoute 的 `discovery.service` 查 EndpointSlice 得到的后端 pod 数(in-cluster 才有)。可与上面的吞吐 join 出「每副本吞吐」。
+The number of backend pods behind a ModelRoute's `discovery.service`, from its
+EndpointSlices (in-cluster only). Joins with the throughput metrics above to
+give per-replica throughput.
 
-| 指标 | 类型 | 含义 |
+| Metric | Type | Meaning |
 |---|---|---|
-| `bodylog_service_replicas` | gauge | 该 service 后端 pod **总数**(EndpointSlice endpoint 数,含未就绪) |
-| `bodylog_service_replicas_ready` | gauge | 该 service **就绪**后端 pod 数(`conditions.ready`;nil 按约定视为就绪) |
+| `bodylog_service_replicas` | gauge | Backend pods **in total** for this service (EndpointSlice endpoints, ready or not) |
+| `bodylog_service_replicas_ready` | gauge | **Ready** backend pods for this service (`conditions.ready`; nil counts as ready, by convention) |
+| `bodylog_service_replicas_desired` | gauge | **Desired** replicas for this service (the top-level workload's `spec.replicas`); **not emitted** when it cannot be read, because a 0 would read as "scaled to zero" |
 
-### exporter 自监控
+All three carry a **`role`** label:
 
-| 指标 | 类型 | 含义 |
+- An ordinary service has `role=""`.
+- A **prefill/decode-disaggregated (DisaggregatedSet) service** is split in
+  three. `role="router"` is what counting the `discovery.service` itself yields:
+  under disaggregation that Service selects each slice's **router** -- the pods
+  holding the public port -- not the engines. `role="prefill"` and
+  `role="decode"` are the engines, taken from the per-(role, slice)
+  LeaderWorkerSets that the DisaggregatedSet creates.
+
+**One LWS group is one engine** (a leader and its workers), so the role
+dimension counts engines rather than pods -- with
+`leaderWorkerTemplate.size > 1`, a pod count could never match the desired
+number. The engine counts are deliberately **not** taken from the per-role
+headless Services (`<rel>-<role>-hl-s<N>`): those carry
+`publishNotReadyAddresses`, so that a router can resolve its upstreams while the
+engines are still loading, and their EndpointSlices therefore mark every address
+ready. A ready count built on them could never fall -- including through the
+drain it is supposed to show.
+
+`role` is one more label on the same metrics rather than a metric of its own
+because the `LLMServiceDegraded` rule is `_ready < _replicas`: a binary operator
+matches on the **full label set**, so labelling only one side would silently
+reduce it to nothing.
+
+> When aggregating, de-duplicate before summing across roles
+> (`sum by(service)(max by(service, role)(...))`): the same
+> `(service, route, role)` briefly has two series while the exporter restarts.
+> An `avg` or `max` taken `by(service)` alone collapses the role dimension along
+> with everything else.
+
+### Exporter self-monitoring
+
+| Metric | Type | Meaning |
 |---|---|---|
-| `bodylog_exporter_lines_total` | counter | 已 observe 的明细行数 |
-| `bodylog_exporter_offset_bytes` | gauge | 当前 tail 文件的字节 offset |
-| `bodylog_exporter_last_ts_seconds` | gauge | 最新 observe 行的结束时刻(unix 秒),**判滞后** |
-| `bodylog_exporter_recovery_total` | counter | 跨天缺口 HTTP 补读次数 |
-| `bodylog_route_resolver_up` | gauge | 上轮 ModelRoute 发现/映射刷新成功(1/0);失败**保留上次不清空** |
-| `bodylog_route_resolver_pods` | gauge | 当前 podIP→route 映射覆盖的 pod 数 |
-| `bodylog_route_resolver_routes` | gauge | 当前发现的 route 数(poll 列表) |
-| `bodylog_route_resolver_errors_total` | counter | ModelRoute 发现/映射出错累计 |
+| `bodylog_exporter_lines_total` | counter | Detail lines observed |
+| `bodylog_exporter_offset_bytes` | gauge | Current byte offset in the tailed file |
+| `bodylog_exporter_last_ts_seconds` | gauge | End time of the newest observed line (unix seconds) -- **use this to detect lag** |
+| `bodylog_exporter_recovery_total` | counter | HTTP back-fills of a day-rotation gap |
+| `bodylog_route_resolver_up` | gauge | Whether the last ModelRoute discovery/mapping refresh succeeded (1/0); on failure the **previous mapping is kept, not cleared** |
+| `bodylog_route_resolver_pods` | gauge | Pods covered by the current podIP -> route mapping |
+| `bodylog_route_resolver_routes` | gauge | Routes currently discovered (the poll list) |
+| `bodylog_route_resolver_errors_total` | counter | ModelRoute discovery/mapping errors |
 
-### openresty 控制面指标(openresty-poll,可选)
+### openresty control-plane metrics (openresty-poll, optional)
 
-**流量侧(上面)是事后逐请求;这一组是 openresty 的即时控制面态**(每 peer 当前并发、被 ban 的 peer、限流档位)——bodylog 拿不到,**对自动扩缩容反应更快**。开启方式见下方「openresty-poll 配置」:exporter 定时 GET openresty 已暴露的 JSON 端点(`/<route>/_route_state|_tps_status|_ttft_status|_429_status`),**不改 openresty**。全是 **gauge**(快照,每 poll 周期清空重填 → 掉线 peer 自动消失),仅 `openresty_rejected_total` 是 counter。
+**The traffic side above is per-request and after the fact; this group is
+openresty's instantaneous control-plane state** -- each peer's current
+concurrency, which peers are banned, the rate-limiting level. bodylog cannot see
+any of it, and **it reacts faster for autoscaling**. See "openresty-poll
+configuration" below: the exporter periodically GETs the JSON endpoints
+openresty already exposes (`/<route>/_route_state|_tps_status|_ttft_status|_429_status`),
+and **openresty itself is not modified**. These are all **gauges** (snapshots,
+cleared and refilled every poll cycle, so a peer that disappears stops being
+reported); only `openresty_rejected_total` is a counter.
 
-维度:`service`(= `discovery.service`,与 `bodylog_*` 对齐,便于按 service 聚合)/ `route`(=ModelRoute 名)/ `peer`(真后端 host:port)/ `name`(peer 名)/ `priority`(路由层级)/ `model`(子池,无分模型时为 `_`)。`service` 同样来自富化(route→`discovery.service`);未知回退 `unknown`。
+Dimensions: `service` (the `discovery.service`, aligned with `bodylog_*` so both
+aggregate by the same key), `route` (the ModelRoute name), `peer` (the real
+backend `host:port`), `name` (the peer's name), `priority` (the routing tier),
+and `model` (the sub-pool, `_` when there is no per-model split). `service`
+again comes from enrichment (route -> `discovery.service`) and falls back to
+`unknown`.
 
-| 指标 | 类型 | label | 含义 |
+| Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `openresty_peer_active_conns` | gauge | service,route,peer,name,priority | 该 peer **当前并发**(least_conn 计数) |
-| `openresty_peer_banned` | gauge | 同上 | 是否被健康检查 **ban**(1/0) |
-| `openresty_peer_max_concurrency` | gauge | 同上 | 该 peer 静态并发上限 |
-| `openresty_route_active_level` | gauge | service,route | 当前生效优先级层(3=cart/2=backend/1=svc 兜底) |
-| `openresty_route_active_limit` | gauge | service,route | 生效层总并发上限 |
-| `openresty_route_healthy_peers` | gauge | service,route | 生效层健康 peer 数 |
-| `openresty_adaptive_cc` | gauge | service,route,model | **当前动态并发上限**(AIMD) |
-| `openresty_adaptive_cc_min` / `_max` | gauge | service,route,model | 生效下限 / 静态池容量 |
+| `openresty_peer_active_conns` | gauge | service,route,peer,name,priority | This peer's **current concurrency** (the least_conn counter) |
+| `openresty_peer_banned` | gauge | as above | Whether the health check has **banned** it (1/0) |
+| `openresty_peer_max_concurrency` | gauge | as above | This peer's static concurrency ceiling |
+| `openresty_route_active_level` | gauge | service,route | The priority tier in effect (3=cart / 2=backend / 1=svc fallback) |
+| `openresty_route_active_limit` | gauge | service,route | Total concurrency ceiling of that tier |
+| `openresty_route_healthy_peers` | gauge | service,route | Healthy peers in that tier |
+| `openresty_adaptive_cc` | gauge | service,route,model | **The current dynamic concurrency ceiling** (AIMD) |
+| `openresty_adaptive_cc_min` / `_max` | gauge | service,route,model | The floor in effect / the static pool capacity |
 | `openresty_adaptive_cc_init` | gauge | service,route,model | Start point and low-traffic shrink floor (= min unless `adaptive_cc_init` is set; absent on engines that predate it) |
-| `openresty_adaptive_cc_conc` | gauge | service,route,model | **当前并发**(timer 判压力用的实时在途) |
-| `openresty_adaptive_cc_rej` | gauge | service,route,model | 本区间被压抑需求(并发 429 数) |
-| `openresty_tps_ewma` | gauge | service,route,model | 输出 token 速率 EWMA(tok/s,口径同上:分母含 prefill、含非流式) |
-| `openresty_ttft_ewma_ms` | gauge | service,route,model | TTFT EWMA(ms) |
-| `openresty_tps_limiter_active` / `openresty_ttft_limiter_active` | gauge | service,route | 限流是否生效(1/0) |
-| `openresty_rejected_total` | **counter** | service,route,reason | 429 限流累计(reason=concurrency/ttft/tps) |
+| `openresty_adaptive_cc_conc` | gauge | service,route,model | **Current concurrency** (what the timer reads to judge pressure) |
+| `openresty_adaptive_cc_rej` | gauge | service,route,model | Demand suppressed this interval (concurrency 429s) |
+| `openresty_tps_ewma` | gauge | service,route,model | Output token rate EWMA (tok/s, same definition as above: the denominator includes prefill, and non-streaming requests count) |
+| `openresty_ttft_ewma_ms` | gauge | service,route,model | TTFT EWMA (ms) |
+| `openresty_tps_limiter_active` / `openresty_ttft_limiter_active` | gauge | service,route | Whether that limiter is in effect (1/0) |
+| `openresty_rejected_total` | **counter** | service,route,reason | 429s from rate limiting (reason=concurrency/ttft/tps) |
 | `openresty_poll_up` | gauge | service,route | Whether all four endpoints of this route answered in the last poll (1/0); one route failing does not affect the others |
-| `openresty_poll_errors_total` | counter | — | poll 出错累计 |
+| `openresty_poll_errors_total` | counter | — | Poll errors |
 | `openresty_poll_last_success_seconds` | gauge | service,route | Unix time of this route's last fully successful poll |
 
-route 动态发现自监控与富化**同一个发现器**,见上方 `bodylog_route_resolver_*`(不再有独立的 `openresty_discovered_routes` / `openresty_route_discovery_*`)。
+Dynamic route discovery shares **one discoverer** with enrichment and reports
+through `bodylog_route_resolver_*` above (there is no separate
+`openresty_discovered_routes` / `openresty_route_discovery_*` any more).
 
-**只 poll 一台**:k8s openresty Service(HA 时只选 active leader → 天然单逻辑目标),不带 instance label。
+**Only one target is polled**: the k8s openresty Service (under HA it resolves to
+the active leader, so there is naturally one logical target), with no instance
+label.
 
-### label 说明
+### The labels
 
-- **`service`**:后端所属 ModelRoute 的 `spec.discovery.service`(`ns/name`,如 `model-service/fallback-model-service-01`)。**推荐主聚合维度** —— pod IP 会漂移、`model` 会抓空,但 service 稳定。富化未命中(裸机/无 SA/pod 刚建未进 EndpointSlice)= `unknown`。
-- **`route`**:后端所属 ModelRoute 的 `spec.nginx.route`(如 `fallback-model-service-0.1`),省略则取 `metadata.name`(与 autoconfig 生成 `session_route_<route>.conf` 的规则一致;只有连 nginx 段都没有的 monitor-only 才不计),与 service 1:1。未命中 = `unknown`。
-- **`backend`**:归一化后的**真实后端** `host:port`(= bodylog 聚合的 peer key)。缺失时为 `(none)`(如未路由的 4xx);重试会出现 `<peer> (retry#1)` 变体。
-- **`model`**:响应里的 served-model-name(取自 `resp_meta.model`,**有界**);缺失为 `unknown`。**纯取明细,不用 ModelRoute 兜底**(要稳定的服务维度用 `service`)。
-- **`status_class`**:`2xx` / `4xx` / `5xx` / `other`(429 归 `4xx`;精确 429 分 reason 见 `openresty_rejected_total`)。
-- **`stream`**:`true` / `false` / `unknown`(请求未声明 stream 时)。
-- **`finish_reason`**:停止原因串(如 `stop`/`length`/`tool_calls`);为空不计。
-- **`prompt_bucket`**:输入长度档位(仅 `bodylog_ttft_seconds` / `bodylog_output_tok_per_second`)。取值见上方档位表;`prompt_tokens<=0` → `unknown`。
+- **`service`**: the `spec.discovery.service` of the backend's ModelRoute
+  (`ns/name`, e.g. `model-service/fallback-model-service-01`). **The dimension
+  to aggregate by** -- pod IPs drift and `model` can come back empty, but the
+  service is stable. Enrichment that does not hit (bare metal, no service
+  account, a pod too new to be in an EndpointSlice) gives `unknown`.
+- **`route`**: the `spec.nginx.route` of the backend's ModelRoute (e.g.
+  `fallback-model-service-0.1`), falling back to `metadata.name` when omitted
+  (the same rule autoconfig uses to name `session_route_<route>.conf`; only a
+  monitor-only ModelRoute with no nginx section at all is skipped). One route to
+  one service. No hit gives `unknown`.
+- **`backend`**: the normalised **real backend** `host:port` (the peer key
+  bodylog aggregates on). `(none)` when absent, as for a 4xx that was never
+  routed; a retry shows up as the variant `<peer> (retry#1)`.
+- **`model`**: the served-model-name from the response (`resp_meta.model`,
+  **bounded**); `unknown` when absent. **Taken only from the detail line, never
+  filled in from the ModelRoute** -- for a stable service dimension, use
+  `service`.
+- **`status_class`**: `2xx` / `4xx` / `5xx` / `other` (429 counts as `4xx`; for
+  429 broken down by reason see `openresty_rejected_total`).
+- **`stream`**: `true` / `false` / `unknown` (when the request did not say).
+- **`finish_reason`**: the stop reason string (`stop`, `length`, `tool_calls`
+  and so on); empty is not counted.
+- **`prompt_bucket`**: the input-length band, on `bodylog_ttft_seconds` and
+  `bodylog_output_tok_per_second` only. Values are in the table above;
+  `prompt_tokens<=0` gives `unknown`.
 
-### 富化:podIP→service/route(单一发现器)
+### Enrichment: podIP -> service/route (one discoverer)
 
-`bodylog_*`(明细)与 `openresty_*`(poll)都需要把「后端」归到一个稳定的服务身份上。**同一个发现器**(in-cluster SA REST,不引 client-go)一份 ModelRoute list 产出三样:
+Both `bodylog_*` (details) and `openresty_*` (poll) need to attribute "a
+backend" to a stable service identity. **One discoverer** (in-cluster REST with
+the service account, no client-go) produces three things from a single
+ModelRoute list:
 
-1. **`map[podIP]→{route,service}`**:每个 ModelRoute 的 `discovery.service` → 查该 Service 的 EndpointSlice 得 pod IP 集 → 反建。`observe()` 用 `backend` 的 IP(剥 `:port`/`(retry#N)`)查表打 `service`/`route`。**含未就绪 pod**(它可能刚服务过一个请求,仍要能归属)。
-2. **每 service 副本数**(`bodylog_service_replicas` / `_ready`)。
-3. **route 列表 + route→service**:给 openresty-poll 用(route 列表按 `OPENRESTY_SERVICE` 过滤;service map 含全部 route)。
+1. **`map[podIP] -> {route, service}`**: for each ModelRoute, its
+   `discovery.service` -> that Service's EndpointSlices -> the set of pod IPs ->
+   inverted. `observe()` takes the IP out of `backend` (stripping `:port` and
+   `(retry#N)`), looks it up, and attaches `service`/`route`. **Not-ready pods
+   are included**: one may just have served a request and still has to be
+   attributable.
+2. **Replica counts per service** (`bodylog_service_replicas` and `_ready`).
+3. **The route list and route -> service**, for openresty-poll (the route list
+   is filtered by `OPENRESTY_SERVICE`; the service map holds every route).
 
-周期刷新(`ROUTE_DISCOVERY_INTERVAL_SECONDS`,默认 30s),pod/route 增删自动跟随;apiserver 抖动某轮失败 → **保留上次不清空**。**仅 in-cluster 启用**(需 `KUBERNETES_SERVICE_HOST` + SA);裸机 exporter 无此能力 → `service`/`route` 恒 `unknown`(其余指标照常)。**RBAC 需 `list` `modelroutes` + `endpointslices`**(helm `rbac.yaml` 已建)。
+It refreshes periodically (`ROUTE_DISCOVERY_INTERVAL_SECONDS`, default 30s), so
+pods and routes coming and going are followed automatically; when the apiserver
+flaps and a round fails, **the previous result is kept, not cleared**. It is
+**enabled in-cluster only** (it needs `KUBERNETES_SERVICE_HOST` and a service
+account); a bare-metal exporter has no such ability, so `service` and `route`
+stay `unknown` while every other metric carries on. **RBAC needs `list` on
+`modelroutes` and `endpointslices`** (the helm `rbac.yaml` already creates it).
+The per-role series additionally need `list` on `leaderworkersets`; without that
+permission, or on a cluster without the CRD, **only the role dimension goes
+missing** and everything else carries on (one log line, then no further requests
+for 30 minutes). To turn it off outright, set `PD_ROLE_GROUP=""` and no request
+is made at all. Also note that when `_desired` is split by role, it is
+**emitted only once every slice of that role has reported its `spec.replicas`**:
+summing a subset would give a smaller number that still looks like an answer.
 
-> **⚠️ `service` label 与 target label 撞名**:kube-prometheus-stack 抓取时会注入一个 target label `service`(= 抓的 k8s Service 名)。必须 **ServiceMonitor `honorLabels: true`**(bodylog chart 与本 README 的 manifest 都已设),让 exporter 自带的 `service`(模型 service)胜出,`by(service)` 才聚合到模型而非抓取目标。
+> **⚠️ The `service` label collides with a target label**: kube-prometheus-stack
+> injects a target label `service` (the name of the k8s Service being scraped)
+> when it scrapes. **`honorLabels: true` on the ServiceMonitor is required** (the
+> bodylog chart and the manifest in this README both set it) so that the
+> exporter's own `service` -- the model service -- wins, and `by(service)`
+> aggregates by model rather than by scrape target.
 
-### ⚠️ 字段可靠性(0/空按"缺测"跳过,不污染分位/不造无谓 series)
+### ⚠️ Field reliability (0 or empty is treated as "not measured", skipped rather than polluting quantiles or creating pointless series)
 
-- `ttft`(frt):**只在 `stream=true` 时记**(明细里的 `stream` 由 listener 从请求体正则抠出)。
-  ⚠️ 早期版本按 `frt > 0` 过滤,以为「非流式 frt=0」——**实际非流式的 `first_chunk_t ≈ rt`**
-  (只有一个 body chunk,它到达时响应就结束),恒 >0,一条都没滤掉,导致 TTFT 直方图混进大量
-  非流式样本,实测 p99(82s)甚至超过 RT p99(77s)。0.1.10 起改为按 `stream` 过滤。
-  代价:`req_body` 未采到/为 base64 时 `stream` 抠不出来(=null),该请求即使是流式也会漏记 TTFT
-  ——**样本变少,不会算错**;实测 800 条明细中 `stream=null` 的无一呈流式形态。
-- **token 类**:响应无 usage 时为 0 → **流式请求必须带 `stream_options.include_usage=true`**,否则 `completion_tokens`=0、`output_tok_per_second` 无数据。
-- `model`/`finish_reason`:响应非 JSON(如 error)时可能为空。
-- `reasoning_tokens`:非推理模型恒 0。
+- `ttft` (frt): **recorded only when `stream=true`** (the `stream` field in the
+  detail line is pulled out of the request body by the listener with a regex).
+  ⚠️ An early version filtered on `frt > 0`, assuming "non-streaming means
+  frt=0". **In reality a non-streaming response has `first_chunk_t ≈ rt`** --
+  there is one body chunk, and when it arrives the response is over -- so frt is
+  always > 0 and nothing was filtered at all. The TTFT histogram filled up with
+  non-streaming samples, and its p99 (82s) was measured higher than the RT p99
+  (77s). Since 0.1.10 the filter is on `stream`.
+  The cost: when `req_body` was not captured or is base64, `stream` cannot be
+  extracted (null) and that request's TTFT is missed even if it was streaming --
+  **fewer samples, not wrong ones**. Measured over 800 detail lines, none of the
+  `stream=null` ones looked like a stream.
+- **Token fields**: 0 when the response has no usage, so **a streaming request
+  must send `stream_options.include_usage=true`**, or `completion_tokens` is 0
+  and `output_tok_per_second` has no data.
+- `model` and `finish_reason`: may be empty when the response is not JSON, as
+  with an error.
+- `reasoning_tokens`: always 0 for a non-reasoning model.
 
 ---
 
-## 配置(环境变量)
+## Configuration (environment variables)
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Meaning |
 |---|---|---|
-| `BODYLOG_DETAILS_DIR` | `/data/bodylog/metrics/details` | bodylog 的 `metrics/details` 目录(要能读到) |
-| `EXPORTER_LISTEN` | `:9110` | 监听地址(k8s 抓取需 `0.0.0.0:9110`) |
-| `CHECKPOINT_PATH` | `/var/lib/bodylog-exporter/checkpoint.json` | offset 持久化文件 |
-| `BODYLOG_URL` | 空 | bodylog HTTP base(如 `http://127.0.0.1:9998`),**仅跨天缺口补读用**;空=不补读 |
-| `BODYLOG_HTTP_TOKEN` | 空 | bodylog `/metrics` 鉴权(补读用) |
-| `RECOVERY_LAG_SECONDS` | `10` | 补读上界 = `now - lag`(等 flush 落定) |
-| `FOLLOW_INTERVAL_MS` | `300` | tail 到 EOF 后的轮询间隔 |
-| `DATE_TZ` | `Asia/Shanghai` | 文件按天命名的时区,**须与 bodylog 一致**;无 tzdata 回退固定 `+08:00`(中国无 DST 正好正确) |
+| `BODYLOG_DETAILS_DIR` | `/data/bodylog/metrics/details` | bodylog's `metrics/details` directory (must be readable) |
+| `EXPORTER_LISTEN` | `:9110` | Listen address (`0.0.0.0:9110` to be scraped in k8s) |
+| `CHECKPOINT_PATH` | `/var/lib/bodylog-exporter/checkpoint.json` | Where the offset is persisted |
+| `BODYLOG_URL` | empty | bodylog's HTTP base (e.g. `http://127.0.0.1:9998`), **used only to back-fill a day-rotation gap**; empty means no back-fill |
+| `BODYLOG_HTTP_TOKEN` | empty | Auth for bodylog's `/metrics` (for the back-fill) |
+| `RECOVERY_LAG_SECONDS` | `10` | Back-fill up to `now - lag`, to let the flush settle |
+| `FOLLOW_INTERVAL_MS` | `300` | Poll interval once the tail reaches EOF |
+| `DATE_TZ` | `Asia/Shanghai` | Timezone the daily file names use; **must match bodylog's**. Without tzdata it falls back to a fixed `+08:00`, which is exactly right where there is no DST |
 
-### openresty-poll 配置(可选;空 URL = 只 tail、不 poll)
+### openresty-poll configuration (optional; an empty URL means tail only, no polling)
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Meaning |
 |---|---|---|
-| `OPENRESTY_POLL_URL` | 空 | openresty base(如集群内 `http://openresty:8080`);**空=不启用**。裸机 exporter 够不到 k8s 故默认关 |
-| `OPENRESTY_POLL_ROUTES` | 空 | **静态逃生口**:逗号分隔 route 列表(如 `qwen,opt`)。**非空则不走动态发现**;留空=动态发现 |
-| `OPENRESTY_POLL_INTERVAL_MS` | `15000` | poll 周期 |
-| `OPENRESTY_POLL_TIMEOUT_MS` | `3000` | 单请求超时 |
+| `OPENRESTY_POLL_URL` | empty | openresty's base (in-cluster, e.g. `http://openresty:8080`); **empty disables polling**. Off by default because a bare-metal exporter cannot reach k8s |
+| `OPENRESTY_POLL_ROUTES` | empty | **The static escape hatch**: a comma-separated route list (e.g. `qwen,opt`). **Non-empty bypasses dynamic discovery**; leave it empty for discovery |
+| `OPENRESTY_POLL_INTERVAL_MS` | `15000` | Poll period |
+| `OPENRESTY_POLL_TIMEOUT_MS` | `3000` | Per-request timeout |
 
-**route 集合默认【动态发现】**(不填 `OPENRESTY_POLL_ROUTES` 时):走**与富化同一个发现器**(in-cluster SA 列 **ModelRoute CR** `routing.modelsphere.dev/v1alpha1`),取 `spec.nginx.route`(省略则 `metadata.name`,同 autoconfig)得 route 列表、`spec.discovery.service` 得 route→service,周期刷新、增删自动跟随 —— **无需静态配、route 变了不重启**。下面这几个 env **同时**控制富化和 poll 发现(一份 list 两用):
+**The route set is discovered dynamically by default** (when
+`OPENRESTY_POLL_ROUTES` is unset): through **the same discoverer** enrichment
+uses (in-cluster, with the service account, listing **ModelRoute CRs** in
+`routing.modelsphere.dev/v1alpha1`), taking `spec.nginx.route` (or
+`metadata.name` when omitted, as autoconfig does) for the route list and
+`spec.discovery.service` for route -> service, refreshed periodically so
+additions and removals are followed -- **nothing to configure statically, and no
+restart when a route changes**. The variables below control **both** enrichment
+and poll discovery, since one list serves both:
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Meaning |
 |---|---|---|
 | `MODELROUTE_GROUP` / `_VERSION` / `_PLURAL` | `routing.modelsphere.dev` / `v1alpha1` / `modelroutes` | CR coordinates. `MODELROUTE_GROUP` may list several groups, comma-separated (e.g. while ModelRoutes move from one group to another): every group is listed, an object in more than one (same namespace/name) is taken from the earliest, a group the cluster does not serve (404) is skipped, and any other error keeps the last snapshot. RBAC must grant every group listed |
-| `ROUTE_DISCOVERY_INTERVAL_SECONDS` | `30` | list ModelRoute 周期(富化 + poll 发现共用) |
-| `ROUTE_DISCOVERY_TIMEOUT_MS` | `4000` | 单次 list/EndpointSlice 请求超时 |
-| `OPENRESTY_SERVICE` | 空 | 只把 `nginx.service` 指向本 openresty 的 route 计入 **poll 列表**(多 openresty 时用);空=全要。**富化映射/service map 不受此过滤**(全 route) |
+| `ROUTE_DISCOVERY_INTERVAL_SECONDS` | `30` | How often ModelRoutes are listed (shared by enrichment and poll discovery) |
+| `ROUTE_DISCOVERY_TIMEOUT_MS` | `4000` | Timeout for one list/EndpointSlice request |
+| `PD_ROLE_GROUP` / `PD_ROLE_VERSION` | `leaderworkerset.x-k8s.io` / `v1` | Coordinates of the LeaderWorkerSet API the per-role engine counts come from. **`PD_ROLE_GROUP=""` turns the whole thing off**: not a single request is made (which is what the chart's `pdRoles.enabled=false` passes) |
+| `OPENRESTY_SERVICE` | empty | Count only the routes whose `nginx.service` points at this openresty towards the **poll list** (for several openrestys); empty takes all. **The enrichment mapping and the service map are not filtered by this** and hold every route |
 | `OPENRESTY_POLL_PER_SERVICE` | `true` | Poll each ModelRoute on the openresty its `spec.nginx.service` names (`ns/name`, or `name` in the ModelRoute's namespace) at `http://<name>.<ns>.svc:<OPENRESTY_POLL_PORT>`, and label the result with that ModelRoute's service. ModelRoutes that name no openresty use `OPENRESTY_POLL_URL`. `false` = the old single-openresty behaviour, where ModelRoutes sharing a route name on different openrestys (a canary next to production) all read the one openresty and got one route's label. |
 | `OPENRESTY_POLL_PORT` | `8080` | Dispatch port of the openresty Services polled per ModelRoute |
 
-发现自监控:`bodylog_route_resolver_up`(1/0)、`bodylog_route_resolver_routes`(route 数)、`bodylog_route_resolver_pods`(映射覆盖 pod 数)、`bodylog_route_resolver_errors_total`。apiserver 抖动某轮失败 → **保留上次成功的映射/routes 不清空**。RBAC 需 `list` `modelroutes`(发现)+ `endpointslices`(富化查后端 pod)。
+Discovery reports on itself through `bodylog_route_resolver_up` (1/0),
+`bodylog_route_resolver_routes` (route count), `bodylog_route_resolver_pods`
+(pods covered) and `bodylog_route_resolver_errors_total`. When the apiserver
+flaps and a round fails, **the last successful mapping and route list are kept,
+not cleared**. RBAC needs `list` on `modelroutes` (discovery) and
+`endpointslices` (enrichment, to find the backend pods).
 
-> **只读**:poll 的都是 openresty 的 GET 状态端点(`_route_state`/`_tps_status`/`_ttft_status`/`_429_status`),不改任何配置、不 reload。k8s 部署时作 bodylog **sidecar**(同 pod 可短名 `http://openresty:8080` 直连,SA 带 modelroute list 权限)。
+> **Read-only**: everything polled is a GET status endpoint of openresty
+> (`_route_state`, `_tps_status`, `_ttft_status`, `_429_status`); nothing is
+> changed and nothing is reloaded. In k8s it runs as a **sidecar** to bodylog
+> (same pod, so the short name `http://openresty:8080` resolves, with a service
+> account that may list ModelRoutes).
 
 ---
 
-## 部署
+## Deployment
 
 ### Bare-metal systemd (the main case: the host that runs bodylog)
 
 ```bash
-# 二进制放主机;编辑 bodylog-exporter.service 的 Environment
+# Put the binary on the host; edit the Environment lines in bodylog-exporter.service
 cp bodylog-exporter /usr/local/bin/
 cp bodylog-exporter.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now bodylog-exporter
 curl -s localhost:9110/metrics | head
 ```
 
-### k8s Prometheus 抓取(裸机 target 走 Endpoints)
+### Scraping a bare-metal exporter from k8s Prometheus (the target goes through Endpoints)
 
-bodylog 在裸机、Prometheus 在 k8s(kube-prometheus-stack):建**无 selector 的 Service + 手写 Endpoints(裸机 IP:9110)+ ServiceMonitor**(label 带 `release: kube-prometheus-stack`)。现成 manifest:[`deploy/prometheus-scrape.yaml`](deploy/prometheus-scrape.yaml)(`kubectl apply -f`,换主机改 name/IP 即可):
+bodylog on bare metal with Prometheus in k8s (kube-prometheus-stack): create a
+**selector-less Service, hand-written Endpoints (the bare-metal `IP:9110`), and
+a ServiceMonitor** labelled `release: kube-prometheus-stack`. There is a ready
+manifest in [`deploy/prometheus-scrape.yaml`](deploy/prometheus-scrape.yaml)
+(`kubectl apply -f`; for another host, change the name and the IP):
 
 ```yaml
 apiVersion: v1
@@ -229,182 +392,221 @@ spec:
   endpoints: [ { port: metrics, path: /metrics, interval: 30s, honorLabels: true } ]
 ```
 
-### k8s:独立 chart(与 listener 同节点,一个实例同时出两类指标)
+### k8s: its own chart (co-located with the listener, one instance emitting both metric groups)
 
-exporter 是**独立 chart**(不再是 bodylog chart 的 sidecar):只读 tail listener 落在**节点本地盘**的明细(`bodylog_*`)+ poll 集群内 openresty(`openresty_*`)。**一个实例 = tail + poll 两半全出**。独立部署的好处是升级 exporter 不重启 listener,收帧/落盘零中断;代价是**必须与 listener 钉在同一节点**(明细在该节点本地盘)。
+The exporter is **its own chart**, no longer a sidecar in the bodylog chart: it
+tails the details the listener writes to **node-local disk** (`bodylog_*`) and
+polls the in-cluster openresty (`openresty_*`). **One instance emits both
+halves.** Deploying it separately means upgrading the exporter does not restart
+the listener, so frame intake and writing are never interrupted; the cost is
+that it **must be pinned to the listener's node**, since the details are on that
+node's local disk.
 
-chart 发布在 [modelsphere/helm-charts](https://github.com/modelsphere/helm-charts):
+The charts are published at [modelsphere/helm-charts](https://github.com/modelsphere/helm-charts):
 
 ```bash
 helm repo add modelsphere https://modelsphere.github.io/helm-charts
 helm repo update
 
-# 先装 listener
+# the listener first
 helm -n <ns> upgrade --install bodylog modelsphere/bodylog \
   --set-string secret.token=<token> \
   --set persistence.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
 
-# 再装 exporter:同节点 + hostPath 与 listener 一致 + 复用它的 Secret
+# then the exporter: same node, the same hostPath as the listener, reusing its Secret
 helm -n <ns> upgrade --install bodylog-exporter modelsphere/bodylog-exporter \
   --set data.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
 ```
 
-关键 values(详见 chart 自带的 `values.yaml`):
+The values that matter (the chart's own `values.yaml` has the rest):
 
 ```yaml
 data:
-  dir: /data/bodylog             # 容器内挂载点,须 = listener 的 dataDir
-  hostPath: /data/bodylog        # 节点真实目录,须 = listener persistence.hostPath
+  dir: /data/bodylog             # mount point in the container; must equal the listener's dataDir
+  hostPath: /data/bodylog        # the real directory on the node; must equal the listener's persistence.hostPath
 openrestyPoll:
-  url: "http://openresty:8080"   # 集群内 openresty Service;空=只 tail 不 poll
-  routes: []                     # 留空=动态发现;填了=静态覆盖
+  url: "http://openresty:8080"   # the in-cluster openresty Service; empty = tail only, no polling
+  routes: []                     # empty = dynamic discovery; set = static override
   intervalMs: 15000
 routeDiscovery:
-  enabled: true                  # list ModelRoute CR(chart 自动建 SA+ClusterRole+Binding)
-  openrestyService: ""           # 只统计 nginx.service 指向本 openresty 的 route;空=全要
+  enabled: true                  # list ModelRoute CRs (the chart creates the SA, ClusterRole and Binding)
+  openrestyService: ""           # count only routes whose nginx.service points here; empty = all
 serviceMonitor: { enabled: true, releaseLabel: kube-prometheus-stack }
 ```
 
-⚠️ `data.hostPath` 非空但 `nodeSelector` 为空 → chart 直接 `fail`(否则 pod 调度到别的 node 会读到空目录,看着像"一条数据都没有")。
+⚠️ A non-empty `data.hostPath` with an empty `nodeSelector` makes the chart
+`fail` outright -- otherwise the pod could be scheduled onto another node, read
+an empty directory, and look exactly like "there is no data at all".
 
-Service 自动加 `metrics:9110` 口 + ServiceMonitor(集群内直接抓,已置 `honorLabels: true` 解决 `service` 撞名)。
+The Service gets a `metrics:9110` port automatically, along with a ServiceMonitor
+(scraped directly in-cluster, with `honorLabels: true` already set to resolve the
+`service` name collision).
 
-**data 卷三选一**(`values.persistence`):
-- `persistence.enabled: true`(默认)→ 建 **PVC**(`storageClassName`/`size`);
-- **`persistence.hostPath: <路径>`** → 用**宿主机目录**(复用某台机器已有的 bodylog 数据盘,不建 PVC)。**必须配 `nodeSelector`** 把 pod 钉到那台 node,否则 `DirectoryOrCreate` 会在别的 node 新建空目录(看似丢历史数据)—— chart 已加 **helm 硬校验**:hostPath 非空但 nodeSelector 为空直接 `fail`;
-- `persistence.enabled: false` → emptyDir(仅测试,重启丢数据)。
+**Three ways to give it a data volume** (`values.persistence`):
+- `persistence.enabled: true` (the default) creates a **PVC**
+  (`storageClassName`, `size`);
+- **`persistence.hostPath: <path>`** uses a **directory on the node** (to reuse a
+  machine's existing bodylog data disk, with no PVC). **A `nodeSelector` is
+  mandatory** to pin the pod to that node, or `DirectoryOrCreate` will create an
+  empty directory on a different one, which looks like losing the history. The
+  chart enforces this: a non-empty hostPath with an empty nodeSelector is a
+  hard `fail`;
+- `persistence.enabled: false` uses an emptyDir (testing only; a restart loses
+  the data).
 
 ```bash
-# 复用宿主机裸盘(如 bodylog 从裸机迁进 k8s,续用原数据目录)
+# reuse a disk on the node, e.g. when bodylog moves from bare metal into k8s and keeps its data directory
 helm -n <ns> upgrade --install bodylog modelsphere/bodylog --version <tag> \
   --set-string secret.token=<token> \
   --set persistence.hostPath=/data/bodylog \
   --set nodeSelector."kubernetes\.io/hostname"=<node>
 ```
 
-### k8s:独立 poll-only 部署(集群没 bodylog 时)
+### k8s: standalone poll-only (a cluster without bodylog)
 
-只想把 openresty 控制面态导进 Prometheus、集群里又没 bodylog:用独立 Deployment(tail 空跑,只 poll)。现成 manifest [`deploy/exporter-standalone.yaml`](deploy/exporter-standalone.yaml)(含 SA+ClusterRole+Binding+Deployment+Service+ServiceMonitor,`OPENRESTY_POLL_URL=http://openresty:8080` + 动态发现):
+To bring only openresty's control-plane state into Prometheus on a cluster that
+has no bodylog: run a standalone Deployment, where the tail finds nothing and
+only the poll does any work. There is a ready manifest in
+[`deploy/exporter-standalone.yaml`](deploy/exporter-standalone.yaml) (SA,
+ClusterRole, Binding, Deployment, Service and ServiceMonitor, with
+`OPENRESTY_POLL_URL=http://openresty:8080` and dynamic discovery):
 
 ```bash
-kubectl apply -f deploy/exporter-standalone.yaml   # 换 ns/openresty Service 名即可复用
+kubectl apply -f deploy/exporter-standalone.yaml   # change the namespace and the openresty Service name to reuse it
 ```
 
-### 裸机启用 openresty-poll(可选)
+### Enabling openresty-poll on bare metal (optional)
 
-裸机 systemd 场景默认只 tail;要顺带 poll **同机**的 openresty,给 `bodylog-exporter.service` 的 Environment 加 `OPENRESTY_POLL_URL`(如 `http://127.0.0.1:18080`)+ `OPENRESTY_POLL_ROUTES`(裸机非 k8s、无 ModelRoute API → 用静态 route 列表)。
+A bare-metal systemd deployment only tails by default. To have it also poll the
+openresty on the **same host**, add `OPENRESTY_POLL_URL` (e.g.
+`http://127.0.0.1:18080`) and `OPENRESTY_POLL_ROUTES` to the Environment of
+`bodylog-exporter.service` -- bare metal is not k8s and has no ModelRoute API, so
+the route list has to be static.
 
-CI:`.github/workflows/release.yml` 的 `image` job(matrix 里的 `exporter`)。**只发 exporter 用带前缀的 tag**:
+CI: the `image` job in `.github/workflows/release.yml` (`exporter` in its
+matrix). **To release only the exporter, use a prefixed tag**:
 
 ```bash
 git tag exporter/v<X.Y.Z> && git push origin exporter/v<X.Y.Z>
-# → image 4pdosc/bodylog-exporter:<X.Y.Z>
-#   (前缀被剥掉;openresty / bodylog 不进 matrix,它们的 :latest 也不会被挪)
+# -> image 4pdosc/bodylog-exporter:<X.Y.Z>
+#    (the prefix is stripped; openresty and bodylog stay out of the matrix, and their :latest is left alone)
 ```
 
-同理 `openresty/v*` / `bodylog/v*`;**无前缀的 tag(如 `0.1.13`)仍然三个组件一起发**。
-认不出的前缀(打错成 `exporters/v1`)直接让 workflow 失败 —— 宁可什么都不发生。
-预发布 tag(带 `-`,如 `0.2.0-rc1`)照常出镜像,但**不动 `:latest`**。
+Likewise `openresty/v*` and `bodylog/v*`. **An unprefixed tag (such as `0.1.13`)
+still releases all three components.** A prefix that is not recognised (a typo
+like `exporters/v1`) fails the workflow outright -- better that nothing happens
+at all. A pre-release tag (one containing `-`, such as `0.2.0-rc1`) produces an
+image as usual but **does not move `:latest`**.
 
-chart 不在本仓发布:三个 chart 在
-[modelsphere/helm-charts](https://github.com/modelsphere/helm-charts),
-由那个仓的 chart-releaser 发到 GitHub Pages。
+The charts are not published from this repository: all three live in
+[modelsphere/helm-charts](https://github.com/modelsphere/helm-charts) and are
+released to GitHub Pages by that repository's chart-releaser.
 
 ---
 
-## 常用 PromQL
+## Everyday PromQL
 
-**按 `service` 聚合是推荐用法**(pod IP 漂移、model 抓空都不影响):
+**Aggregating by `service` is the recommended usage** -- pod IPs drifting and an
+empty `model` do not affect it:
 
 ```promql
-# 每 service QPS / 输出吞吐(tok/s)
+# QPS and output throughput (tok/s) per service
 sum by(service)(rate(bodylog_requests_total{backend!="(none)"}[1m]))
 sum by(service)(rate(bodylog_completion_tokens_total[1m]))
 
-# 每 service TTFT p95 / RT p95(秒)—— native histogram:裸名、不带 _bucket/le
+# TTFT p95 and RT p95 per service (seconds) -- native histograms: the bare name, no _bucket or le
 histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))
 histogram_quantile(0.95, sum by(service)(rate(bodylog_rt_seconds[5m])))
 
-# 每 service 错误率
+# Error rate per service
 sum by(service)(rate(bodylog_requests_total{status_class=~"4xx|5xx",backend!="(none)"}[5m]))
   / clamp_min(sum by(service)(rate(bodylog_requests_total{backend!="(none)"}[5m])),0.001)
 
-# 每 service 副本数 / 每就绪副本吞吐
+# Replicas per service, and throughput per ready replica
 bodylog_service_replicas_ready
 sum by(service)(rate(bodylog_completion_tokens_total[1m])) / bodylog_service_replicas_ready
 
-# 每 service 429 速率(按 reason 细分)—— openresty 控制面 counter
+# 429 rate per service, broken down by reason -- the openresty control-plane counter
 sum by(service)(rate(openresty_rejected_total[1m]))
 sum by(service,reason)(rate(openresty_rejected_total[1m]))
 
-# 单请求生成速率 p50(每条请求 completion/rt 的分布)
+# p50 of the per-request generation rate (the distribution of completion/rt over requests)
 histogram_quantile(0.5, sum by(service)(rate(bodylog_output_tok_per_second[5m])))
 
-# Watchmen overall/decode TPS 均值(按 service 聚合;新指标不带 prompt_bucket)
+# Mean of the Watchmen overall/decode TPS (aggregated by service; the new metrics have no prompt_bucket)
 histogram_avg(sum by(service)(rate(bodylog_overall_output_tok_per_second[1m])))
 histogram_avg(sum by(service)(rate(bodylog_decode_output_tok_per_second[1m])))
 
-# 更细:某 service 下每个 backend(pod)QPS —— pod 扩缩时按 service 聚合更稳
+# Finer: QPS per backend (pod) within one service -- aggregating by service is steadier while pods scale
 sum by(backend)(rate(bodylog_requests_total{service="model-service/fallback-model-service-01"}[1m]))
 
-# exporter 是否滞后(last_ts 与 now 差)
+# Is the exporter lagging (the gap between last_ts and now)
 time() - bodylog_exporter_last_ts_seconds
 ```
 
-> histogram 为 **native-only**(2026-08-31 起,exporter 0.2.0):不再双发经典桶,`_bucket`/`_sum`/`_count` 不再产生。
-> 分位数用裸名:`histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`;
-> 均值用 `histogram_sum(...)/histogram_count(...)`。⚠️ 前提是 Prometheus 侧支持 native histogram —— 若关闭,这三个直方图将没有任何桶。
+> The histograms are **native-only** (since 2026-08-31, exporter 0.2.0): classic
+> buckets are no longer emitted in parallel, and `_bucket`/`_sum`/`_count` no
+> longer exist. Take quantiles from the bare name:
+> `histogram_quantile(0.95, sum by(service)(rate(bodylog_ttft_seconds[5m])))`,
+> and a mean with `histogram_sum(...)/histogram_count(...)`. ⚠️ This assumes
+> Prometheus supports native histograms -- with that disabled, these three
+> histograms have no buckets at all.
 
-### 自动扩缩容(LLMScaler `metrics` 片段)
+### Autoscaling (an LLMScaler `metrics` fragment)
 
 ```yaml
 metrics:
-  - name: qps-per-pod        # 负载可按副本分摊,适合 ratio 扩缩
+  - name: qps-per-pod        # load divides across replicas, so it suits ratio scaling
     query: 'avg(sum by(backend)(rate(bodylog_requests_total{model="qwen",backend!="(none)"}[1m])))'
-    target: "<单 pod QPS 预算>"
-  - name: ttft-p95           # 饱和护栏,NaN 兜底 0
+    target: "<the per-pod QPS budget>"
+  - name: ttft-p95           # a saturation guard rail, falling back to 0 on NaN
     query: 'histogram_quantile(0.95, sum(rate(bodylog_ttft_seconds{model="qwen"}[2m]))) or vector(0)'
     target: "2"
 ```
 
-**用 openresty 控制面态扩缩容(比 bodylog 更即时)**:`active_conns` / `adaptive_cc` 是实时压力,反应比事后 counter 快:
+**Scaling on openresty's control-plane state (more immediate than bodylog)**:
+`active_conns` and `adaptive_cc` are live pressure and react faster than an
+after-the-fact counter:
 
 ```promql
-# 每 pod 平均并发占用率(当前并发 / 静态上限)—— 越接近 1 越该扩
+# Mean per-pod concurrency utilisation (current concurrency / the static ceiling) -- the closer to 1, the more it needs to scale out
 avg(openresty_peer_active_conns{route="qwen"}) / avg(openresty_peer_max_concurrency{route="qwen"})
 
-# 自适应并发已顶到池容量(AIMD 打满 → 需要更多 pod)
+# Adaptive concurrency has reached the pool's capacity (AIMD maxed out -> more pods needed)
 avg(openresty_adaptive_cc{route="qwen"}) / avg(openresty_adaptive_cc_max{route="qwen"})
 
-# 有 peer 被 ban(健康恶化,别盲目缩容)
+# A peer is banned (health is degrading; do not scale in blindly)
 sum(openresty_peer_banned{route="qwen"})
 
-# 并发 429 正在发生(容量不足的直接信号)
+# Concurrency 429s are happening (the direct signal of running out of capacity)
 sum(rate(openresty_rejected_total{route="qwen",reason="concurrency"}[1m]))
 ```
 
 ---
 
-## 覆盖边界(重要)
+## What this does not cover (important)
 
-本 exporter **只覆盖流量侧**指标。以下 bodylog 拿不到,需**别的 Prometheus 源**(通常已在集群):
+This exporter covers **the traffic side only**. bodylog cannot see any of the
+following, which need **other Prometheus sources** -- usually already in the
+cluster:
 
-| 需求 | 来源 |
+| What is needed | Where it comes from |
 |---|---|
-| KV cache 占用 / 运行中 / 等待中 / cache 命中率 | 引擎 `/metrics`(`sglang:token_usage`/`num_running_reqs`/`num_queue_reqs`/`cache_hit_rate`、`vllm:*`,需 `--enable-metrics`) |
-| GPU 温度 / 显存 / 利用率 | `nvidia-dcgm-exporter`(`DCGM_FI_DEV_*`) |
-| 服务 up/down | Prometheus `up{}`(bodylog 只看发生过的请求,**空闲≠宕机**) |
+| KV cache usage / running / queued / cache hit rate | The engine's `/metrics` (`sglang:token_usage`, `num_running_reqs`, `num_queue_reqs`, `cache_hit_rate`, `vllm:*`; needs `--enable-metrics`) |
+| GPU temperature / memory / utilisation | `nvidia-dcgm-exporter` (`DCGM_FI_DEV_*`) |
+| Whether a service is up or down | Prometheus `up{}` (bodylog only sees requests that happened, and **idle is not down**) |
 
-整套 monitor 看板 = **bodylog exporter + 引擎 /metrics + dcgm + up{}** 四类源合起来。
+A complete monitoring board is the four sources together: **this exporter, the
+engine's /metrics, dcgm, and `up{}`**.
 
 ---
 
-## 崩溃/丢数据语义
+## Crash and data-loss semantics
 
-| 谁挂 | 结果 |
+| What fails | Result |
 |---|---|
-| exporter 短挂(当天 jsonl 还在) | **不丢**:重启从 offset 续读补齐;counter 归零由 `rate()` 处理 |
-| exporter 长挂(跨当天 `jsonl→parquet` 轮转) | 缺口走 `/metrics` HTTP 补读(读 parquet+jsonl)→ **不丢**(需配 `BODYLOG_URL`) |
-| bodylog 挂 | 已落盘明细安全;恢复后继续 append,exporter 继续 tail |
+| The exporter is down briefly (the day's jsonl is still there) | **Nothing is lost**: it resumes from the offset on restart and catches up; the counters restarting from zero is handled by `rate()` |
+| The exporter is down across the day's `jsonl -> parquet` rotation | The gap is back-filled over `/metrics` (which reads both parquet and jsonl), so **nothing is lost** (needs `BODYLOG_URL`) |
+| bodylog itself is down | The details already written are safe; when it comes back it appends again and the exporter keeps tailing |
