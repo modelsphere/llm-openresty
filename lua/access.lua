@@ -287,6 +287,12 @@ function _G.do_route(opts)
     if sp_on and not ttft_hard429_off and not is_probe then
         if hit_ttft then
             -- 1.0x trip (any declared metric) -> set the flag (only on change).
+            -- Several workers can see "not held" at once and all write it;
+            -- harmless, they write the same value and TTL.
+            -- turn1_held(opts) with no model: in the request path the key
+            -- prefix falls back to ngx.ctx.req_model, set by prepare_request,
+            -- so peers_by_model routes get their per-model flag here. Only
+            -- callers without a request (admin endpoints) must pass the model.
             local held, ftd, fkey = session_prio.turn1_held(opts)
             sp_turn1_held = true
             if not held and ftd then ftd:set(fkey, 1, opts.ttft_ttl) end

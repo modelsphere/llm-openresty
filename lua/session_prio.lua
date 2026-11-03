@@ -287,6 +287,10 @@ function M.t1_allow_probe(opts, kind)
     local pre = prefix_fn(opts)
     -- Warm probe counter for THIS window: if anything above zero exists, warm
     -- traffic has already re-opened a slot and turn 1 stays out.
+    -- Not locked against the incr below: a warm request can probe between
+    -- this read and our incr, so a turn-1 probe occasionally passes in a
+    -- window where a warm one did too. The turn-1 count itself is an atomic
+    -- incr, so it never exceeds the budget. Acceptable for a probe budget.
     local warm = td:get(pre .. "probe:" .. win)
     if warm and warm > 0 then return false end
     -- Same window/expiry handling as the warm counter: rolling key, fresh keys
