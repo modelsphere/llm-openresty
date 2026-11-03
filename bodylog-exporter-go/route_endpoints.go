@@ -80,9 +80,9 @@ type podRouteResolver struct {
 	// engines behind it. They are one label on all three rather than a separate metric because
 	// the LLMServiceDegraded rule compares _ready < _replicas -- a binary operator matching on
 	// the full label set, which an asymmetric label would silently reduce to nothing.
-	replicas        *prometheus.GaugeVec // {service, route, role} → 后端 pod 总数(含未就绪)
-	replicasReady   *prometheus.GaugeVec // {service, route, role} → 就绪后端 pod 数
-	replicasDesired *prometheus.GaugeVec // {service, route, role} → 期望副本数(工作负载 spec.replicas)
+	replicas        *prometheus.GaugeVec // {service, route, role} -> backends in total, ready or not
+	replicasReady   *prometheus.GaugeVec // {service, route, role} -> ready backends
+	replicasDesired *prometheus.GaugeVec // {service, route, role} -> desired replicas, from the workload spec
 }
 
 func newPodRouteResolver(reg *prometheus.Registry) *podRouteResolver {
