@@ -1,0 +1,60 @@
+name: e2e
+
+# test/e2e on a kind cluster: the router image built from this checkout, one
+# route backed by modelsphere/mock-llmd, exercised through the path dispatch.
+# Runs on every pull request and push to main, and on workflow_dispatch.
+# Not a required check: it pulls the base image, OpenResty packages and the
+# mock-llmd image from the internet.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      label_filter:
+        description: "Ginkgo label filter. Empty runs the whole suite."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KIND_VERSION: v0.33.0
+      # kind v0.33.0 linux-amd64, from
+      # https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64.sha256sum
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: test/e2e/go.mod
+      - name: Install kind
+        run: |
+          curl -fsSLo kind-linux-amd64 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind-linux-amd64" | sha256sum -c
+          chmod +x kind-linux-amd64
+          sudo mv kind-linux-amd64 /usr/local/bin/kind
+          kind version
+      - name: e2e
+        env:
+          LABEL_FILTER: ${{ inputs.label_filter }}
+        run: |
+          if [ -n "${LABEL_FILTER}" ]; then
+            # Quotes survive into the recipe so a filter with spaces stays one argument.
+            make test-e2e E2E_ARGS="-ginkgo.label-filter='${LABEL_FILTER}'"
+          else
+            make test-e2e
+          fi

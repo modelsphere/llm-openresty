@@ -1,0 +1,144 @@
+# E2E fixture: the standalone manifest shape from k8s/deployment.yaml, with
+# the routes ConfigMap filled with one route ("mock") whose only peer is
+# modelsphere/mock-llmd, the project's standalone mock LLM server.
+# Differences from k8s/deployment.yaml, all
+# e2e-only: the image is the one built from this checkout (the suite loads it
+# into kind and sets it on the deployment), resources are sized for a kind
+# node, and terminationGracePeriodSeconds is 30 -- the production 3600 exists
+# to drain long streams, here it would only slow cluster teardown.
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: openresty }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: openresty-routes, namespace: openresty }
+data:
+  session_route_mock.conf: |
+    lua_shared_dict active_conns_mock 4m; lua_shared_dict cluster_avg_mock 16k; lua_shared_dict lc_locks_mock 1m;
+    lua_shared_dict bad_peers_mock 1m; lua_shared_dict bodylog_ctl_mock 1m; lua_shared_dict cch_ctl_mock 1m;
+    server {
+        listen unix:/usr/local/openresty/nginx/sock/mock.sock;
+        server_name _;
+        set $route "mock";
+        set_by_lua_block $__mock_init { _G.register_route("mock", function() return {
+            peers={{"mock-upstream.openresty.svc.cluster.local",8081,"mock-llm"}}, default_max=50, bodylog_default_enabled=false,
+            health_check_interval=9999, adaptive_cc=false } end) return "" }
+        include conf.d/router_locations.inc;
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-upstream
+  namespace: openresty
+  labels: { app: mock-upstream }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mock-upstream }
+  template:
+    metadata:
+      labels: { app: mock-upstream }
+    spec:
+      containers:
+      - name: mock
+        # One static Go binary; MOCK_MODEL_IDS is the id /v1/models advertises
+        # and MOCK_SERVER_NAME is stamped on its responses.
+        image: ghcr.io/modelsphere/mock-llmd:0.1.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - { name: MOCK_MODEL_IDS, value: "mock-llm" }
+        - { name: MOCK_SERVER_NAME, value: "mock-llm" }
+        ports:
+        - { name: http, containerPort: 8081 }
+        readinessProbe:
+          httpGet: { path: /v1/models, port: 8081 }
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          failureThreshold: 30
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+          limits: { cpu: 250m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-upstream
+  namespace: openresty
+  labels: { app: mock-upstream }
+spec:
+  selector: { app: mock-upstream }
+  ports:
+  - { name: http, port: 8081, targetPort: 8081 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openresty-router
+  namespace: openresty
+  labels: { app: openresty-router }
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: openresty-router }
+  template:
+    metadata:
+      labels: { app: openresty-router }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: openresty
+        image: llm-openresty:e2e
+        imagePullPolicy: Never
+        lifecycle:
+          preStop: { exec: { command: ["/bin/sh", "-c", "sleep 5"] } }
+        ports:
+        - { name: dispatch, containerPort: 8080 }
+        - { name: health, containerPort: 8090 }
+        env:
+        - { name: BODYLOG_LISTENER_HOST, value: "" }
+        - { name: BODYLOG_LISTENER_PORT, value: "9999" }
+        volumeMounts:
+        - { name: routes, mountPath: /usr/local/openresty/nginx/conf/conf.d/routes }
+        - { name: sock, mountPath: /usr/local/openresty/nginx/sock }
+        startupProbe:
+          httpGet: { path: /healthz, port: 8090 }
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8090 }
+          initialDelaySeconds: 3
+          periodSeconds: 10
+          timeoutSeconds: 3
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8090 }
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests: { cpu: 500m, memory: 512Mi }
+          limits: { cpu: "2", memory: 1Gi }
+      volumes:
+      - name: routes
+        configMap: { name: openresty-routes }
+      - name: sock
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openresty-router
+  namespace: openresty
+  labels: { app: openresty-router }
+spec:
+  type: ClusterIP
+  selector: { app: openresty-router }
+  ports:
+  - { name: dispatch, port: 8080, targetPort: 8080 }
+  - { name: health, port: 8090, targetPort: 8090 }
