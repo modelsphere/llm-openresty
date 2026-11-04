@@ -10,6 +10,7 @@ local ttft         = require "ttft"
 local tps          = require "tps"
 local bodylog      = require "bodylog"
 local reqtransform = require "reqtransform"
+local session_prio = require "session_prio"
 
 -- ══════════════════════════════════════════════════════════════════════
 -- _G.dbg_* — 调试 endpoint 实现（参数化，所有路由共享）
@@ -827,6 +828,7 @@ function _G.dbg_route_opts(opts)
     for _, d in ipairs(directives.DIRECTIVES) do
         local v = opts[d.key]
         if d.key == "adaptive_cc" then v = opts.adaptive_cc and true or false end   -- off is stored as nil
+        if d.key == "session_prio" then v = opts.session_prio_default_enabled end   -- normalised at registration
         local item = { key = d.key, label = d.label, group = d.group, kind = d.kind, fallback = fallback_text(d),
                        detail = d.detail, needsAdaptive = d.needsAdaptive or false,
                        set = set_keys[d.key] == true }
@@ -1169,5 +1171,135 @@ function _G.dbg_reject_rules_toggle(opts)
         ok      = true,
         changes = changes,
         enabled = en2 == 1,
+    }))
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- session_prio (session turn-priority) hot toggle + status
+-- ══════════════════════════════════════════════════════════════════════
+
+-- POST /_session_prio_toggle?on=0|1 -> hot-toggle session_prio for this route
+-- (runtime override on cch_ctl_dict key "session_prio_enabled", no reload,
+-- survives reloads, wins over the factory value). Same shape as
+-- /_reject_rules_toggle (0/1 rather than deleting the key, so it can override
+-- a factory on in one direction and a factory off in the other).
+function _G.dbg_session_prio_toggle(opts)
+    if util.opts_missing(opts) then return end
+    ngx.header["Content-Type"] = "application/json"
+    local ctl = opts.cch_ctl_dict and ngx.shared[opts.cch_ctl_dict]
+    if not ctl then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false, error = "cch_ctl_dict not declared" }))
+        return
+    end
+    local on = ngx.var.arg_on
+    if on == "1" then ctl:set("session_prio_enabled", 1)
+    elseif on == "0" then ctl:set("session_prio_enabled", 0)
+    else
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ ok = false, error = "use ?on=1 (on) | ?on=0 (off)" }))
+        return
+    end
+    ngx.say(cjson_dbg.encode({
+        route   = opts.route_name, ok = true,
+        enabled = session_prio.enabled(opts),
+        factory_default = opts.session_prio_default_enabled,
+    }))
+end
+
+-- GET /_session_status -> this route's session_prio state: enabled/factory,
+-- effective bucket table, header parse classes, per-bucket admits and the
+-- three gates' rejects, ptok/ctok (hit rate), no_cached_field, and the
+-- nohdr share of the last minute. Keys are built deterministically from the
+-- effective table and the known pools (per model for peers_by_model, one
+-- route-wide pool otherwise) -- no get_keys scan.
+function _G.dbg_session_status(opts)
+    if util.opts_missing(opts) then return end
+    ngx.header["Content-Type"] = "application/json"
+    local tbl = opts._sp_table or {}
+    local eff = {}
+    for _, b in ipairs(tbl) do
+        eff[#eff + 1] = string.format(">=%d share=%.3f tol=%.3f", b.min_turn, b.share, b.tol)
+    end
+    local d = ngx.shared.session_stat
+    local now_min = math.floor(ngx.time() / 60)
+    local pools   -- { { model = <model|nil>, prefix = "<route>[:<model>]:" }, ... }
+    if opts.peers_by_model then
+        pools = {}
+        local ms = {}
+        for m in pairs(opts.peers_by_model) do ms[#ms + 1] = m end
+        table.sort(ms)
+        for _, m in ipairs(ms) do
+            pools[#pools + 1] = { model = m, prefix = (opts.route_name or "?") .. ":" .. m .. ":" }
+        end
+    else
+        pools = { { model = false, prefix = (opts.route_name or "?") .. ":" } }
+    end
+    local out_pools = {}
+    for _, p in ipairs(pools) do
+        local pre = p.prefix
+        local hdr = { ok = 0, missing = 0, bad = 0 }
+        if d then
+            hdr.ok      = d:get(pre .. "hdr:ok")      or 0
+            hdr.missing = d:get(pre .. "hdr:missing") or 0
+            hdr.bad     = d:get(pre .. "hdr:bad")     or 0
+        end
+        local buckets = {}
+        local function read_bucket(label)
+            local b = {
+                admit = 0, rej_conc = 0, rej_ttft = 0, rej_tps = 0,
+                ptok = 0, ctok = 0, no_cached_field = 0,
+            }
+            if d then
+                for k in pairs(b) do
+                    b[k] = d:get(pre .. label .. ":" .. k) or 0
+                end
+            end
+            b.hit_rate = (b.ptok > 0) and (b.ctok / b.ptok) or nil
+            return b
+        end
+        for _, b in ipairs(tbl) do
+            buckets[tostring(b.min_turn)] = read_bucket("b" .. tostring(b.min_turn))
+        end
+        buckets["0"] = read_bucket("bnohdr")   -- nohdr pseudo-bucket, shown as min_turn=0
+        -- nohdr minute share: prefer the last complete minute (same reading
+        -- as note_nohdr_minute), falling back to the minute in progress.
+        local nohdr_minute = nil
+        if d then
+            for _, m in ipairs({ now_min - 1, now_min }) do
+                local total = d:get(pre .. "wm:" .. m .. ":total")
+                if total and total > 0 then
+                    nohdr_minute = {
+                        minute = m,
+                        share  = (d:get(pre .. "wm:" .. m .. ":nohdr") or 0) / total,
+                    }
+                    break
+                end
+            end
+        end
+        out_pools[#out_pools + 1] = {
+            model = (p.model ~= false) and p.model or nil,
+            header_counts = hdr,
+            buckets = buckets,
+            nohdr_last_minute = nohdr_minute,
+            -- the flag lives per pool (<route>[:<model>]:turn1_hold): read it
+            -- with THIS pool's model, never from ngx.ctx (an admin endpoint
+            -- has no request model, and the flat layout would silently be "?").
+            turn1_hold = session_prio.turn1_held(opts, p.model ~= false and p.model or nil),
+        }
+    end
+    ngx.say(cjson_dbg.encode({
+        route           = opts.route_name,
+        ok              = true,
+        enabled         = session_prio.enabled(opts),
+        factory_default = opts.session_prio_default_enabled,
+        r_new           = opts.session_prio_r_new,
+        severe          = opts.session_prio_severe,
+        full_turn       = opts.session_prio_full_turn,
+        release         = opts.session_prio_release,
+        warn_frac       = opts.session_prio_warn_frac,
+        effective_table = eff,
+        pools           = out_pools,
+        session_stat_present = (d ~= nil),
     }))
 end

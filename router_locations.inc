@@ -252,6 +252,27 @@
         content_by_lua_block { _G.dbg_reject_rules_toggle(_G.__route_opts[ngx.var.route]) }
     }
 
+    # /_session_status        — session_prio state: enabled, effective bucket
+    #                             table, per-bucket counters, hit rate, nohdr share
+    # /_session_prio_toggle   — hot-toggle session_prio: POST ?on=1 / on=0
+    #                             (cch_ctl, no reload)
+    # Both are loopback-only: the bucket table and hit rates are internal
+    # capacity policy and must not leak to the public net. Feature is off by
+    # default; implementation in lua/session_prio.lua.
+    location = /_session_status {
+        allow 127.0.0.1;
+        allow ::1;
+        deny  all;
+        content_by_lua_block { _G.dbg_session_status(_G.__route_opts[ngx.var.route]) }
+    }
+
+    location = /_session_prio_toggle {
+        allow 127.0.0.1;
+        allow ::1;
+        deny  all;
+        content_by_lua_block { _G.dbg_session_prio_toggle(_G.__route_opts[ngx.var.route]) }
+    }
+
     # ── @return_501: 上游 4xx 统一改写成 501(per-route opt-in,2026-07-29 首用 glm_vendor-gpu)──
     # 启用方法:路由 server 块(include 本文件之前)加两行:
     #     proxy_intercept_errors on;

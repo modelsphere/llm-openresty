@@ -104,13 +104,20 @@ def _chat_tool_call_chunk(cid: str, model: str, created: int, name: str, args: s
 
 
 def _chat_usage_chunk(cid: str, model: str, created: int,
-                      prompt_tokens: int, completion_tokens: int) -> bytes:
+                      prompt_tokens: int, completion_tokens: int,
+                      cached_tokens=None) -> bytes:
     """include_usage=true 时的最终 chunk（choices=[] + usage）。"""
+    usage = {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens + completion_tokens,
+             "completion_tokens": completion_tokens}
+    # optional additive prefix-cache field (vLLM emits it only when cache
+    # reporting is on); omitted entirely unless --cached-tokens is set, so the
+    # default wire is byte-identical for every other harness.
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
     return _sse(json.dumps({
         "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
         "choices": [],
-        "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens + completion_tokens,
-                  "completion_tokens": completion_tokens},
+        "usage": usage,
     }))
 
 
@@ -346,7 +353,8 @@ async def chat_completions(request: web.Request):
 
         # usage chunk（仅当 stream_options.include_usage=true）
         if (body.get("stream_options") or {}).get("include_usage"):
-            await resp.write(_chat_usage_chunk(cid, model, created, prompt_tokens, out_len))
+            await resp.write(_chat_usage_chunk(cid, model, created, prompt_tokens, out_len,
+                                               cached_tokens=app.get("cached_tokens")))
 
         await resp.write(_DONE)
         await resp.write_eof()
@@ -481,6 +489,7 @@ def make_app(args):
     app["prefill_delay_ms"] = args.prefill_delay_ms
     app["models_status"] = args.models_status
     app["chat_status"] = args.chat_status
+    app["cached_tokens"] = args.cached_tokens
     app["stats"] = {"req_count": 0, "in_flight": 0}
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models_list)
@@ -500,6 +509,9 @@ def main():
     p.add_argument("--prefill-delay-ms", type=float, default=float(os.environ.get("PREFILL_DELAY_MS", "50")))
     p.add_argument("--models-status", type=int, default=200, help="坏 mock 模拟:/v1/models 返此状态(F5 测健康探测 ban)")
     p.add_argument("--chat-status", type=int, default=200, help="坏 mock 模拟:/v1/chat/completions 返此状态(E5 测 next_upstream retry)")
+    p.add_argument("--cached-tokens", type=int, default=None,
+                   help="when set, usage chunks also carry prompt_tokens_details.cached_tokens (prefix cache); "
+                        "unset keeps the wire byte-identical to before")
     args = p.parse_args()
 
     app = make_app(args)

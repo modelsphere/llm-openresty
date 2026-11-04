@@ -12,6 +12,7 @@ local util  = require "util"
 local reject_rules = require "reject_rules"
 local ttft  = require "ttft"
 local tps   = require "tps"
+local session_prio = require "session_prio"
 local timers   -- route↔timers 真环:延后到 register_route 首次用时 lazy require
 
 -- 5min 滑动窗口 cluster_avg 聚合：返回 (sum, samples, avg)
@@ -91,6 +92,14 @@ M.DEFAULTS = {
     expose_routed_peer         = false,
     bodylog_default_pct        = global("BODYLOG_DEFAULT_PCT"),
     reject_rules_status        = function() return _G.REJECT_RULES_DEFAULT_STATUS or 429 end,
+    -- session turn-priority admission (default OFF; see lua/session_prio.lua)
+    session_prio               = function() return _G.SESSION_PRIO_DEFAULT == true end,
+    session_prio_r_new         = session_prio.DEFAULTS.r_new,
+    session_prio_severe        = session_prio.DEFAULTS.severe,
+    session_prio_full_turn     = session_prio.DEFAULTS.full_turn,
+    session_prio_release       = session_prio.DEFAULTS.release,
+    session_prio_warn_frac     = session_prio.DEFAULTS.warn_frac,
+    session_prio_t1_probes     = session_prio.DEFAULTS.t1_probes,
 }
 function M.default_of(key)
     local d = M.DEFAULTS[key]
@@ -293,6 +302,29 @@ function _G.register_route(name, opts_factory)
     end
     util.bool_opt(opts, "reject_rules_default_enabled", _G.REJECT_RULES_DEFAULT_ENABLED == true, name)
     opts.reject_rules              = reject_rules.validate_reject_rules(name, opts.reject_rules)
+    -- ── Session turn-priority admission (session_prio, default OFF) ──
+    -- The factory option is spelled session_prio (true/false; nil = follow the
+    -- global). Registration normalises it into session_prio_default_enabled;
+    -- the runtime hot toggle (cch_ctl "session_prio_enabled",
+    -- /_session_prio_toggle) overrides it from there, same shape as
+    -- reject_rules. Numeric/table validation lives in session_prio.validate_opts.
+    if opts.session_prio ~= nil then
+        local b = util.parse_bool(opts.session_prio)
+        if b == nil then
+            ngx.log(ngx.ERR, "[", name, "] session_prio=", tostring(opts.session_prio),
+                    " is not a boolean - treated as unset (global default)")
+            util.bool_opt(opts, "session_prio_default_enabled", D("session_prio"), name)
+        else
+            if type(opts.session_prio) ~= "boolean" then
+                ngx.log(ngx.WARN, "[", name, "] session_prio=", tostring(opts.session_prio), " (", type(opts.session_prio),
+                        ") read as ", tostring(b), "; write it as a boolean")
+            end
+            opts.session_prio_default_enabled = b
+        end
+    else
+        util.bool_opt(opts, "session_prio_default_enabled", D("session_prio"), name)
+    end
+    session_prio.validate_opts(opts, name)
     -- ── 自适应并发(AIMD;配 tps_limit_tps 默认开,与 TPS 硬熔断互斥)默认值 ──
     -- adaptive_cc=true 时:复用 TPS EWMA 当反馈信号,每 adaptive_cc_interval 调一次池并发上限——
     --   EWMA < 阈值(tps_limit_tps/by_model/override)→ ×dec(减);>= → ×inc(增);clamp 在 [min,静态max]。

@@ -326,6 +326,12 @@ function M.bodylog_finalize(opts)
         forwarded_to  = ngx.var.upstream_http_x_routed_peer,
         session_id    = (ngx.ctx.session_id ~= "" and ngx.ctx.session_id) or nil,
         session_src   = ngx.ctx.session_source,
+        -- phan fields record only with the feature on and a valid gateway
+        -- header (flat, not nested: the listener's duckdb details schema
+        -- evolves on flat fields; absent = feature off or nohdr, so the fields
+        -- simply never appear).
+        phan_session_id = ngx.ctx.phan_session and ngx.ctx.phan_session.session_id or nil,
+        phan_turn       = ngx.ctx.phan_session and ngx.ctx.phan_session.turn or nil,
         mode          = ngx.ctx.routed_mode,
         status        = ngx.status,
         resp_bytes    = ngx.ctx.bodylog_total_bytes or 0,    -- upstream 原始 SSE wire 总字节（无 cap）
