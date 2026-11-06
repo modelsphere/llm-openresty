@@ -504,8 +504,10 @@ local function rate_limit_view(opts)
         route_value      = opts.rate_limit,              -- route conf, or the global when unset
         global_default   = _G.RATE_LIMIT_ENABLED ~= false,
         covers           = route.RATE_LIMIT_REASONS,
-        -- Requests let through while the switch was off that would otherwise have been refused.
-        -- Since the worker restarted; survive reload; ?reset_counts=1 on the toggle clears them.
+        -- While the switch is off: per gate, the requests that tripped it and were let through.
+        -- A trip, not a refusal: a probe slot or a warm turn in session_prio's soft band might have
+        -- been admitted anyway, and a request tripping two gates counts on both. Since the worker
+        -- restarted; survive reload; ?reset_counts=1 on the toggle clears them.
         would_reject     = route.would_reject_counts(opts),
         ctl_dict_declared = ctl and true or false,
     }
@@ -518,7 +520,8 @@ function _G.dbg_rate_limit_status(opts)
     ngx.say(cjson_dbg.encode(rate_limit_view(opts)))
 end
 
--- POST /_rate_limit_toggle?on=0|1   -> runtime override (no reload; survives reload)
+-- /_rate_limit_toggle?on=0|1   -> runtime override (no reload; survives reload). Any method; the
+--                                    location is bound to 127.0.0.1.
 --      /_rate_limit_toggle?reset=1  -> drop the override, back to the route / global value
 --      /_rate_limit_toggle?reset_counts=1 -> zero the would-reject counters
 -- Without a parameter it only reports. on accepts 1/0/true/false.
@@ -533,23 +536,39 @@ function _G.dbg_rate_limit_toggle(opts)
             error = "lua_shared_dict " .. tostring(opts.cch_ctl_dict) .. " not declared; nothing can be overridden" }))
         return
     end
+    -- reset / reset_counts take the same spellings as on (1/0, true/false, yes/no, on/off).
+    local function flag(name)
+        local v = args[name]
+        if v == nil then return false end
+        local b = util.parse_bool(v)
+        if b == nil then return nil end
+        return b
+    end
+    local reset, reset_counts = flag("reset"), flag("reset_counts")
+    local on = nil                                 -- not `a and b or nil`: that turns false into nil
+    if args.on ~= nil then on = util.parse_bool(args.on) end
+    local function bad(msg)
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false, error = msg }))
+    end
+    if (args.on ~= nil and on == nil) or reset == nil or reset_counts == nil then
+        return bad("use ?on=0 (let the load-based 429s through) | ?on=1 (enforce them) | ?reset=1 | ?reset_counts=1")
+    end
+    -- Setting and dropping the override in one call is ambiguous: refuse instead of silently
+    -- applying whichever runs last.
+    if args.on ~= nil and reset then
+        return bad("?on and ?reset=1 contradict each other; send one of them")
+    end
     local changes = {}
     if args.on ~= nil then
-        local b = util.parse_bool(args.on)
-        if b == nil then
-            ngx.status = 400
-            ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false,
-                error = "use ?on=0 (let the load-based 429s through) | ?on=1 (enforce them) | ?reset=1" }))
-            return
-        end
-        ctl:set("rate_limit_enabled", b and 1 or 0)
-        changes.override = b
+        ctl:set("rate_limit_enabled", on and 1 or 0)
+        changes.override = on
     end
-    if args.reset == "1" then
+    if reset then
         ctl:delete("rate_limit_enabled")
         changes.override = "removed"
     end
-    if args.reset_counts == "1" then
+    if reset_counts then
         for _, r in ipairs(route.RATE_LIMIT_REASONS) do ctl:delete("rl_would:" .. r) end
         changes.counts_reset = true
     end

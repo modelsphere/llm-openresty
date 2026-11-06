@@ -11,10 +11,19 @@
 #   S10    TPS 429 (hard, adaptive_cc=false): on -> 429; off -> all 200, would_reject.tps > 0
 #   S11    all peers banned -> still 503 with the switch off (it is not a rate limit)
 #   S12    /_tps_status and /_429_status report the switch; /_route_opts lists the option
-#   S13    session_prio route, per-turn concurrency share: turn 1 is refused below the pool
-#          limit while on; off -> all 200, counted as would-reject
-#   S14    session_prio route, graded TTFT gate (EWMA past threshold x severe): turn 1 refused
-#          while on; off -> turn 1 and warm turns all 200, would_reject.ttft > 0
+#   S13    session_prio per-turn concurrency share, below the pool limit: 10 concurrent turn-1
+#          requests on a pool of 10 (turn 1's share caps it at 8.5) -> 429 while on; 10 warm
+#          turns -> all 200 (control: it is the share, not the pool); off -> turn 1 all 200
+#   S14    session_prio graded TTFT gate (EWMA past threshold x severe): turn 1 refused while on;
+#          off -> turn 1 and warm turns all 200, would_reject.ttft > 0
+#   S15    session_prio turn-1 hold band (flag held, EWMA between threshold x release and 1.0x,
+#          no plain trip; reached by tripping at 400ms, then moving the threshold to just above
+#          the EWMA with /_ttft_limit): turn 1 refused while on; off -> 200. Only this band
+#          reaches the session_prio gating with the switch off -- above 1.0x the plain trip
+#          branch takes the request first.
+#   S16    session_prio route, TPS hard gate: turn 1 refused while on; off -> all 200
+#   S17    toggle input: ?on=0&reset=1 -> 400; ?reset=true accepted; an unparsable route value
+#          falls back to the global and reports source=global
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="${ENGINE:-$HERE/../session_base.conf}"; MOCK="${MOCK:-$HERE/mock_vllm_sse.py}"
@@ -35,8 +44,8 @@ sed -n "${start},${end}p" "$ENGINE" > "$PREFIX/initblock.conf"
 source "$HERE/lib_initblock.sh"; prepend_lua_path "$PREFIX/initblock.conf" "$HERE/../lua"
 
 # route -> port
-ROUTES="st ac rf tt tp dd sc sq"
-port_of(){ case $1 in st) echo 19600;; ac) echo 19601;; rf) echo 19602;; tt) echo 19603;; tp) echo 19604;; dd) echo 19605;; sc) echo 19606;; sq) echo 19607;; esac; }
+ROUTES="st ac rf tt tp dd sc sq sh sp rv"
+port_of(){ case $1 in st) echo 19600;; ac) echo 19601;; rf) echo 19602;; tt) echo 19603;; tp) echo 19604;; dd) echo 19605;; sc) echo 19606;; sq) echo 19607;; sh) echo 19608;; sp) echo 19609;; rv) echo 19610;; esac; }
 {
 cat <<'EOF'
 worker_processes 1; error_log logs/error.log warn; pid logs/nginx.pid;
@@ -73,6 +82,11 @@ cat <<'EOF'
                                                  rt_limit_factor=1, adaptive_cc=false, session_prio=true}) end)
     _G.register_route("sq", function() return R({peers=wide, adaptive_cc=false, session_prio=true, ttft_limit_ms=400,
                                                  ttft_window=3, ttft_ttl=8, ttft_probe_window=3, ttft_probe_per_window=2}) end)
+    _G.register_route("sh", function() return R({peers=wide, adaptive_cc=false, session_prio=true, ttft_limit_ms=400,
+                                                 ttft_window=3, ttft_ttl=30, ttft_probe_window=3, ttft_probe_per_window=2}) end)
+    _G.register_route("sp", function() return R({peers=wide, adaptive_cc=false, session_prio=true, tps_limit_tps=50, tps_window=3,
+                                                 tps_ttl=8, tps_probe_window=3, tps_probe_per_window=2, tps_min_decode_s=0.3}) end)
+    _G.register_route("rv", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=false, rate_limit="maybe"}) end)
   }
 EOF
 for r in $ROUTES; do p=$(port_of $r); cat <<EOF
@@ -82,6 +96,9 @@ for r in $ROUTES; do p=$(port_of $r); cat <<EOF
     location = /_rate_limit_toggle { content_by_lua_block { _G.dbg_rate_limit_toggle(_G.__route_opts.$r) } }
     location = /_429_status { content_by_lua_block { _G.dbg_429_status(_G.__route_opts.$r) } }
     location = /_tps_status { content_by_lua_block { _G.dbg_tps_status(_G.__route_opts.$r) } }
+    location = /_ttft_status { content_by_lua_block { _G.dbg_ttft_status(_G.__route_opts.$r) } }
+    location = /_ttft_limit { content_by_lua_block { _G.dbg_ttft_limit(_G.__route_opts.$r) } }
+    location = /_session_status { content_by_lua_block { _G.dbg_session_status(_G.__route_opts.$r) } }
     location = /_route_opts { content_by_lua_block { _G.dbg_route_opts(_G.__route_opts.$r) } } }
 EOF
 done
@@ -171,9 +188,11 @@ v=$(curl -s "$(U st)/_429_status?all=1" | js "sorted(d['rate_limit'].keys())"); 
 v=$(curl -s "$(U st)/_429_status" | js "list(d['by_reason'].keys())"); echo "$v" | grep -q would && no "S12 would-reject leaked into by_reason: $v" || ok "S12 by_reason holds real 429s only"
 v=$(curl -s "$(U rf)/_route_opts" | js "[x for x in d.get('directives',[]) if x['key']=='rate_limit'][0]['value']"); [ "$v" = "False" ] && ok "S12 /_route_opts: rate_limit value=False on rf" || no "S12 route_opts: $v"
 
-# ── session_prio: per-turn concurrency share ── (20 x turn 1 against a pool of 10)
-r=$(burst sc 20 1500 5 5 0 1); limited "$r" && ok "S13 sc on: turn-1 share 429s ($r)" || no "S13 sc on, no 429 (precondition): $r"
-tog sc on=0 >/dev/null; r=$(burst sc 20 1500 5 5 0 1); allok "$r" 20 && ok "S13 sc off: all 200 ($r)" || no "S13 sc off: $r"
+# ── session_prio: per-turn concurrency share ── (pool of 10; turn 1 capped at 8.5)
+# 10 concurrent: the 10th sees 9 in flight -- over turn 1's 8.5, under the pool's 10.
+r=$(burst sc 10 1500 5 5 0 40); allok "$r" 10 && ok "S13 sc on, control: 10 warm turns all 200 ($r)" || no "S13 control, warm turns refused: $r"
+r=$(burst sc 10 1500 5 5 0 1); limited "$r" && ok "S13 sc on: turn-1 share 429 below the pool limit ($r)" || no "S13 sc on, no 429 (precondition): $r"
+tog sc on=0 >/dev/null; r=$(burst sc 10 1500 5 5 0 1); allok "$r" 10 && ok "S13 sc off: turn 1 all 200 ($r)" || no "S13 sc off: $r"
 w=$(st sc "d['would_reject']['concurrency']"); [ "$w" -gt 0 ] 2>/dev/null && ok "S13 would_reject.concurrency=$w" || no "S13 would_reject not counted: $w"
 tog sc reset=1 >/dev/null
 
@@ -185,6 +204,43 @@ r=$(burst sq 10 800 5 20 1 1); allok "$r" 10 && ok "S14 sq off: turn 1 all 200 (
 r=$(burst sq 10 800 5 20 1 40); allok "$r" 10 && ok "S14 sq off: warm turn 40 all 200 ($r)" || no "S14 sq off, turn 40: $r"
 w=$(st sq "d['would_reject']['ttft']"); [ "$w" -gt 0 ] 2>/dev/null && ok "S14 would_reject.ttft=$w" || no "S14 would_reject.ttft=$w"
 tog sq reset=1 >/dev/null
+
+# ── session_prio: turn-1 hold band ── warm turns trip at 400ms and set the hold flag; then the
+# threshold moves to EWMA/0.95 with /_ttft_limit, so the EWMA sits between threshold x release (0.9)
+# and 1.0x: no plain trip, flag still held -> only the session_prio gating can refuse turn 1.
+# (The EWMA is bucketed, so moving the threshold is the deterministic way into the band.)
+ewma(){ curl -s "$(U $1)/_ttft_status" | js "(d.get('ewma_ms') or {}).get('_') or 0"; }
+held(){ curl -s "$(U $1)/_session_status" | js "d['pools'][0]['turn1_hold']"; }
+estab sh 800 5 20 1 40
+# The flag is written by a request that sees the trip; estab's last request can arrive before the
+# EWMA exists, so send warm requests until one sets it.
+for i in 1 2 3 4 5; do [ "$(held sh)" = True ] && break; fire sh 800 5 20 1 40 >/dev/null; sleep 1; done
+e=$(ewma sh)
+lim=$("$PY" -c "import sys; print(int(float(sys.argv[1]) / 0.95))" "$e")
+curl -s "$(U sh)/_ttft_limit?ms=$lim&ttl=120" >/dev/null
+if [ "$(held sh)" = True ] && "$PY" -c "import sys; e,l=float(sys.argv[1]),float(sys.argv[2]); sys.exit(0 if 0.9*l < e < l else 1)" "$e" "$lim"; then
+  ok "S15 precondition: hold flag set, EWMA $e in the hold band of threshold $lim"
+  r=$(fire sh 20 5 20 1 1); [ "$r" = 429 ] && ok "S15 sh on: turn 1 refused in the hold band ($r)" || no "S15 sh on, turn 1 not held (precondition): $r"
+  tog sh on=0 >/dev/null
+  r=$(fire sh 20 5 20 1 1); [ "$r" = 200 ] && ok "S15 sh off: turn 1 let through in the hold band ($r)" || no "S15 sh off: $r"
+  tog sh reset=1 >/dev/null
+else
+  no "S15 precondition: hold=$(held sh) EWMA $e threshold $lim"
+fi
+curl -s "$(U sh)/_ttft_limit?ms=0" >/dev/null
+
+# ── session_prio: TPS hard gate ── (50ms/chunk = 20 tok/s < limit 50)
+estab sp 20 50 20 1 40
+r=$(burst sp 10 20 50 20 1 1); limited "$r" && ok "S16 sp on: turn-1 TPS 429 ($r)" || no "S16 sp on, no 429 (precondition): $r"
+tog sp on=0 >/dev/null; r=$(burst sp 10 20 50 20 1 1); allok "$r" 10 && ok "S16 sp off: all 200 ($r)" || no "S16 sp off: $r"
+w=$(st sp "d['would_reject']['tps']"); [ "$w" -gt 0 ] 2>/dev/null && ok "S16 would_reject.tps=$w" || no "S16 would_reject.tps=$w"
+tog sp reset=1 >/dev/null
+
+# ── toggle input ──
+code=$(curl -s -o /dev/null -w "%{http_code}" "$(U st)/_rate_limit_toggle?on=0&reset=1"); [ "$code" = 400 ] && ok "S17 ?on=0&reset=1 -> 400" || no "S17 contradictory toggle -> $code"
+[ "$(st st "d['source']")" = "global" ] && ok "S17 refused toggle changed nothing" || no "S17 refused toggle still applied: $(st st "d['source']")"
+tog st on=0 >/dev/null; o=$(tog st reset=true); [ "$(echo "$o" | js "d['source']")" = "global" ] && ok "S17 ?reset=true accepted" || no "S17 reset=true: $o"
+[ "$(st rv "d['enabled']")" = "True" ] && [ "$(st rv "d['source']")" = "global" ] && ok "S17 rate_limit=\"maybe\" falls back, source=global" || no "S17 invalid route value: $(curl -s $(U rv)/_rate_limit_status)"
 
 echo
 echo "================ rate-limit switch: PASS=$P FAIL=$F ================"

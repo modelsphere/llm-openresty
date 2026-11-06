@@ -226,6 +226,8 @@ function _G.register_route(name, opts_factory)
     -- rate_limit: master switch for the load-based 429s (concurrency -- static or adaptive --, TTFT, TPS).
     -- Off lets those requests through; measurement, AIMD and the 503 for an all-banned pool are unchanged.
     -- A runtime override (/_rate_limit_toggle) wins over this; see M.rate_limit_state.
+    -- An unparsable value falls back to the global default, so it must not be reported as source=route.
+    opts._rate_limit_from_route = opts.rate_limit ~= nil and util.parse_bool(opts.rate_limit) ~= nil
     util.bool_opt(opts, "rate_limit", D("rate_limit"), name)
     util.bool_opt(opts, "cch_default_enabled", _G.CCH_STRIP_DEFAULT_ENABLED == true, name)
     -- Kimi tool_call_id normalize 每路由默认（factory 显式设 false 即永久关，重启也不恢复；缺省回落全局 _G.KIMI_NORMALIZE_DEFAULT_ENABLED）
@@ -728,12 +730,13 @@ function M.rate_limit_state(opts)
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local ovr = ctl and ctl:get(RL_KEY)
     if ovr ~= nil then return ovr == 1, "runtime" end
-    local src = (opts._set_keys and opts._set_keys.rate_limit) and "route" or "global"
+    local src = opts._rate_limit_from_route and "route" or "global"
     return opts.rate_limit ~= false, src
 end
 
--- With the switch off, a request that would have been refused is let through and counted here
--- instead: per route, per reason, in the route's own ctl dict. Kept out of reject_stat on purpose --
+-- With the switch off, a request that trips a gate is let through and counted here instead: per
+-- route, per gate, in the route's own ctl dict. These are trips, not exact refusals (see
+-- dbg_rate_limit_status). Kept out of reject_stat on purpose --
 -- everything there is read as a real 429 (/_429_status totals, openresty_rejected_total).
 function M.count_would_reject(opts, reason)
     local ctl = ngx.shared[opts.cch_ctl_dict]

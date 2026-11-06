@@ -297,14 +297,22 @@ Hot toggles (bound to 127.0.0.1) change behaviour without a reload:
 static pool limit or the adaptive one, including `session_prio`'s per-turn shares), TTFT
 (including `session_prio`'s graded gate), and decode rate. With it off those requests are
 let through, while everything behind them keeps running: the EWMAs, the adaptive limit, health
-bans and the 503 for an all-banned pool. Each request that would have been refused is counted,
-per reason, in `/_rate_limit_status` and in the `rate_limit` field of `/_429_status`. These
-counts are never added to the real 429 counters. Content rules (`reject_rules`) have their own
+bans and the 503 for an all-banned pool. Each gate a request trips while the switch is off is
+counted, per gate, in `/_rate_limit_status` and in the `rate_limit` field of `/_429_status`.
+These are trips rather than exact refusals: a probe slot or a warm turn in `session_prio`'s soft
+band might have been admitted anyway, and a request tripping two gates counts on both. They are
+never added to the real 429 counters. Content rules (`reject_rules`) have their own
 switch and are not covered. Three layers, highest first:
-- the runtime override `POST /<route>/_rate_limit_toggle?on=0|1` takes effect without a reload
+- the runtime override `/<route>/_rate_limit_toggle?on=0|1` (127.0.0.1 only) takes effect without a reload
   and survives one; `?reset=1` removes it;
 - the route option `rate_limit` (route conf, or `nginx.values` on a ModelRoute);
 - the global `_G.RATE_LIMIT_ENABLED` in `session_base.conf`.
+
+Two things to watch when switching it off at runtime. The override survives reloads and lasts
+until `?reset=1` or a full restart, so remove it once the incident is over (`/_rate_limit_status`
+shows `source: runtime` while it is in place). And the adaptive limit keeps moving on traffic it no
+longer caps -- down under overload, up under pressure -- so switching back on can bring a burst of
+429s until it settles.
 
 **Body logging** captures full request and response bodies asynchronously over a
 cosocket (a length-prefixed binary frame; the request path never blocks on it) and
