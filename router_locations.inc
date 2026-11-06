@@ -171,6 +171,17 @@
         allow 127.0.0.1; deny all;
         content_by_lua_block { _G.dbg_tps_limit(_G.__route_opts[ngx.var.route]) }
     }
+    # Rate-limit master switch: the load-based 429s (concurrency, TTFT, TPS), not reject_rules.
+    # GET  /_rate_limit_status                -> effective state, its source, would-reject counts (open)
+    # POST /_rate_limit_toggle?on=0|1         -> runtime override, no reload, survives reload (127.0.0.1)
+    #      /_rate_limit_toggle?reset=1        -> drop the override; ?reset_counts=1 zeroes the counts
+    location = /_rate_limit_status {
+        content_by_lua_block { _G.dbg_rate_limit_status(_G.__route_opts[ngx.var.route]) }
+    }
+    location = /_rate_limit_toggle {
+        allow 127.0.0.1; deny all;
+        content_by_lua_block { _G.dbg_rate_limit_toggle(_G.__route_opts[ngx.var.route]) }
+    }
     # GET /<route>/_429_status -> this route's 429 counters by reason; ?all=1 -> every route on this
     # openresty (by_route); ?reset=1 clears the same scope (127.0.0.1 only). The counters live in one
     # shared dict (reject_stat, key "<route>:<reason>"); dbg_429_status filters it by opts.route_name.

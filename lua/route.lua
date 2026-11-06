@@ -67,6 +67,8 @@ M.DEFAULTS = {
     -- capacity & failover
     default_max                = global("MAX_CONCURRENCY_PER_PEER"),
     rt_limit_factor            = global("RT_LIMIT_FACTOR"),
+    -- `~= false`: a session_base.conf older than this switch has no such global, and limiting must stay on
+    rate_limit                 = function() return _G.RATE_LIMIT_ENABLED ~= false end,
     max_more_tries             = 2,
     cross_tier_fallback        = true,
     -- health checks / routing
@@ -221,6 +223,10 @@ function _G.register_route(name, opts_factory)
                 " is invalid (need a positive number) - falling back to ", D("rt_limit_factor"))
         opts.rt_limit_factor = D("rt_limit_factor")
     end
+    -- rate_limit: master switch for the load-based 429s (concurrency -- static or adaptive --, TTFT, TPS).
+    -- Off lets those requests through; measurement, AIMD and the 503 for an all-banned pool are unchanged.
+    -- A runtime override (/_rate_limit_toggle) wins over this; see M.rate_limit_state.
+    util.bool_opt(opts, "rate_limit", D("rate_limit"), name)
     util.bool_opt(opts, "cch_default_enabled", _G.CCH_STRIP_DEFAULT_ENABLED == true, name)
     -- Kimi tool_call_id normalize 每路由默认（factory 显式设 false 即永久关，重启也不恢复；缺省回落全局 _G.KIMI_NORMALIZE_DEFAULT_ENABLED）
     util.bool_opt(opts, "kimi_normalize_default_enabled", _G.KIMI_NORMALIZE_DEFAULT_ENABLED == true, name)
@@ -706,6 +712,43 @@ function M.compute_static_max_cc(opts, model)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
+-- ── Rate-limit master switch ──
+-- Covers the three load-based 429 exits in do_route: concurrency (static pool limit or adaptive cc),
+-- TTFT and TPS. reject_rules is a content policy with its own switch and is not covered.
+-- Three layers, highest first:
+--   runtime  ngx.shared[opts.cch_ctl_dict] "rate_limit_enabled" = 1/0, set by /_rate_limit_toggle;
+--            no reload, survives one; ?reset=1 removes it
+--   route    opts.rate_limit (route conf / ModelRoute nginx.values), parsed in register_route
+--   global   _G.RATE_LIMIT_ENABLED (session_base.conf), the route option's default
+-- Returns enabled, source ("runtime" | "route" | "global").
+local RL_KEY = "rate_limit_enabled"
+M.RATE_LIMIT_REASONS = { "concurrency", "ttft", "tps" }
+
+function M.rate_limit_state(opts)
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local ovr = ctl and ctl:get(RL_KEY)
+    if ovr ~= nil then return ovr == 1, "runtime" end
+    local src = (opts._set_keys and opts._set_keys.rate_limit) and "route" or "global"
+    return opts.rate_limit ~= false, src
+end
+
+-- With the switch off, a request that would have been refused is let through and counted here
+-- instead: per route, per reason, in the route's own ctl dict. Kept out of reject_stat on purpose --
+-- everything there is read as a real 429 (/_429_status totals, openresty_rejected_total).
+function M.count_would_reject(opts, reason)
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    if ctl then ctl:incr("rl_would:" .. reason, 1, 0) end
+end
+
+function M.would_reject_counts(opts)
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local out = {}
+    for _, r in ipairs(M.RATE_LIMIT_REASONS) do
+        out[r] = ctl and (ctl:get("rl_would:" .. r) or 0) or 0
+    end
+    return out
+end
+
 -- M.derive_mincc(opts, maxcc) — AIMD 下限(慢启动 floor + clamp band 下界)。
 -- 显式配 adaptive_cc_min 优先,否则从**静态** maxcc 派生(×min_frac,≥1),再钳到 maxcc。
 -- 统一 3 处调用(do_route / do_adaptive_cc_loop / dbg_tps_status)同一 base(静态 maxcc),
