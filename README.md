@@ -278,7 +278,7 @@ Every `/v1/*` response carries `X-Routed-Session`, `X-Routed-Source`, `X-Routed-
 default, description, in the same shape as the console's deploy form -- with the value the
 engine actually runs with and whether the route set it, plus the derived adaptive-concurrency
 bounds (static max, floor, start point) per sub-pool. The catalog lives in `lua/directives.lua`:
-`directives` holds the 16 options an operator is expected to tune; engine internals (AIMD
+`directives` holds the 18 options an operator is expected to tune; engine internals (AIMD
 coefficients, measurement windows, probe allowances ...) are marked hidden and served under
 `advanced` instead -- still settable, just not offered by the form. `test/test_route_opts.sh` fails
 if a literal default in either list drifts from the engine.
@@ -286,12 +286,33 @@ if a literal default in either list drifts from the engine.
 Read-only endpoints (no key required): `/_health_status`, `/_active_conns`,
 `/_cluster_avg`, `/_route_state`, `/_route_debug?sid=…`, `/_route_inspect`,
 `/_ttft_status`, `/_tps_status`, `/_429_status`, `/_bodylog_status`,
-`/_reject_rules_status`, `/_route_opts`.
+`/_reject_rules_status`, `/_route_opts`, `/_rate_limit_status`.
 
 Hot toggles (bound to 127.0.0.1) change behaviour without a reload:
 `/_ttft_toggle`, `/_ttft_limit`, `/_tps_toggle`, `/_tps_limit`, `/_bodylog_toggle`,
 `/_reject_rules_toggle`, `/_cch_strip_toggle`, `/_kimi_normalize_toggle`,
-`/_include_usage_toggle`.
+`/_include_usage_toggle`, `/_rate_limit_toggle`.
+
+**Rate-limit master switch.** One switch turns off all three load-based 429s: concurrency (the
+static pool limit or the adaptive one, including `session_prio`'s per-turn shares), TTFT
+(including `session_prio`'s graded gate), and decode rate. With it off those requests are
+let through, while everything behind them keeps running: the EWMAs, the adaptive limit, health
+bans and the 503 for an all-banned pool. Each gate a request trips while the switch is off is
+counted, per gate, in `/_rate_limit_status` and in the `rate_limit` field of `/_429_status`.
+These are trips rather than exact refusals: a probe slot or a warm turn in `session_prio`'s soft
+band might have been admitted anyway, and a request tripping two gates counts on both. They are
+never added to the real 429 counters. Content rules (`reject_rules`) have their own
+switch and are not covered. Three layers, highest first:
+- the runtime override `/<route>/_rate_limit_toggle?on=0|1` (127.0.0.1 only) takes effect without a reload
+  and survives one; `?reset=1` removes it;
+- the route option `rate_limit` (route conf, or `nginx.values` on a ModelRoute);
+- the global `_G.RATE_LIMIT_ENABLED` in `session_base.conf`.
+
+Two things to watch when switching it off at runtime. The override survives reloads and lasts
+until `?reset=1` or a full restart, so remove it once the incident is over (`/_rate_limit_status`
+shows `source: runtime` while it is in place). And the adaptive limit keeps moving on traffic it no
+longer caps -- down under overload, up under pressure -- so switching back on can bring a burst of
+429s until it settles.
 
 **Body logging** captures full request and response bodies asynchronously over a
 cosocket (a length-prefixed binary frame; the request path never blocks on it) and

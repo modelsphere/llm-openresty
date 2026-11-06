@@ -90,6 +90,10 @@ function _G.do_route(opts)
     -- 限流 429。尤其两级 nginx 串联时,内层一忙就把探测 429 掉 → 外层健康检查误判后端不可用。
     -- 仅放行三个限流出口,仍走正常 pick + proxy(拿后端真实响应);503(全 banned)不放行。
     local is_probe = (ngx.var.uri == "/v1/models" or ngx.var.uri == "/health")
+    -- Rate-limit master switch (route.rate_limit_state). Off: the concurrency / TTFT / TPS checks below
+    -- still run and count what they would have refused, but let the request through. Everything that
+    -- feeds them -- EWMAs, the AIMD loop, health bans and the all-banned 503 -- is unaffected.
+    local rl_on = route.rate_limit_state(opts)
 
     -- ★ 早设 ngx.ctx.route_opts：让 prepare_request / bodylog_* / balancer 都能拿到
     ngx.ctx.route_opts = opts
@@ -208,7 +212,10 @@ function _G.do_route(opts)
     local hit_rt  = a.rt_sum   >= eff_limit
     -- 2026-07-02 暂时禁用均值判断,只用实时值 rt_sum 判过载(原: a.avg_5min >= limit)
     local hit_avg = false
-    if (hit_rt or hit_avg) and not is_probe then
+    if (hit_rt or hit_avg) and not is_probe and not rl_on then
+        -- Not counted as adaptive-cc "rej" either: nothing was suppressed, so it is no climb signal.
+        route.count_would_reject(opts, "concurrency")
+    elseif (hit_rt or hit_avg) and not is_probe then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":concurrency",1,0) end end
         if sp_on then session_prio.count(opts, sp_bucket, "rej_conc") end
@@ -280,7 +287,10 @@ function _G.do_route(opts)
     --     also covers EWMA expired/nil) no longer trips. While set, turn 1 is
     --     rejected with no probe slot. The flag is written only on state change.
     local sp_turn1_held
-    if sp_on and not ttft_hard429_off and not is_probe then
+    -- With rate limiting switched off the graded gate is skipped whole: no
+    -- hold flag is written and nothing is rejected (the would-reject count
+    -- below covers the plain 1.0x trip).
+    if sp_on and rl_on and not ttft_hard429_off and not is_probe then
         if hit_ttft then
             -- 1.0x trip (any declared metric) -> set the flag (only on change).
             -- Several workers can see "not held" at once and all write it;
@@ -317,7 +327,7 @@ function _G.do_route(opts)
         end
     end
     local sp_ttft_reject, sp_ttft_hard
-    if sp_on and not is_probe and not ttft_hard429_off then
+    if sp_on and rl_on and not is_probe and not ttft_hard429_off then
         local tbl = opts._sp_table
         local bidx = sp_bucket == "nohdr" and opts._sp_top or sp_bucket
         local is_turn1 = sp_bucket ~= "nohdr" and tbl[sp_bucket].min_turn == 1
@@ -355,7 +365,10 @@ function _G.do_route(opts)
             end
         end
     end
-    if (sp_on and sp_ttft_reject) and not is_probe then
+    if hit_ttft and not is_probe and not rl_on and not ttft.ttft_429_disabled(opts) then
+        -- Checked before ttft_allow_probe: with nothing being refused, no probe slot should be used up.
+        route.count_would_reject(opts, "ttft")
+    elseif (sp_on and sp_ttft_reject) and not is_probe then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":ttft",1,0) end end
         session_prio.count(opts, sp_bucket, "rej_ttft")
@@ -412,7 +425,7 @@ function _G.do_route(opts)
     --   Only live on the TPS hard-fuse path (adaptive_cc off); AIMD routes are
     --   unaffected here.
     local sp_tps_reject
-    if sp_on and not is_probe and (not opts.adaptive_cc) and hit_tps then
+    if sp_on and rl_on and not is_probe and (not opts.adaptive_cc) and hit_tps then
         local tbl = opts._sp_table
         local bidx = sp_bucket == "nohdr" and opts._sp_top or sp_bucket
         local is_turn1 = sp_bucket ~= "nohdr" and tbl[sp_bucket].min_turn == 1
@@ -439,7 +452,9 @@ function _G.do_route(opts)
             end
         end
     end
-    if sp_on and sp_tps_reject and not is_probe then
+    if hit_tps and not is_probe and not rl_on then
+        route.count_would_reject(opts, "tps")
+    elseif sp_on and sp_tps_reject and not is_probe then
         ngx.status = 429
         do local rj=ngx.shared.reject_stat; if rj then rj:incr((opts.route_name or "-")..":tps",1,0) end end
         session_prio.count(opts, sp_bucket, "rej_tps")

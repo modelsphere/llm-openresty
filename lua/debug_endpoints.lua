@@ -482,7 +482,99 @@ function _G.dbg_tps_status(opts)
         metrics               = mstat,                        -- 每模型指标列表 + source(override|declared|static)
         dict_capacity         = td and td:capacity() or nil,
         dict_free_space       = td and td:free_space() or nil,
+        -- Rate-limit master switch: off means the TPS / concurrency 429s are not enforced even though
+        -- everything above is still measured. Details: /_rate_limit_status.
+        rate_limit_enabled    = (route.rate_limit_state(opts)),
+        rate_limit_source     = select(2, route.rate_limit_state(opts)),
     }))
+end
+
+-- ── Rate-limit master switch (see route.rate_limit_state) ──
+local function rate_limit_view(opts)
+    local enabled, source = route.rate_limit_state(opts)
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local ovr = ctl and ctl:get("rate_limit_enabled")
+    local override = nil                                 -- absent = no override
+    if ovr ~= nil then override = (ovr == 1) end         -- not `a and b or nil`: that turns false into nil
+    return {
+        route            = opts.route_name,
+        enabled          = enabled,
+        source           = source,                       -- runtime | route | global
+        runtime_override = override,
+        route_value      = opts.rate_limit,              -- route conf, or the global when unset
+        global_default   = _G.RATE_LIMIT_ENABLED ~= false,
+        covers           = route.RATE_LIMIT_REASONS,
+        -- While the switch is off: per gate, the requests that tripped it and were let through.
+        -- A trip, not a refusal: a probe slot or a warm turn in session_prio's soft band might have
+        -- been admitted anyway, and a request tripping two gates counts on both. Since the worker
+        -- restarted; survive reload; ?reset_counts=1 on the toggle clears them.
+        would_reject     = route.would_reject_counts(opts),
+        ctl_dict_declared = ctl and true or false,
+    }
+end
+
+-- GET /_rate_limit_status -> the switch's effective state, where it comes from, and the would-reject counts.
+function _G.dbg_rate_limit_status(opts)
+    if util.opts_missing(opts) then return end
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cjson_dbg.encode(rate_limit_view(opts)))
+end
+
+-- /_rate_limit_toggle?on=0|1   -> runtime override (no reload; survives reload). Any method; the
+--                                    location is bound to 127.0.0.1.
+--      /_rate_limit_toggle?reset=1  -> drop the override, back to the route / global value
+--      /_rate_limit_toggle?reset_counts=1 -> zero the would-reject counters
+-- Without a parameter it only reports. on accepts 1/0/true/false.
+function _G.dbg_rate_limit_toggle(opts)
+    if util.opts_missing(opts) then return end
+    ngx.header["Content-Type"] = "application/json"
+    local ctl = ngx.shared[opts.cch_ctl_dict]
+    local args = ngx.req.get_uri_args()
+    if not ctl and (args.on ~= nil or args.reset ~= nil or args.reset_counts ~= nil) then
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false,
+            error = "lua_shared_dict " .. tostring(opts.cch_ctl_dict) .. " not declared; nothing can be overridden" }))
+        return
+    end
+    -- reset / reset_counts take the same spellings as on (1/0, true/false, yes/no, on/off).
+    local function flag(name)
+        local v = args[name]
+        if v == nil then return false end
+        local b = util.parse_bool(v)
+        if b == nil then return nil end
+        return b
+    end
+    local reset, reset_counts = flag("reset"), flag("reset_counts")
+    local on = nil                                 -- not `a and b or nil`: that turns false into nil
+    if args.on ~= nil then on = util.parse_bool(args.on) end
+    local function bad(msg)
+        ngx.status = 400
+        ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false, error = msg }))
+    end
+    if (args.on ~= nil and on == nil) or reset == nil or reset_counts == nil then
+        return bad("use ?on=0 (let the load-based 429s through) | ?on=1 (enforce them) | ?reset=1 | ?reset_counts=1")
+    end
+    -- Setting and dropping the override in one call is ambiguous: refuse instead of silently
+    -- applying whichever runs last.
+    if args.on ~= nil and reset then
+        return bad("?on and ?reset=1 contradict each other; send one of them")
+    end
+    local changes = {}
+    if args.on ~= nil then
+        ctl:set("rate_limit_enabled", on and 1 or 0)
+        changes.override = on
+    end
+    if reset then
+        ctl:delete("rate_limit_enabled")
+        changes.override = "removed"
+    end
+    if reset_counts then
+        for _, r in ipairs(route.RATE_LIMIT_REASONS) do ctl:delete("rl_would:" .. r) end
+        changes.counts_reset = true
+    end
+    local view = rate_limit_view(opts)
+    view.ok, view.changes = true, changes
+    ngx.say(cjson_dbg.encode(view))
 end
 
 -- GET /_429_status → 全路由 429 限流累计计数(按 route × reason 聚合)。
@@ -528,11 +620,21 @@ function _G.dbg_429_status(opts)
             total = total + v
         end
     end
+    -- Rate-limit switch per route, and what it let through while off. Separate fields, never folded into
+    -- total / by_reason: those are real 429s and the exporter reads them as such.
+    local rate_limit = {}
+    for rname, ropts in pairs(_G.__route_opts or {}) do
+        if show_all or rname == want then
+            local en, src = route.rate_limit_state(ropts)
+            rate_limit[rname] = { enabled = en, source = src, would_reject = route.would_reject_counts(ropts) }
+        end
+    end
     ngx.say(cjson_dbg.encode({
         scope     = show_all and "all" or want,          -- "all"=全路由聚合 / "<route>"=仅本路由
         total     = total,
         by_reason = by_reason,
         by_route  = by_route,
+        rate_limit = rate_limit,                         -- appended field; see above
         note      = "默认仅本 route;?all=1 全路由聚合。counters since last reset/worker restart (survive reload)",
         worker_id = ngx.worker.id(),
     }))
