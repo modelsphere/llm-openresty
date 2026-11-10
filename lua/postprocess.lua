@@ -409,6 +409,8 @@ local function strip_actual_usage_json(payload)
 end
 M.strip_actual_usage_json = strip_actual_usage_json  -- exposed for unit tests
 
+-- The needle assumes the key is written plainly. A backend that escaped it in the JSON (e.g.
+-- "actual\u005fusage") would have the field passed through -- as with post-processing off.
 M.register("strip_actual_usage", json_rewrite_handler(strip_actual_usage_json, '"actual_usage"'))
 
 return M

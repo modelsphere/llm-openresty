@@ -84,7 +84,7 @@ check(stripped == 500, "field not cleanly stripped in " .. (500 - stripped) .. "
 local at = with:find("actual_usage", 1, true)
 local split = run("strip_actual_usage", { with:sub(1, at + 5), with:sub(at + 6) })
 check(not split:find("actual_usage", 1, true), "needle split across two chunks was not stripped")
--- vllm_format (no needle) still rewrites on the scanned payload: the "/" in content comes back escaped
+-- vllm_format (no needle) still rewrites frames found by the line scan
 local v = run("vllm_format", cut(content .. 'data: {"choices":[],"system_fingerprint":"fp"}\n\n'))
 check(not v:find("system_fingerprint", 1, true), "vllm_format did not drop system_fingerprint")
 print(string.format("fast path: %d/500 unchanged, %d/500 stripped", unchanged, stripped))
