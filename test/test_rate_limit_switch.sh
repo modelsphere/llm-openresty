@@ -22,7 +22,7 @@
 #          reaches the session_prio gating with the switch off -- above 1.0x the plain trip
 #          branch takes the request first.
 #   S16    session_prio route, TPS hard gate: turn 1 refused while on; off -> all 200
-#   S17    toggle input: ?on=0&reset=1 -> 400; ?reset=true accepted; an unparsable route value
+#   S17    toggle input: GET -> 405 (POST only); ?on=0&reset=1 -> 400; ?reset=true accepted; an unparsable route value
 #          falls back to the global and reports source=global
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -237,7 +237,8 @@ w=$(st sp "d['would_reject']['tps']"); [ "$w" -gt 0 ] 2>/dev/null && ok "S16 wou
 tog sp reset=1 >/dev/null
 
 # ── toggle input ──
-code=$(curl -s -o /dev/null -w "%{http_code}" "$(U st)/_rate_limit_toggle?on=0&reset=1"); [ "$code" = 400 ] && ok "S17 ?on=0&reset=1 -> 400" || no "S17 contradictory toggle -> $code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$(U st)/_rate_limit_toggle?on=0&reset=1"); [ "$code" = 400 ] && ok "S17 ?on=0&reset=1 -> 400" || no "S17 contradictory toggle -> $code"
+code=$(curl -s -o /dev/null -w "%{http_code}" "$(U st)/_rate_limit_toggle?on=0"); [ "$code" = 405 ] && ok "S17 GET toggle -> 405" || no "S17 GET toggle -> $code"
 [ "$(st st "d['source']")" = "global" ] && ok "S17 refused toggle changed nothing" || no "S17 refused toggle still applied: $(st st "d['source']")"
 tog st on=0 >/dev/null; o=$(tog st reset=true); [ "$(echo "$o" | js "d['source']")" = "global" ] && ok "S17 ?reset=true accepted" || no "S17 reset=true: $o"
 [ "$(st rv "d['enabled']")" = "True" ] && [ "$(st rv "d['source']")" = "global" ] && ok "S17 rate_limit=\"maybe\" falls back, source=global" || no "S17 invalid route value: $(curl -s $(U rv)/_rate_limit_status)"

@@ -173,7 +173,8 @@
     }
     # Rate-limit master switch: the load-based 429s (concurrency, TTFT, TPS), not reject_rules.
     # GET  /_rate_limit_status                -> effective state, its source, would-reject counts (open)
-    # POST /_rate_limit_toggle?on=0|1         -> runtime override, no reload, survives reload (127.0.0.1)
+    # POST /_rate_limit_toggle?on=0|1         -> runtime override, no reload, survives reload
+    #                                          (POST only -> 405 otherwise; 127.0.0.1 only)
     #      /_rate_limit_toggle?reset=1        -> drop the override; ?reset_counts=1 zeroes the counts
     location = /_rate_limit_status {
         content_by_lua_block { _G.dbg_rate_limit_status(_G.__route_opts[ngx.var.route]) }

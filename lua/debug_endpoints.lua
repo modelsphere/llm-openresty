@@ -520,14 +520,22 @@ function _G.dbg_rate_limit_status(opts)
     ngx.say(cjson_dbg.encode(rate_limit_view(opts)))
 end
 
--- /_rate_limit_toggle?on=0|1   -> runtime override (no reload; survives reload). Any method; the
---                                    location is bound to 127.0.0.1.
+-- POST /_rate_limit_toggle?on=0|1   -> runtime override (no reload; survives reload). POST only, so a
+--                                       stray GET (a crawler, a browser prefetch) can't flip it; the
+--                                       location is bound to 127.0.0.1. Reading: /_rate_limit_status.
 --      /_rate_limit_toggle?reset=1  -> drop the override, back to the route / global value
 --      /_rate_limit_toggle?reset_counts=1 -> zero the would-reject counters
 -- Without a parameter it only reports. on accepts 1/0/true/false.
 function _G.dbg_rate_limit_toggle(opts)
     if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
+    if ngx.req.get_method() ~= "POST" then
+        ngx.status = 405
+        ngx.header["Allow"] = "POST"
+        ngx.say(cjson_dbg.encode({ route = opts.route_name, ok = false,
+            error = "POST only; read the state with GET /_rate_limit_status" }))
+        return
+    end
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local args = ngx.req.get_uri_args()
     if not ctl and (args.on ~= nil or args.reset ~= nil or args.reset_counts ~= nil) then
