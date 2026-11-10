@@ -268,7 +268,9 @@ How it behaves:
   re-encoded, so its key order and `/` escaping can differ from the backend's.
 - `Content-Length` is dropped on the route's 2xx responses (they are sent chunked),
   and a non-stream JSON body is held until it is complete (up to 8 MiB; a larger
-  one passes through unchanged). Streams are not held: frames go out as they arrive.
+  one passes through unchanged). A stream is not held: each complete line goes out
+  with the chunk it arrived in, and only a line a chunk ends in the middle of waits
+  for the next chunk.
 - Fail-open: a frame that does not parse, or a handler error, leaves the original bytes.
 - The bodylog sees the raw upstream response (it runs first). The listener keeps
   `usage` and `actual_usage` in the record's `resp_meta`, so a stripped

@@ -290,22 +290,45 @@ local function vllm_rewrite_json(payload)
     return enc or payload                            -- fail open on an encode error
 end
 
+local byte = string.byte
+
+-- %s in a Lua pattern: space, \t, \n, \v, \f, \r
+local function is_space(b) return b == 32 or (b >= 9 and b <= 13) end
+
+-- The payload of one SSE line: what follows "data:", without the whitespace around it; nil for
+-- any other line. Same result as line:match("^data:%s*(.-)%s*\r?\n?$"), in one linear scan --
+-- that pattern's lazy capture re-tries the rest of the line at every character, which made it
+-- most of the handler's cost (~7 us of ~8 us on a 216-byte frame).
+local function sse_payload(line)
+    if byte(line, 1) ~= 100 or line:sub(1, 5) ~= "data:" then return nil end   -- 100 = "d"
+    local s, e = 6, #line
+    while s <= e and is_space(byte(line, s)) do s = s + 1 end
+    while e >= s and is_space(byte(line, e)) do e = e - 1 end
+    return line:sub(s, e)
+end
+M.sse_payload = sse_payload   -- exposed for unit tests
+
 -- Rewrite one SSE data frame with rewrite_json. Leave unchanged frames byte-identical.
 local function rewrite_sse_line(line, rewrite_json)
-    local payload = line:match("^data:%s*(.-)%s*\r?\n?$")
+    local payload = sse_payload(line)
     if not payload or payload == "" or payload == "[DONE]" then
         return line                                  -- comment/heartbeat/terminator/non-data
     end
     local rewritten = rewrite_json(payload)
     if rewritten == payload then return line end
-    return "data: " .. rewritten .. (line:match("\r?\n$") or "")
+    local n, tail = #line, ""
+    if byte(line, n) == 10 then tail = (n > 1 and byte(line, n - 1) == 13) and "\r\n" or "\n" end
+    return "data: " .. rewritten .. tail
 end
 
 -- A handler that rewrites OpenAI-style responses one JSON document at a time:
 -- each SSE data frame, or a whole non-stream JSON body (capped and buffered until
 -- eof). rewrite_json(payload) -> payload' returns its input unchanged (the same
 -- string) when there is nothing to do, so untouched frames stay byte-identical.
-local function json_rewrite_handler(rewrite_json)
+-- needle (optional): a plain substring every frame the handler would change contains. A stream
+-- chunk without it is passed on without splitting it into lines -- except a line it ends in the
+-- middle of, which is held back with the next chunk, since the needle may straddle the boundary.
+local function json_rewrite_handler(rewrite_json, needle)
     return {
         buffered = false,
         rewrites_length = true,
@@ -342,6 +365,13 @@ local function json_rewrite_handler(rewrite_json)
             if not ctx.pp_sse then return nil end    -- other media types pass through
             local pending = (ctx.pp_leftover or "") .. (chunk or "")
             ctx.pp_leftover = nil
+            if needle and not pending:find(needle, 1, true) then
+                if eof or byte(pending, -1) == 10 then return pending end
+                local last, p = 0, pending:find("\n", 1, true)
+                while p do last = p; p = pending:find("\n", p + 1, true) end
+                ctx.pp_leftover = pending:sub(last + 1)   -- the partial last line
+                return pending:sub(1, last)
+            end
             local out, pos = {}, 1
             while true do
                 local nl = pending:find("\n", pos, true)
@@ -379,6 +409,8 @@ local function strip_actual_usage_json(payload)
 end
 M.strip_actual_usage_json = strip_actual_usage_json  -- exposed for unit tests
 
-M.register("strip_actual_usage", json_rewrite_handler(strip_actual_usage_json))
+-- The needle assumes the key is written plainly. A backend that escaped it in the JSON (e.g.
+-- "actual\u005fusage") would have the field passed through -- as with post-processing off.
+M.register("strip_actual_usage", json_rewrite_handler(strip_actual_usage_json, '"actual_usage"'))
 
 return M
