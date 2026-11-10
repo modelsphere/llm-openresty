@@ -27,6 +27,8 @@ Default values can also be overridden per-request via JSON body fields:
   {"prefill_delay_ms": 0} -> override prefill delay
   {"emit_reasoning": true}-> 用 reasoning 字段（Kimi-K2.5 思考链）而非 content
   {"emit_tool_call": true}-> 末尾追加一个 tool_call（chat 接口）
+  {"emit_actual_usage": true} -> chat usage also carries a top-level "actual_usage" (as some
+                             sglang builds do; same as --actual-usage for every request)
 
 非流式 finish_reason / stop_reason 默认 "length"（mock 总是发完 max_tokens 才停），
 和真 vllm 在 max_tokens 触发时一致。
@@ -103,9 +105,19 @@ def _chat_tool_call_chunk(cid: str, model: str, created: int, name: str, args: s
     }))
 
 
+def _actual_usage(usage: dict) -> dict:
+    """A second, different token count next to "usage", as some sglang builds return it:
+    same totals, but its own prompt_tokens_details (cached_tokens + 1024, capped at the
+    prompt) so a test can tell the two apart."""
+    cached = ((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0) + 1024
+    actual = dict(usage)
+    actual["prompt_tokens_details"] = {"cached_tokens": min(cached, usage["prompt_tokens"])}
+    return actual
+
+
 def _chat_usage_chunk(cid: str, model: str, created: int,
                       prompt_tokens: int, completion_tokens: int,
-                      cached_tokens=None) -> bytes:
+                      cached_tokens=None, actual_usage=False) -> bytes:
     """include_usage=true 时的最终 chunk（choices=[] + usage）。"""
     usage = {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens + completion_tokens,
              "completion_tokens": completion_tokens}
@@ -114,11 +126,14 @@ def _chat_usage_chunk(cid: str, model: str, created: int,
     # default wire is byte-identical for every other harness.
     if cached_tokens is not None:
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
-    return _sse(json.dumps({
+    chunk = {
         "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
         "choices": [],
         "usage": usage,
-    }))
+    }
+    if actual_usage:
+        chunk["actual_usage"] = _actual_usage(usage)
+    return _sse(json.dumps(chunk))
 
 
 # ─── /v1/completions: chunk builders（legacy text completion）─────────────
@@ -301,6 +316,8 @@ async def chat_completions(request: web.Request):
                 "prompt_logprobs": None, "prompt_token_ids": None,
                 "kv_transfer_params": None,
             }
+            if app["actual_usage"] or body.get("emit_actual_usage"):
+                payload["actual_usage"] = _actual_usage(payload["usage"])
             h = {"X-Mock-Peer": app["name"]}; h.update(extra_hdr)
             return web.json_response(payload, headers=h)
 
@@ -354,7 +371,9 @@ async def chat_completions(request: web.Request):
         # usage chunk（仅当 stream_options.include_usage=true）
         if (body.get("stream_options") or {}).get("include_usage"):
             await resp.write(_chat_usage_chunk(cid, model, created, prompt_tokens, out_len,
-                                               cached_tokens=app.get("cached_tokens")))
+                                               cached_tokens=app.get("cached_tokens"),
+                                               actual_usage=app["actual_usage"]
+                                               or bool(body.get("emit_actual_usage"))))
 
         await resp.write(_DONE)
         await resp.write_eof()
@@ -490,6 +509,7 @@ def make_app(args):
     app["models_status"] = args.models_status
     app["chat_status"] = args.chat_status
     app["cached_tokens"] = args.cached_tokens
+    app["actual_usage"] = args.actual_usage
     app["stats"] = {"req_count": 0, "in_flight": 0}
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models_list)
@@ -512,12 +532,16 @@ def main():
     p.add_argument("--cached-tokens", type=int, default=None,
                    help="when set, usage chunks also carry prompt_tokens_details.cached_tokens (prefix cache); "
                         "unset keeps the wire byte-identical to before")
+    p.add_argument("--actual-usage", action="store_true",
+                   help="chat usage also carries a top-level actual_usage (some sglang builds); "
+                        "per request: {\"emit_actual_usage\": true}")
+    p.add_argument("--host", default="127.0.0.1", help="listen address (0.0.0.0 inside a pod)")
     args = p.parse_args()
 
     app = make_app(args)
     print(f"[mock-sse] {args.name} on :{args.port}  out={args.output_len}  "
           f"chunk={args.chunk_delay_ms}ms  prefill={args.prefill_delay_ms}ms", flush=True)
-    web.run_app(app, host="127.0.0.1", port=args.port, access_log=None, print=lambda *_: None)
+    web.run_app(app, host=args.host, port=args.port, access_log=None, print=lambda *_: None)
 
 
 if __name__ == "__main__":
