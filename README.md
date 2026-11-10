@@ -316,7 +316,9 @@ them, and a restarted instance comes back without it. It survives reloads and la
 route option (`rate_limit: false` in the ModelRoute's `nginx.values`) instead: it is part of the
 deployed configuration and applies to every instance. And the adaptive limit keeps moving on traffic it no
 longer caps -- down under overload, up under pressure -- so switching back on can bring a burst of
-429s until it settles.
+429s until it settles. Likewise `session_prio`'s turn-1 hold flag is neither set nor released while
+the switch is off: a flag left set from before is re-evaluated by the first request after it comes
+back on (and it expires with the TTFT TTL in any case).
 
 **Body logging** captures full request and response bodies asynchronously over a
 cosocket (a length-prefixed binary frame; the request path never blocks on it) and

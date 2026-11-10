@@ -351,6 +351,7 @@ end
 function _G.dbg_tps_status(opts)
     if util.opts_missing(opts) then return end
     ngx.header["Content-Type"] = "application/json"
+    local rl_enabled, rl_source = route.rate_limit_state(opts)   -- one read of the switch for both fields
     local td = ngx.shared[opts.tps_dict]   -- 原始 handle(即便热关也能看 EWMA)
     local rp = (opts.route_name or "?") .. ":"
     local ewmas, nousage = {}, {}
@@ -484,8 +485,8 @@ function _G.dbg_tps_status(opts)
         dict_free_space       = td and td:free_space() or nil,
         -- Rate-limit master switch: off means the TPS / concurrency 429s are not enforced even though
         -- everything above is still measured. Details: /_rate_limit_status.
-        rate_limit_enabled    = (route.rate_limit_state(opts)),
-        rate_limit_source     = select(2, route.rate_limit_state(opts)),
+        rate_limit_enabled    = rl_enabled,
+        rate_limit_source     = rl_source,
     }))
 end
 
