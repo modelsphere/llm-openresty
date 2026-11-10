@@ -171,6 +171,10 @@ type detailRecord struct {
 	CachedTokens     int64   `json:"cached_tokens"`
 	TotalTokens      int64   `json:"total_tokens"`
 	ReasoningTokens  int64   `json:"reasoning_tokens"`
+	// actual_usage.prompt_tokens_details.cached_tokens (some sglang builds send a second token
+	// count next to usage). Absent unless the response had actual_usage, so "not reported" and
+	// "reported 0" stay apart.
+	ActualCachedTokens *int64 `json:"actual_cached_tokens,omitempty"`
 }
 
 // extractDetail: 从 assembleEntry 解析好的 map 里抽出 metrics 明细，不带任何正文。
@@ -202,6 +206,10 @@ func extractDetail(m map[string]any) detailRecord {
 		CachedTokens:     u.cached,
 		TotalTokens:      u.total,
 		ReasoningTokens:  u.reasoning,
+	}
+	if u.hasActualCached {
+		v := u.actualCached
+		d.ActualCachedTokens = &v
 	}
 	if rm, ok := m["resp_meta"].(map[string]any); ok {
 		d.Model = getString(rm["model"])
@@ -1188,6 +1196,8 @@ func normalizePeer(m map[string]any) string {
 
 type usageTokens struct {
 	prompt, cached, compl, total, reasoning int64
+	actualCached                            int64 // actual_usage.prompt_tokens_details.cached_tokens
+	hasActualCached                         bool  // the response carried actual_usage with that field
 }
 
 // extractUsage: 从 resp_meta.usage 抽 token 计数，兼容 OpenAI(prompt/completion_tokens)
@@ -1199,6 +1209,13 @@ func extractUsage(m map[string]any) usageTokens {
 	rm, ok := m["resp_meta"].(map[string]any)
 	if !ok {
 		return u
+	}
+	if au, ok := rm["actual_usage"].(map[string]any); ok {
+		if d, ok := au["prompt_tokens_details"].(map[string]any); ok {
+			if v, ok := d["cached_tokens"].(float64); ok { // a number; null or missing = not reported
+				u.actualCached, u.hasActualCached = int64(v), true
+			}
+		}
 	}
 	us, ok := rm["usage"].(map[string]any)
 	if !ok {
@@ -1317,7 +1334,7 @@ const detailsColumns = "{" +
 	"'finish_reason':'VARCHAR','frt':'DOUBLE','lct':'DOUBLE','rt':'DOUBLE'," +
 	"'chunk_count':'BIGINT','req_bytes':'BIGINT','resp_bytes':'BIGINT'," +
 	"'prompt_tokens':'BIGINT','completion_tokens':'BIGINT','cached_tokens':'BIGINT'," +
-	"'total_tokens':'BIGINT','reasoning_tokens':'BIGINT'}"
+	"'total_tokens':'BIGINT','reasoning_tokens':'BIGINT','actual_cached_tokens':'BIGINT'}"
 
 // readDetailsJSON: 用显式 schema 读明细 jsonl 的 DuckDB 表达式。arg 是单个 sqlStr 路径
 // 或文件名列表（read_json 两者都接受）。rotateDetails 与 metricsHandler 共用，保证写/读
