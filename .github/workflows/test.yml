@@ -1,4 +1,5 @@
-# Unit tests for the Go components.
+# Unit tests: the Go components (bodylog-listener) and the Lua engine modules
+# (test/utest_*.lua, run with the resty CLI by test/run_lua_unit_tests.sh).
 #
 # Separate from release.yml so a pull request is tested without going anywhere
 # near the publish path. release.yml runs the same tests as a gate before it
@@ -7,13 +8,17 @@ name: test
 
 on:
   pull_request:
-    paths: &go_paths
+    paths: &test_paths
       - 'bodylog-listener-go/**'
       - 'Dockerfile.bodylog'
+      - 'lua/**'
+      - 'test/utest_*.lua'
+      - 'test/run_lua_unit_tests.sh'
+      - 'Dockerfile'
       - '.github/workflows/test.yml'
   push:
     branches: [main]
-    paths: *go_paths
+    paths: *test_paths
   workflow_dispatch:
 
 permissions:
@@ -37,3 +42,23 @@ jobs:
         env:
           CGO_ENABLED: 1
         run: go test ./...
+
+  lua:
+    # jammy, so the OpenResty pinned in the Dockerfile (OPENRESTY_VER) installs as is
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install openresty + resty CLI (the Dockerfile's version)
+        run: |
+          set -eux
+          ver=$(sed -n 's/^ARG OPENRESTY_VER=//p' Dockerfile)
+          test -n "$ver"
+          wget -qO - https://openresty.org/package/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/openresty.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu jammy main" \
+            | sudo tee /etc/apt/sources.list.d/openresty.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "openresty=$ver" "openresty-resty=$ver"
+
+      - name: lua unit tests
+        run: bash test/run_lua_unit_tests.sh /usr/local/openresty/bin/resty

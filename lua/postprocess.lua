@@ -44,12 +44,20 @@
 --       exceeds it, the framework gives up buffering, flushes what it has and
 --       passes the rest through un-transformed (fail-open, logged).
 --
--- Route opt: opts.postprocess = "<name>" selects the handler for that route.
--- Global fallback: _G.POSTPROCESS_DEFAULT = "<name>". nil in both = off.
+-- Route opt: opts.postprocess = "<name>" selects the handler for that route (one
+-- handler per route). Global fallback: _G.POSTPROCESS_DEFAULT = "<name>". nil in
+-- both = off. Built-in handlers (bottom of this file):
+--   vllm_format        -- normalize vLLM's response quirks (includes dropping actual_usage)
+--   strip_actual_usage -- only drop the top-level actual_usage some sglang builds add
 
 local M = {}
 
-local cjson = require "cjson.safe"   -- decode/encode return nil on error (no throw)
+-- decode/encode return nil on error (no throw). A private instance, so the setting
+-- below does not leak into other modules: decoded arrays keep an array marker and an
+-- empty one re-encodes as [] -- by default cjson writes every empty table as {}, which
+-- would turn the final usage chunk's "choices":[] into "choices":{} on a rewrite.
+local cjson = require("cjson.safe").new()
+cjson.decode_array_with_array_mt(true)
 local json_null = (require "cjson").null
 
 -- Cap on how much of a response may be accumulated in memory, so a large
@@ -206,6 +214,7 @@ local vllm_choice_null_fields = {
 local vllm_message_null_fields = { "refusal", "annotations", "audio", "function_call" }
 local vllm_top_drop_fields = {
     "service_tier", "system_fingerprint", "kv_transfer_params", "ec_transfer_params",
+    "actual_usage",   -- some sglang builds; see strip_actual_usage below
 }
 
 local function vllm_drop_null_fields(obj, fields)
@@ -281,72 +290,95 @@ local function vllm_rewrite_json(payload)
     return enc or payload                            -- fail open on an encode error
 end
 
--- Rewrite one SSE data frame. Leave unchanged frames byte-identical.
-local function vllm_rewrite_sse_line(line)
+-- Rewrite one SSE data frame with rewrite_json. Leave unchanged frames byte-identical.
+local function rewrite_sse_line(line, rewrite_json)
     local payload = line:match("^data:%s*(.-)%s*\r?\n?$")
     if not payload or payload == "" or payload == "[DONE]" then
         return line                                  -- comment/heartbeat/terminator/non-data
     end
-    local rewritten = vllm_rewrite_json(payload)
+    local rewritten = rewrite_json(payload)
     if rewritten == payload then return line end
     return "data: " .. rewritten .. (line:match("\r?\n$") or "")
 end
 
--- vllm_format: normalize SSE frames and complete JSON responses. SSE is handled
--- line by line; non-stream JSON is capped and buffered until eof.
-M.register("vllm_format", {
-    buffered = false,
-    rewrites_length = true,
-    accept_status = function(status) return status >= 200 and status < 300 end,
-    header = function(ctx, opts)
-        local content_type = (ngx.header.content_type or ""):lower()
-        ctx.pp_sse = content_type:find("text/event-stream", 1, true) ~= nil
-        ctx.pp_json = not ctx.pp_sse and content_type:find("application/json", 1, true) ~= nil
-    end,
-    body = function(chunk, eof, ctx, opts)
-        if ctx.pp_json then
-            if ctx.pp_json_overflow then return nil end
-            local buf = ctx.pp_json_buf
-            if not buf then
-                buf = {}
-                ctx.pp_json_buf = buf
-                ctx.pp_json_size = 0
-            end
-            if chunk and chunk ~= "" then
-                buf[#buf + 1] = chunk
-                ctx.pp_json_size = ctx.pp_json_size + #chunk
-            end
-            if ctx.pp_json_size > M.DEFAULT_MAX_BUFFER then
-                ngx.log(ngx.ERR, "postprocess: JSON body over ", M.DEFAULT_MAX_BUFFER,
-                        " bytes; passing through un-transformed")
-                ctx.pp_json_overflow = true
-                ctx.pp_json_buf = nil
-                return table.concat(buf)
-            end
-            if not eof then return "" end
-            ctx.pp_json_buf = nil
-            return vllm_rewrite_json(table.concat(buf))
-        end
-        if not ctx.pp_sse then return nil end        -- other media types pass through
-        local pending = (ctx.pp_leftover or "") .. (chunk or "")
-        ctx.pp_leftover = nil
-        local out, pos = {}, 1
-        while true do
-            local nl = pending:find("\n", pos, true)
-            if not nl then
-                local rest = pending:sub(pos)        -- incomplete trailing line
-                if eof then
-                    out[#out + 1] = vllm_rewrite_sse_line(rest)
-                else
-                    ctx.pp_leftover = rest           -- stash; the next chunk completes it
+-- A handler that rewrites OpenAI-style responses one JSON document at a time:
+-- each SSE data frame, or a whole non-stream JSON body (capped and buffered until
+-- eof). rewrite_json(payload) -> payload' returns its input unchanged (the same
+-- string) when there is nothing to do, so untouched frames stay byte-identical.
+local function json_rewrite_handler(rewrite_json)
+    return {
+        buffered = false,
+        rewrites_length = true,
+        accept_status = function(status) return status >= 200 and status < 300 end,
+        header = function(ctx, opts)
+            local content_type = (ngx.header.content_type or ""):lower()
+            ctx.pp_sse = content_type:find("text/event-stream", 1, true) ~= nil
+            ctx.pp_json = not ctx.pp_sse and content_type:find("application/json", 1, true) ~= nil
+        end,
+        body = function(chunk, eof, ctx, opts)
+            if ctx.pp_json then
+                if ctx.pp_json_overflow then return nil end
+                local buf = ctx.pp_json_buf
+                if not buf then
+                    buf = {}
+                    ctx.pp_json_buf = buf
+                    ctx.pp_json_size = 0
                 end
-                break
+                if chunk and chunk ~= "" then
+                    buf[#buf + 1] = chunk
+                    ctx.pp_json_size = ctx.pp_json_size + #chunk
+                end
+                if ctx.pp_json_size > M.DEFAULT_MAX_BUFFER then
+                    ngx.log(ngx.ERR, "postprocess: JSON body over ", M.DEFAULT_MAX_BUFFER,
+                            " bytes; passing through un-transformed")
+                    ctx.pp_json_overflow = true
+                    ctx.pp_json_buf = nil
+                    return table.concat(buf)
+                end
+                if not eof then return "" end
+                ctx.pp_json_buf = nil
+                return rewrite_json(table.concat(buf))
             end
-            out[#out + 1] = vllm_rewrite_sse_line(pending:sub(pos, nl))
-            pos = nl + 1
-        end
-        return table.concat(out)
-    end,
-})
+            if not ctx.pp_sse then return nil end    -- other media types pass through
+            local pending = (ctx.pp_leftover or "") .. (chunk or "")
+            ctx.pp_leftover = nil
+            local out, pos = {}, 1
+            while true do
+                local nl = pending:find("\n", pos, true)
+                if not nl then
+                    local rest = pending:sub(pos)    -- incomplete trailing line
+                    if eof then
+                        out[#out + 1] = rewrite_sse_line(rest, rewrite_json)
+                    else
+                        ctx.pp_leftover = rest       -- stash; the next chunk completes it
+                    end
+                    break
+                end
+                out[#out + 1] = rewrite_sse_line(pending:sub(pos, nl), rewrite_json)
+                pos = nl + 1
+            end
+            return table.concat(out)
+        end,
+    }
+end
+
+-- vllm_format: normalize vLLM's SSE frames and complete JSON responses.
+M.register("vllm_format", json_rewrite_handler(vllm_rewrite_json))
+
+-- strip_actual_usage: drop the top-level "actual_usage" object some sglang builds add
+-- next to "usage" (a second token count that clients and billing should not see; the
+-- bodylog still records it, since it runs before post-processing). Nothing else is
+-- touched. A plain substring test runs first, so only the frame that carries the
+-- field -- the final usage chunk of a stream -- is decoded at all.
+local function strip_actual_usage_json(payload)
+    if not payload:find('"actual_usage"', 1, true) then return payload end
+    local obj = cjson.decode(payload)
+    if type(obj) ~= "table" or obj.actual_usage == nil then return payload end
+    obj.actual_usage = nil
+    return cjson.encode(obj) or payload              -- fail open on an encode error
+end
+M.strip_actual_usage_json = strip_actual_usage_json  -- exposed for unit tests
+
+M.register("strip_actual_usage", json_rewrite_handler(strip_actual_usage_json))
 
 return M

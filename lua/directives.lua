@@ -62,7 +62,7 @@ M.DIRECTIVES = {
 
   { key = "default_max", label = "Default peer maximum", group = "Capacity & failover", kind = "number",
     detail = "In-flight requests allowed per peer when the peer entry names no maximum of its own. The static pool maximum -- what the adaptive limit is bounded by -- is the largest per-tier sum of peer maximums." },
-  { key = "rate_limit", label = "Rate limiting", group = "Capacity & failover", kind = "boolean",
+  { key = "load_rate_limit", label = "Load-based rate limiting", group = "Capacity & failover", kind = "boolean",
     detail = "Master switch for the load-based 429s: concurrency (the static pool limit or the adaptive one, session_prio's per-turn shares included), TTFT (session_prio's graded gate included) and decode rate. Off lets those requests through while everything behind them -- the measurements, the adaptive limit, health bans and the 503 for an all-banned pool -- keeps running, and /_rate_limit_status counts what would have been refused. Content rules (reject_rules) are not covered. A runtime override from /_rate_limit_toggle wins over this value. Accepts true/false (also yes/no, on/off, 1/0); anything else is logged and the default stands." },
   { hidden = true, key = "rt_limit_factor", label = "Runtime limit factor", group = "Capacity & failover", kind = "number",
     detail = "Scales the pool limit at which requests are turned away for concurrency: a request is refused once in-flight requests reach limit x factor. Must be over 0; anything else is logged and the global default stands." },

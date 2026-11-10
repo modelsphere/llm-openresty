@@ -238,6 +238,42 @@ pairs. The fix for a small pool is to *lower* `session_prio_r_new`, or supply a
 also that under adaptive concurrency the limit itself is a float that moves over
 time, so the effective number of distinct ceilings moves with it.
 
+## Response post-processing
+
+A route can rewrite upstream responses before they reach the client, to hide backend
+quirks. It is off unless the route names a handler (`lua/postprocess.lua`):
+
+```yaml
+# ModelRoute
+spec:
+  nginx:
+    values:
+      postprocess: strip_actual_usage
+```
+
+(in a route conf: `postprocess = "strip_actual_usage"`; `_G.POSTPROCESS_DEFAULT` in
+`session_base.conf` sets one for every route that names none.)
+
+| handler | what it does |
+|---|---|
+| `strip_actual_usage` | removes the top-level `actual_usage` some sglang builds return next to `usage` (a second token count, e.g. with different `cached_tokens`). Nothing else is touched. |
+| `vllm_format` | normalizes vLLM's response shape: drops vLLM's placeholder fields when they are null (`prompt_token_ids`, `prompt_logprobs`, `logprobs`, `token_ids`, `refusal`, `annotations`, ...), always drops `stop_reason`, `service_tier`, `system_fingerprint`, `kv_transfer_params`, `ec_transfer_params` and `actual_usage`, and renames `reasoning` to `reasoning_content` and `created_cache_tokens` to `cache_write_tokens`. |
+
+How it behaves:
+
+- One handler per route.
+- Only 2xx responses, and only `text/event-stream` (each `data:` frame) and
+  `application/json` bodies; anything else passes through.
+- A frame or body with nothing to change is sent byte-identical. A changed one is
+  re-encoded, so its key order and `/` escaping can differ from the backend's.
+- `Content-Length` is dropped on the route's 2xx responses (they are sent chunked),
+  and a non-stream JSON body is held until it is complete (up to 8 MiB; a larger
+  one passes through unchanged). Streams are not held: frames go out as they arrive.
+- Fail-open: a frame that does not parse, or a handler error, leaves the original bytes.
+- The bodylog sees the raw upstream response (it runs first). The listener keeps
+  `usage` and `actual_usage` in the record's `resp_meta`, so a stripped
+  `actual_usage` is still in the bodylog.
+
 ## Authentication
 
 Keys are read from a file, default `/etc/openresty/api-keys/keys`, overridable with
@@ -305,15 +341,17 @@ never added to the real 429 counters. Content rules (`reject_rules`) have their 
 switch and are not covered. Three layers, highest first:
 - the runtime override `POST /<route>/_rate_limit_toggle?on=0|1` (127.0.0.1 only) takes effect without a reload
   and survives one; `?reset=1` removes it;
-- the route option `rate_limit` (route conf, or `nginx.values` on a ModelRoute);
-- the global `_G.RATE_LIMIT_ENABLED` in `session_base.conf`.
+- the route option `load_rate_limit` (route conf, or `nginx.values` on a ModelRoute). Named so,
+  not `rate_limit`: on a ModelRoute that key is a video route's download speed limit, and the CRD
+  rejects it on llm routes;
+- the global `_G.LOAD_RATE_LIMIT_ENABLED` in `session_base.conf`.
 
 Things to watch when switching it off at runtime. The override lives in this openresty
 instance's shared memory: with several replicas (e.g. two openresty pods) send it to every one of
 them, and a restarted instance comes back without it. It survives reloads and lasts until
 `?reset=1` or a full restart, so remove it once the incident is over (`/_rate_limit_status` shows
 `source: runtime` while it is in place). To keep limiting off for longer than an incident, set the
-route option (`rate_limit: false` in the ModelRoute's `nginx.values`) instead: it is part of the
+route option (`load_rate_limit: false` in the ModelRoute's `nginx.values`) instead: it is part of the
 deployed configuration and applies to every instance. And the adaptive limit keeps moving on traffic it no
 longer caps -- down under overload, up under pressure -- so switching back on can bring a burst of
 429s until it settles. Likewise `session_prio`'s turn-1 hold flag is neither set nor released while
@@ -387,11 +425,15 @@ cd test
 ./test_lazy_init_timing.sh      # lazy route registration across workers
 ```
 
-Pure-Lua unit tests need only `resty`:
+Pure-Lua unit tests (`test/utest_*.lua`) need only `resty`. Run them all from the
+repository root, as CI does on every pull request that touches `lua/` or a unit test:
 
 ```bash
-resty utest_surgical_normalize.lua ../lua/reqtransform.lua
+bash test/run_lua_unit_tests.sh [path/to/resty]
 ```
+
+It exits non-zero if any test fails, or if it finds none. A test that needs a special
+invocation (a shared dict, another working directory) is listed in the script.
 
 A note on how these are written: several assertions exist specifically to fail when
 the thing under test is removed. A check that only confirms "no error appeared" also

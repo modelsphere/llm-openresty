@@ -272,6 +272,7 @@ type respFields struct {
 	finishReason string
 	model        string
 	usage        any
+	actualUsage  any // some sglang builds: a second token count next to usage (openresty may strip it from the client response)
 	toolCalls    []any
 	stopReason   string // Anthropic
 	errorObj     any
@@ -364,6 +365,9 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 	}
 	if u, ok := obj["usage"].(map[string]any); ok && u != nil {
 		rf.usage = u
+	}
+	if u, ok := obj["actual_usage"].(map[string]any); ok && u != nil {
+		rf.actualUsage = u
 	}
 	if m, ok := obj["model"].(string); ok && m != "" {
 		rf.model = m
@@ -489,6 +493,9 @@ func buildRespMeta(rf respFields) map[string]any {
 	}
 	if rf.usage != nil {
 		m["usage"] = rf.usage
+	}
+	if rf.actualUsage != nil {
+		m["actual_usage"] = rf.actualUsage
 	}
 	if len(rf.toolCalls) > 0 {
 		m["tool_calls"] = reassembleToolCalls(rf.toolCalls)
