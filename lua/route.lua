@@ -68,7 +68,7 @@ M.DEFAULTS = {
     default_max                = global("MAX_CONCURRENCY_PER_PEER"),
     rt_limit_factor            = global("RT_LIMIT_FACTOR"),
     -- `~= false`: a session_base.conf older than this switch has no such global, and limiting must stay on
-    rate_limit                 = function() return _G.RATE_LIMIT_ENABLED ~= false end,
+    load_rate_limit            = function() return _G.LOAD_RATE_LIMIT_ENABLED ~= false end,
     max_more_tries             = 2,
     cross_tier_fallback        = true,
     -- health checks / routing
@@ -223,12 +223,14 @@ function _G.register_route(name, opts_factory)
                 " is invalid (need a positive number) - falling back to ", D("rt_limit_factor"))
         opts.rt_limit_factor = D("rt_limit_factor")
     end
-    -- rate_limit: master switch for the load-based 429s (concurrency -- static or adaptive --, TTFT, TPS).
+    -- load_rate_limit: master switch for the load-based 429s (concurrency -- static or adaptive --, TTFT, TPS).
+    -- Not named rate_limit: on a ModelRoute that key is a video route's download speed limit, and the
+    -- ModelRoute CRD rejects it on llm routes.
     -- Off lets those requests through; measurement, AIMD and the 503 for an all-banned pool are unchanged.
     -- A runtime override (/_rate_limit_toggle) wins over this; see M.rate_limit_state.
     -- An unparsable value falls back to the global default, so it must not be reported as source=route.
-    opts._rate_limit_from_route = opts.rate_limit ~= nil and util.parse_bool(opts.rate_limit) ~= nil
-    util.bool_opt(opts, "rate_limit", D("rate_limit"), name)
+    opts._load_rate_limit_from_route = opts.load_rate_limit ~= nil and util.parse_bool(opts.load_rate_limit) ~= nil
+    util.bool_opt(opts, "load_rate_limit", D("load_rate_limit"), name)
     util.bool_opt(opts, "cch_default_enabled", _G.CCH_STRIP_DEFAULT_ENABLED == true, name)
     -- Kimi tool_call_id normalize 每路由默认（factory 显式设 false 即永久关，重启也不恢复；缺省回落全局 _G.KIMI_NORMALIZE_DEFAULT_ENABLED）
     util.bool_opt(opts, "kimi_normalize_default_enabled", _G.KIMI_NORMALIZE_DEFAULT_ENABLED == true, name)
@@ -720,8 +722,8 @@ end
 -- Three layers, highest first:
 --   runtime  ngx.shared[opts.cch_ctl_dict] "rate_limit_enabled" = 1/0, set by /_rate_limit_toggle;
 --            no reload, survives one; ?reset=1 removes it
---   route    opts.rate_limit (route conf / ModelRoute nginx.values), parsed in register_route
---   global   _G.RATE_LIMIT_ENABLED (session_base.conf), the route option's default
+--   route    opts.load_rate_limit (route conf / ModelRoute nginx.values), parsed in register_route
+--   global   _G.LOAD_RATE_LIMIT_ENABLED (session_base.conf), the route option's default
 -- Returns enabled, source ("runtime" | "route" | "global").
 local RL_KEY = "rate_limit_enabled"
 M.RATE_LIMIT_REASONS = { "concurrency", "ttft", "tps" }
@@ -730,8 +732,8 @@ function M.rate_limit_state(opts)
     local ctl = ngx.shared[opts.cch_ctl_dict]
     local ovr = ctl and ctl:get(RL_KEY)
     if ovr ~= nil then return ovr == 1, "runtime" end
-    local src = opts._rate_limit_from_route and "route" or "global"
-    return opts.rate_limit ~= false, src
+    local src = opts._load_rate_limit_from_route and "route" or "global"
+    return opts.load_rate_limit ~= false, src
 end
 
 -- With the switch off, a request that trips a gate is let through and counted here instead: per

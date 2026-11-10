@@ -502,8 +502,8 @@ local function rate_limit_view(opts)
         enabled          = enabled,
         source           = source,                       -- runtime | route | global
         runtime_override = override,
-        route_value      = opts.rate_limit,              -- route conf, or the global when unset
-        global_default   = _G.RATE_LIMIT_ENABLED ~= false,
+        route_value      = opts.load_rate_limit,              -- route conf, or the global when unset
+        global_default   = _G.LOAD_RATE_LIMIT_ENABLED ~= false,
         covers           = route.RATE_LIMIT_REASONS,
         -- While the switch is off: per gate, the requests that tripped it and were let through.
         -- A trip, not a refusal: a probe slot or a warm turn in session_prio's soft band might have

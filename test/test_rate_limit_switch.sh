@@ -4,7 +4,7 @@
 # Covers the three load-based 429 exits and what must NOT change with the switch off:
 #   S1-S4  static concurrency limit: on -> 429; runtime off -> all 200, counted as would-reject and NOT
 #          as real 429s; ?reset=1 -> back to the route/global value; bad ?on -> 400
-#   S5-S6  route conf `rate_limit = false` -> source=route, all 200; runtime on=1 wins over it
+#   S5-S6  route conf `load_rate_limit = false` -> source=route, all 200; runtime on=1 wins over it
 #   S7     adaptive concurrency route: off -> all 200
 #   S8     the runtime override survives `openresty -s reload`
 #   S9     TTFT 429: on -> 429; off -> all 200, would_reject.ttft > 0
@@ -64,14 +64,14 @@ cat <<'EOF'
     _G.TPS_BUCKETS = {5,10,20,40,80,150,300}
     _G.ADAPTIVE_CC_HOLD_WHEN_IDLE = false
     _G.TPS_LIMIT_TPS = 20            -- pinned, not inherited from session_base.conf
-    _G.RATE_LIMIT_ENABLED = true     -- pinned likewise
+    _G.LOAD_RATE_LIMIT_ENABLED = true     -- pinned likewise
     local tight = {{"127.0.0.1",28951,"m1",0,1},{"127.0.0.1",28952,"m2",0,1}}   -- static max = 2
     local wide  = {{"127.0.0.1",28951,"m1"},{"127.0.0.1",28952,"m2"},{"127.0.0.1",28953,"m3"}}
     local C = {default_max=50, bodylog_default_enabled=false, health_check_interval=2}
     local function R(x) local t={} for k,v in pairs(C) do t[k]=v end for k,v in pairs(x) do t[k]=v end return t end
     _G.register_route("st", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=false}) end)
     _G.register_route("ac", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=true}) end)
-    _G.register_route("rf", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=false, rate_limit=false}) end)
+    _G.register_route("rf", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=false, load_rate_limit=false}) end)
     _G.register_route("tt", function() return R({peers=wide, adaptive_cc=false, ttft_limit_ms=400, ttft_window=3, ttft_ttl=8,
                                                  ttft_probe_window=3, ttft_probe_per_window=2}) end)
     _G.register_route("tp", function() return R({peers=wide, adaptive_cc=false, tps_limit_tps=50, tps_window=3, tps_ttl=8,
@@ -86,7 +86,7 @@ cat <<'EOF'
                                                  ttft_window=3, ttft_ttl=30, ttft_probe_window=3, ttft_probe_per_window=2}) end)
     _G.register_route("sp", function() return R({peers=wide, adaptive_cc=false, session_prio=true, tps_limit_tps=50, tps_window=3,
                                                  tps_ttl=8, tps_probe_window=3, tps_probe_per_window=2, tps_min_decode_s=0.3}) end)
-    _G.register_route("rv", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=false, rate_limit="maybe"}) end)
+    _G.register_route("rv", function() return R({peers=tight, rt_limit_factor=1, adaptive_cc=false, load_rate_limit="maybe"}) end)
   }
 EOF
 for r in $ROUTES; do p=$(port_of $r); cat <<EOF
@@ -148,7 +148,7 @@ r=$(burst st 20 1500 5 5); limited "$r" && ok "S3 st on again: 429 ($r)" || no "
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$(U st)/_rate_limit_toggle?on=maybe"); [ "$code" = 400 ] && ok "S4 ?on=maybe -> 400" || no "S4 bad on -> $code"
 o=$(tog st reset_counts=1); [ "$(echo "$o" | js "d['would_reject']['concurrency']")" = "0" ] && ok "S4 reset_counts=1 zeroes the counts" || no "S4 reset_counts: $o"
 
-# ── route conf rate_limit=false ──
+# ── route conf load_rate_limit=false ──
 [ "$(st rf "d['enabled']")" = "False" ] && [ "$(st rf "d['source']")" = "route" ] && ok "S5 rf: rate_limit=false -> enabled=false, source=route" || no "S5 rf: $(curl -s $(U rf)/_rate_limit_status)"
 r=$(burst rf 20 1500 5 5); allok "$r" 20 && ok "S5 rf: all 200 ($r)" || no "S5 rf: $r"
 tog rf on=1 >/dev/null; r=$(burst rf 20 1500 5 5); limited "$r" && ok "S6 runtime on=1 beats route false: 429 ($r)" || no "S6 override not applied: $r"
@@ -186,7 +186,7 @@ code=$(fire dd 20 5 5); [ "$code" = 503 ] && ok "S11 all peers banned -> 503 wit
 v=$(curl -s "$(U st)/_tps_status" | js "(d['rate_limit_enabled'], d['rate_limit_source'])"); [ "$v" = "(True, 'global')" ] && ok "S12 /_tps_status reports the switch $v" || no "S12 tps_status: $v"
 v=$(curl -s "$(U st)/_429_status?all=1" | js "sorted(d['rate_limit'].keys())"); echo "$v" | grep -q "'tt'" && ok "S12 /_429_status?all=1 lists every route's switch" || no "S12 429_status: $v"
 v=$(curl -s "$(U st)/_429_status" | js "list(d['by_reason'].keys())"); echo "$v" | grep -q would && no "S12 would-reject leaked into by_reason: $v" || ok "S12 by_reason holds real 429s only"
-v=$(curl -s "$(U rf)/_route_opts" | js "[x for x in d.get('directives',[]) if x['key']=='rate_limit'][0]['value']"); [ "$v" = "False" ] && ok "S12 /_route_opts: rate_limit value=False on rf" || no "S12 route_opts: $v"
+v=$(curl -s "$(U rf)/_route_opts" | js "[x for x in d.get('directives',[]) if x['key']=='load_rate_limit'][0]['value']"); [ "$v" = "False" ] && ok "S12 /_route_opts: load_rate_limit value=False on rf" || no "S12 route_opts: $v"
 
 # ── session_prio: per-turn concurrency share ── (pool of 10; turn 1 capped at 8.5)
 # 10 concurrent: the 10th sees 9 in flight -- over turn 1's 8.5, under the pool's 10.

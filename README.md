@@ -305,15 +305,17 @@ never added to the real 429 counters. Content rules (`reject_rules`) have their 
 switch and are not covered. Three layers, highest first:
 - the runtime override `POST /<route>/_rate_limit_toggle?on=0|1` (127.0.0.1 only) takes effect without a reload
   and survives one; `?reset=1` removes it;
-- the route option `rate_limit` (route conf, or `nginx.values` on a ModelRoute);
-- the global `_G.RATE_LIMIT_ENABLED` in `session_base.conf`.
+- the route option `load_rate_limit` (route conf, or `nginx.values` on a ModelRoute). Named so,
+  not `rate_limit`: on a ModelRoute that key is a video route's download speed limit, and the CRD
+  rejects it on llm routes;
+- the global `_G.LOAD_RATE_LIMIT_ENABLED` in `session_base.conf`.
 
 Things to watch when switching it off at runtime. The override lives in this openresty
 instance's shared memory: with several replicas (e.g. two openresty pods) send it to every one of
 them, and a restarted instance comes back without it. It survives reloads and lasts until
 `?reset=1` or a full restart, so remove it once the incident is over (`/_rate_limit_status` shows
 `source: runtime` while it is in place). To keep limiting off for longer than an incident, set the
-route option (`rate_limit: false` in the ModelRoute's `nginx.values`) instead: it is part of the
+route option (`load_rate_limit: false` in the ModelRoute's `nginx.values`) instead: it is part of the
 deployed configuration and applies to every instance. And the adaptive limit keeps moving on traffic it no
 longer caps -- down under overload, up under pressure -- so switching back on can bring a burst of
 429s until it settles. Likewise `session_prio`'s turn-1 hold flag is neither set nor released while
