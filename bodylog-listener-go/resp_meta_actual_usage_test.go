@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -58,3 +59,40 @@ func TestRespMetaKeepsActualUsage(t *testing.T) {
 		t.Errorf("actual_usage present though upstream sent none: %v", meta)
 	}
 }
+
+// The details line (what bodylog-exporter reads) carries actual_usage's cached_tokens as
+// actual_cached_tokens next to cached_tokens -- only when the response reported one.
+func TestDetailActualCachedTokens(t *testing.T) {
+	usage := `{"prompt_tokens":4096,"completion_tokens":128,"total_tokens":4224,"prompt_tokens_details":{"cached_tokens":2048}}`
+	cases := []struct {
+		name, extra string
+		want        *int64
+	}{
+		{"reported", `,"actual_usage":{"prompt_tokens":4096,"prompt_tokens_details":{"cached_tokens":3072}}`, ptr(3072)},
+		{"reported zero", `,"actual_usage":{"prompt_tokens_details":{"cached_tokens":0}}`, ptr(0)},
+		{"null", `,"actual_usage":{"prompt_tokens_details":{"cached_tokens":null}}`, nil},
+		{"no details", `,"actual_usage":{"prompt_tokens":4096}`, nil},
+		{"absent", ``, nil},
+	}
+	for _, c := range cases {
+		body := `{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":` + usage + c.extra + `}`
+		m := map[string]any{"status": float64(200), "resp_meta": buildRespMeta(extractResp(body))}
+		d := extractDetail(m)
+		if d.CachedTokens != 2048 {
+			t.Errorf("%s: cached_tokens = %d, want 2048 (usage is unaffected)", c.name, d.CachedTokens)
+		}
+		switch {
+		case c.want == nil && d.ActualCachedTokens != nil:
+			t.Errorf("%s: actual_cached_tokens = %d, want absent", c.name, *d.ActualCachedTokens)
+		case c.want != nil && (d.ActualCachedTokens == nil || *d.ActualCachedTokens != *c.want):
+			t.Errorf("%s: actual_cached_tokens = %v, want %d", c.name, d.ActualCachedTokens, *c.want)
+		}
+		line, _ := json.Marshal(d)
+		has := strings.Contains(string(line), `"actual_cached_tokens"`)
+		if has != (c.want != nil) {
+			t.Errorf("%s: details line has actual_cached_tokens=%v, want %v: %s", c.name, has, c.want != nil, line)
+		}
+	}
+}
+
+func ptr(v int64) *int64 { return &v }

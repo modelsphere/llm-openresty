@@ -28,8 +28,11 @@ type detailRecord struct {
 	PromptTokens     int64   `json:"prompt_tokens"`
 	CompletionTokens int64   `json:"completion_tokens"`
 	CachedTokens     int64   `json:"cached_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
-	ReasoningTokens  int64   `json:"reasoning_tokens"`
+	// actual_usage's cached_tokens (some sglang builds report a second count next to usage);
+	// absent from the line when the response had none
+	ActualCachedTokens *int64 `json:"actual_cached_tokens"`
+	TotalTokens        int64  `json:"total_tokens"`
+	ReasoningTokens    int64  `json:"reasoning_tokens"`
 }
 
 type metrics struct {
@@ -37,6 +40,7 @@ type metrics struct {
 	promptTok        *prometheus.CounterVec // {backend,model}
 	completionTok    *prometheus.CounterVec
 	cachedTok        *prometheus.CounterVec
+	actualCachedTok  *prometheus.CounterVec
 	reasoningTok     *prometheus.CounterVec
 	totalTok         *prometheus.CounterVec
 	reqBytes         *prometheus.CounterVec
@@ -84,12 +88,16 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		promptTok:     ctr("bodylog_prompt_tokens_total", "prompt token 累计", srbm),
 		completionTok: ctr("bodylog_completion_tokens_total", "completion token 累计", srbm),
 		cachedTok:     ctr("bodylog_cached_tokens_total", "cached token 累计", srbm),
-		reasoningTok:  ctr("bodylog_reasoning_tokens_total", "reasoning token 累计", srbm),
-		totalTok:      ctr("bodylog_total_tokens_total", "total token 累计", srbm),
-		reqBytes:      ctr("bodylog_req_bytes_total", "请求体字节累计", srbm),
-		respBytes:     ctr("bodylog_resp_bytes_total", "响应体字节累计", srbm),
-		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
-		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []string{"service", "route", "backend", "model", "stream"}),
+		// usage.prompt_tokens_details.cached_tokens is what clients and billing see; some sglang
+		// builds also send actual_usage with the engine's own count, which can differ. This is that
+		// one, counted only for responses that reported it.
+		actualCachedTok: ctr("bodylog_actual_cached_tokens_total", "actual_usage.prompt_tokens_details.cached_tokens 累计(仅上游返回 actual_usage 的请求)", srbm),
+		reasoningTok:    ctr("bodylog_reasoning_tokens_total", "reasoning token 累计", srbm),
+		totalTok:        ctr("bodylog_total_tokens_total", "total token 累计", srbm),
+		reqBytes:        ctr("bodylog_req_bytes_total", "请求体字节累计", srbm),
+		respBytes:       ctr("bodylog_resp_bytes_total", "响应体字节累计", srbm),
+		finishReason:    ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
+		rt:              hist("bodylog_rt_seconds", "总响应时间(秒)", []string{"service", "route", "backend", "model", "stream"}),
 		// prompt_bucket:输入长度分档,用于“某 context 区间的 TTFT 分位数”。见 promptBucket()。
 		ttft: hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", srbmp),
 		// 2026-08-26:分母从 rt 改为 rt-frt(扣除 prefill),仅流式 + 下限过滤,与 openresty 引擎
@@ -106,7 +114,7 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		recovers:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
 	}
 	reg.MustRegister(
-		m.requests, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
+		m.requests, m.promptTok, m.completionTok, m.cachedTok, m.actualCachedTok, m.reasoningTok, m.totalTok,
 		m.reqBytes, m.respBytes, m.finishReason, m.rt, m.ttft, m.outTokPerSec,
 		m.overallTokPerSec, m.decodeTokPerSec,
 		m.lines, m.offset, m.lastTs, m.recovers,
@@ -172,6 +180,9 @@ func (m *metrics) observe(d detailRecord) {
 	}
 	if d.CachedTokens > 0 {
 		m.cachedTok.WithLabelValues(service, route, backend, model).Add(float64(d.CachedTokens))
+	}
+	if d.ActualCachedTokens != nil && *d.ActualCachedTokens > 0 {
+		m.actualCachedTok.WithLabelValues(service, route, backend, model).Add(float64(*d.ActualCachedTokens))
 	}
 	if d.ReasoningTokens > 0 {
 		m.reasoningTok.WithLabelValues(service, route, backend, model).Add(float64(d.ReasoningTokens))
