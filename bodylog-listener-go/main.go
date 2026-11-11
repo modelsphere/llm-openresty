@@ -329,11 +329,22 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 			// strip_actual_usage removes the per-choice copy from the client response the
 			// value is gone for good. Last writer wins, matching the top-level handling
 			// below: a later frame's numbers are the final ones.
-			if u, ok := cm["usage"].(map[string]any); ok && u != nil {
-				rf.usage = u
-			}
-			if u, ok := cm["actual_usage"].(map[string]any); ok && u != nil {
-				rf.actualUsage = u
+			//
+			// ONLY ON THE FINAL FRAME. Measured on that build, the per-choice numbers are the
+			// FINAL totals: with max_tokens=20 over ~18 content frames, the finish frame's
+			// choices[0].usage read completion_tokens=20 and matched the trailing frame's
+			// top-level copy field for field. But nothing in the wire format says a per-choice
+			// usage could not be a PER-CHUNK delta on some other build, and recording a partial
+			// count as the request's total would be worse than recording none: a missing usage
+			// is visibly missing, a wrong one is not. So this is accepted only where the final
+			// totals belong -- the frame that closes the choice.
+			if fr, _ := cm["finish_reason"].(string); fr != "" {
+				if u, ok := cm["usage"].(map[string]any); ok && u != nil {
+					rf.usage = u
+				}
+				if u, ok := cm["actual_usage"].(map[string]any); ok && u != nil {
+					rf.actualUsage = u
+				}
 			}
 		}
 	}

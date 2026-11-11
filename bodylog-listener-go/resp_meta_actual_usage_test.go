@@ -148,3 +148,31 @@ func TestRespMetaTrailingFrameWinsOverPerChoice(t *testing.T) {
 			got.Actual.Completion, b)
 	}
 }
+
+// A PER-CHUNK usage in a CONTENT frame must be ignored. On the build this was measured against, the
+// per-choice numbers appear only on the frame that closes the choice and are the final totals. The
+// wire format does not guarantee that, though: another build could put a per-chunk delta in every
+// content frame, and recording one of those as the request's total would be worse than recording
+// nothing -- a missing usage is visibly missing, a wrong one silently is not. Hence the finish_reason
+// gate, pinned here: only the closing frame's numbers are taken, and a request whose stream carries
+// nothing but per-chunk counts records no usage at all rather than a partial one.
+func TestRespMetaIgnoresPerChunkUsageInContentFrames(t *testing.T) {
+	body := `data: {"id":"c6","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null,` +
+		`"usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101}}]}` + "\n\n" +
+		`data: {"id":"c6","choices":[{"index":0,"delta":{"content":"b"},"finish_reason":null,` +
+		`"usage":{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	b, _ := json.Marshal(buildRespMeta(extractResp(body)))
+	var got struct {
+		Usage *struct {
+			Completion int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("resp_meta not valid JSON: %v", err)
+	}
+	if got.Usage != nil {
+		t.Errorf("a per-chunk usage from a content frame was recorded as the total (completion_tokens=%d): %s",
+			got.Usage.Completion, b)
+	}
+}
