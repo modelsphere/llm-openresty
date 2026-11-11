@@ -48,7 +48,8 @@
 -- handler per route). Global fallback: _G.POSTPROCESS_DEFAULT = "<name>". nil in
 -- both = off. Built-in handlers (bottom of this file):
 --   vllm_format        -- normalize vLLM's response quirks (includes dropping actual_usage)
---   strip_actual_usage -- only drop the top-level actual_usage some sglang builds add
+--   strip_actual_usage -- drop the actual_usage some sglang builds add, at both of the
+--                         placements they use: top level, and inside each choice
 
 local M = {}
 
@@ -395,16 +396,41 @@ end
 -- vllm_format: normalize vLLM's SSE frames and complete JSON responses.
 M.register("vllm_format", json_rewrite_handler(vllm_rewrite_json))
 
--- strip_actual_usage: drop the top-level "actual_usage" object some sglang builds add
--- next to "usage" (a second token count that clients and billing should not see; the
--- bodylog still records it, since it runs before post-processing). Nothing else is
--- touched. A plain substring test runs first, so only the frame that carries the
--- field -- the final usage chunk of a stream -- is decoded at all.
+-- strip_actual_usage: drop the "actual_usage" object some sglang builds add next to "usage" (a second
+-- token count that clients and billing should not see). The bodylog still records it: post-processing
+-- runs after bodylog has captured the frame, and the listener reads the field at both placements this
+-- function strips. Nothing else is touched. A plain substring test runs first, so a frame without the
+-- field is not decoded at all -- but note which frames DO carry it: the frame with finish_reason, the
+-- trailing usage frame, and, when the client asks for continuous_usage_stats, every content frame.
 local function strip_actual_usage_json(payload)
     if not payload:find('"actual_usage"', 1, true) then return payload end
     local obj = cjson.decode(payload)
-    if type(obj) ~= "table" or obj.actual_usage == nil then return payload end
-    obj.actual_usage = nil
+    if type(obj) ~= "table" then return payload end
+    local changed = false
+    if obj.actual_usage ~= nil then
+        obj.actual_usage = nil
+        changed = true
+    end
+    -- The field has two independent placements, so covering only the top level let it reach clients.
+    -- Measured on a recent sglang build (2026-11): in a stream the frame carrying finish_reason holds
+    -- the real usage AND actual_usage INSIDE choices[0] with nothing at the top level, and only the
+    -- trailing "choices":[] frame puts them at the top level. On that build the top-level-only version
+    -- matched the needle on the finish frame, paid for a decode, found nothing to remove and passed
+    -- actual_usage straight through. A non-streaming response on the same build carries both at the top
+    -- level only, so neither placement implies the other.
+    local choices = obj.choices
+    if type(choices) == "table" then
+        for _, ch in ipairs(choices) do
+            if type(ch) == "table" and ch.actual_usage ~= nil then
+                ch.actual_usage = nil
+                changed = true
+            end
+        end
+    end
+    -- Re-encoding a payload nothing was removed from would rewrite it for no reason (key order, number
+    -- formatting), so an unchanged body goes back byte-identical -- which is also where the needle
+    -- matching inside some unrelated string lands.
+    if not changed then return payload end
     return cjson.encode(obj) or payload              -- fail open on an encode error
 end
 M.strip_actual_usage_json = strip_actual_usage_json  -- exposed for unit tests

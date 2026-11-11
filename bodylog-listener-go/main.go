@@ -272,7 +272,7 @@ type respFields struct {
 	finishReason string
 	model        string
 	usage        any
-	actualUsage  any // some sglang builds: a second token count next to usage (openresty may strip it from the client response)
+	actualUsage  any // some sglang builds: a second token count next to usage; read at both placements
 	toolCalls    []any
 	stopReason   string // Anthropic
 	errorObj     any
@@ -320,6 +320,31 @@ func extractFromObj(obj map[string]any, rf *respFields) {
 			}
 			if fr, ok := cm["finish_reason"].(string); ok && fr != "" {
 				rf.finishReason = fr
+			}
+			// Some sglang builds put the real usage / actual_usage INSIDE the choice on the
+			// frame that carries finish_reason, and at the top level only on the trailing
+			// "choices":[] frame -- which a client that did not ask for
+			// stream_options.include_usage never receives. Reading the top level alone left
+			// those streams with no token counts recorded at all, and once openresty's
+			// strip_actual_usage removes the per-choice copy from the client response the
+			// value is gone for good. Last writer wins, matching the top-level handling
+			// below: a later frame's numbers are the final ones.
+			//
+			// ONLY ON THE FINAL FRAME. Measured on that build, the per-choice numbers are the
+			// FINAL totals: with max_tokens=20 over ~18 content frames, the finish frame's
+			// choices[0].usage read completion_tokens=20 and matched the trailing frame's
+			// top-level copy field for field. But nothing in the wire format says a per-choice
+			// usage could not be a PER-CHUNK delta on some other build, and recording a partial
+			// count as the request's total would be worse than recording none: a missing usage
+			// is visibly missing, a wrong one is not. So this is accepted only where the final
+			// totals belong -- the frame that closes the choice.
+			if fr, _ := cm["finish_reason"].(string); fr != "" {
+				if u, ok := cm["usage"].(map[string]any); ok && u != nil {
+					rf.usage = u
+				}
+				if u, ok := cm["actual_usage"].(map[string]any); ok && u != nil {
+					rf.actualUsage = u
+				}
 			}
 		}
 	}

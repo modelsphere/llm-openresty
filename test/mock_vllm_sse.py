@@ -81,14 +81,27 @@ def _chat_init_chunk(cid: str, model: str, created: int) -> bytes:
 
 
 def _chat_content_chunk(cid: str, model: str, created: int, content: str,
-                        finish_reason=None, kind="content") -> bytes:
-    """kind ∈ {"content", "reasoning"}：决定 delta 字段名"""
+                        finish_reason=None, kind="content",
+                        choice_usage=None) -> bytes:
+    """kind ∈ {"content", "reasoning"}：决定 delta 字段名
+
+    choice_usage: when given (a dict of prompt/completion token counts), the chunk carries
+    "usage" AND "actual_usage" INSIDE choices[0] -- the placement measured on a recent sglang
+    build, where the frame bearing finish_reason holds the real numbers per choice and the top
+    level holds none. Only that frame gets them; the content frames before it carry the
+    "usage": null placeholder the same builds emit. A top-level-only consumer sees nothing here,
+    which is exactly the case that has to be reproducible on a cluster.
+    """
     delta_key = "reasoning" if kind == "reasoning" else "content"
+    choice = {"index": 0, "delta": {delta_key: content}, "logprobs": None,
+              "finish_reason": finish_reason, "stop_reason": None,
+              "token_ids": None}
+    if choice_usage is not None:
+        choice["usage"] = choice_usage
+        choice["actual_usage"] = _actual_usage(choice_usage)
     return _sse(json.dumps({
         "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {delta_key: content}, "logprobs": None,
-                     "finish_reason": finish_reason, "stop_reason": None,
-                     "token_ids": None}],
+        "choices": [choice],
     }))
 
 
@@ -345,8 +358,19 @@ async def chat_completions(request: web.Request):
         # 最后一个 content chunk 带 finish_reason（与真 vllm 一致——last chunk 在
         # delta 里也带 reasoning/content，且在 choices[0].finish_reason 填写值）
         if not emit_tool_call:
+            # The per-choice placement lives on THIS frame -- the one carrying finish_reason --
+            # and nowhere else, so a consumer that only reads a frame's top level sees no token
+            # counts at all unless the client also asked for the trailing usage frame.
+            cu = None
+            if app["actual_usage_in_choice"] or body.get("emit_actual_usage_in_choice"):
+                cu = {"prompt_tokens": prompt_tokens,
+                      "total_tokens": prompt_tokens + out_len,
+                      "completion_tokens": out_len}
+                if app.get("cached_tokens") is not None:
+                    cu["prompt_tokens_details"] = {"cached_tokens": app["cached_tokens"]}
             await resp.write(_chat_content_chunk(cid, model, created, unit,
-                                                 finish_reason=finish_reason, kind=kind))
+                                                 finish_reason=finish_reason, kind=kind,
+                                                 choice_usage=cu))
         else:
             # tool_calls 路径：finish_reason 在 tool_call chunk 之后单独一个空 delta chunk
             await resp.write(_chat_content_chunk(cid, model, created, unit, kind=kind))
@@ -510,6 +534,7 @@ def make_app(args):
     app["chat_status"] = args.chat_status
     app["cached_tokens"] = args.cached_tokens
     app["actual_usage"] = args.actual_usage
+    app["actual_usage_in_choice"] = args.actual_usage_in_choice
     app["stats"] = {"req_count": 0, "in_flight": 0}
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models_list)
@@ -535,6 +560,12 @@ def main():
     p.add_argument("--actual-usage", action="store_true",
                    help="chat usage also carries a top-level actual_usage (some sglang builds); "
                         "per request: {\"emit_actual_usage\": true}")
+    p.add_argument("--actual-usage-in-choice", action="store_true",
+                   help="put usage AND actual_usage INSIDE choices[0] on the streaming frame that "
+                        "carries finish_reason, and nothing at the top level there -- the other "
+                        "placement the same builds use, reached when the client does not ask for "
+                        "stream_options.include_usage; per request: "
+                        "{\"emit_actual_usage_in_choice\": true}")
     p.add_argument("--host", default="127.0.0.1", help="listen address (0.0.0.0 inside a pod)")
     args = p.parse_args()
 
