@@ -120,6 +120,13 @@ for _, n in ipairs({ 1, 4, 11, #finish_frame }) do
     assert(d.choices[1].usage.total_tokens == 4224, "per-choice usage was damaged")
     assert(d.choices[1].usage.prompt_tokens_details.cached_tokens == 2048)
     assert(d.choices[1].finish_reason == "length")
+    -- This is the first re-encoded shape in the suite that contains an EMPTY JSON OBJECT. cjson's
+    -- encode_empty_table_as_object defaults to true, so {} survives -- but that is an instance-level
+    -- default of the same kind this file already overrides one line away for arrays, and if it were
+    -- ever flipped, "delta":{} would become "delta":[] on the finish frame of every stream on these
+    -- routes, breaking any client that reads chunk.choices[0].delta.content. Pinned like the
+    -- "usage":null placeholder in case 8, for the same reason.
+    assert(o:find('"delta":{}', 1, true), "delta is no longer an empty object (n=" .. n .. "): " .. o)
 end
 
 -- 8. A continuous_usage_stats stream puts usage + actual_usage at the TOP level of the content frames

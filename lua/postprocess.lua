@@ -396,11 +396,12 @@ end
 -- vllm_format: normalize vLLM's SSE frames and complete JSON responses.
 M.register("vllm_format", json_rewrite_handler(vllm_rewrite_json))
 
--- strip_actual_usage: drop the "actual_usage" object some sglang builds add
--- next to "usage" (a second token count that clients and billing should not see; the
--- bodylog still records it, since it runs before post-processing). Nothing else is
--- touched. A plain substring test runs first, so only the frame that carries the
--- field -- the final usage chunk of a stream -- is decoded at all.
+-- strip_actual_usage: drop the "actual_usage" object some sglang builds add next to "usage" (a second
+-- token count that clients and billing should not see). The bodylog still records it: post-processing
+-- runs after bodylog has captured the frame, and the listener reads the field at both placements this
+-- function strips. Nothing else is touched. A plain substring test runs first, so a frame without the
+-- field is not decoded at all -- but note which frames DO carry it: the frame with finish_reason, the
+-- trailing usage frame, and, when the client asks for continuous_usage_stats, every content frame.
 local function strip_actual_usage_json(payload)
     if not payload:find('"actual_usage"', 1, true) then return payload end
     local obj = cjson.decode(payload)
