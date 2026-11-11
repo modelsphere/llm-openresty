@@ -112,3 +112,39 @@ func TestRespMetaKeepsPerChoiceUsage(t *testing.T) {
 		t.Errorf("finish_reason lost: %s", b)
 	}
 }
+
+// PRECEDENCE. A real stream from such a build, when the client DID send
+// stream_options.include_usage, carries the numbers twice: inside choices[0] on the frame with
+// finish_reason, then at the top level on the trailing "choices":[] frame. The trailing frame is the
+// authoritative one. Reading the per-choice copy must not clobber it -- otherwise resp_meta would
+// report an earlier count, and that regression would be invisible without this case, because every
+// other test uses the same numbers in both places.
+func TestRespMetaTrailingFrameWinsOverPerChoice(t *testing.T) {
+	perChoice := `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}`
+	trailing := `{"prompt_tokens":100,"completion_tokens":8,"total_tokens":108}`
+	body := `data: {"id":"p1","choices":[{"index":0,"delta":{"content":"a"},"usage":null}]}` + "\n\n" +
+		`data: {"id":"p1","choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":` + perChoice +
+		`,"actual_usage":` + perChoice + `}]}` + "\n\n" +
+		`data: {"id":"p1","choices":[],"usage":` + trailing + `,"actual_usage":` + trailing + `}` + "\n\n" +
+		"data: [DONE]\n\n"
+	b, _ := json.Marshal(buildRespMeta(extractResp(body)))
+	var got struct {
+		Usage struct {
+			Completion int `json:"completion_tokens"`
+		} `json:"usage"`
+		Actual struct {
+			Completion int `json:"completion_tokens"`
+		} `json:"actual_usage"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("resp_meta not valid JSON: %v", err)
+	}
+	if got.Usage.Completion != 8 {
+		t.Errorf("usage came from the earlier per-choice frame (%d), not the trailing frame (8): %s",
+			got.Usage.Completion, b)
+	}
+	if got.Actual.Completion != 8 {
+		t.Errorf("actual_usage came from the earlier per-choice frame (%d), not the trailing frame (8): %s",
+			got.Actual.Completion, b)
+	}
+}
