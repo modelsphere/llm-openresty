@@ -98,4 +98,71 @@ assert(pp.resolve({ postprocess = "strip_actual_usage" }) == pp.handlers.strip_a
 assert(pp.resolve({ postprocess = "vllm_format" }) == pp.handlers.vllm_format)
 assert(pp.resolve({}) == nil)
 
+-- ---------------------------------------------------------------------------
+-- 7-10. THE PER-CHOICE PLACEMENT.
+--
+-- Cases 1-5 all put actual_usage at the top level. Measured on a recent sglang build (2026-11), that
+-- is only true of the trailing "choices":[] frame: the frame carrying finish_reason holds the real
+-- usage AND actual_usage INSIDE choices[0], with nothing at the top level. The top-level-only version
+-- therefore matched the needle on that frame, decoded it, found obj.actual_usage nil, and returned the
+-- payload with actual_usage still in it. The shapes below are transcribed from that measurement.
+
+-- 7. The finish frame: actual_usage inside choices[0] must go; the per-choice usage must survive.
+local finish_frame = 'data: {"id":"c3","object":"chat.completion.chunk","choices":[{"index":0,'
+                  .. '"delta":{},"finish_reason":"length","matched_stop":null,"usage":' .. usage
+                  .. ',"actual_usage":' .. actual .. '}]}\n\n'
+for _, n in ipairs({ 1, 4, 11, #finish_frame }) do
+    local o = run("strip_actual_usage", "text/event-stream", pieces_of(finish_frame, n))
+    assert(not o:find("actual_usage", 1, true),
+           "per-choice actual_usage survived (n=" .. n .. "): " .. o)
+    local d = assert(cjson.decode(o:match("data: ({[^\n]*})")), "frame no longer valid JSON: " .. o)
+    assert(d.choices[1].actual_usage == nil)
+    assert(d.choices[1].usage.total_tokens == 4224, "per-choice usage was damaged")
+    assert(d.choices[1].usage.prompt_tokens_details.cached_tokens == 2048)
+    assert(d.choices[1].finish_reason == "length")
+end
+
+-- 8. A continuous_usage_stats stream puts usage + actual_usage at the TOP level of the content frames
+--    while choices[0] still carries the "usage":null placeholder. The placeholder is deliberately left
+--    alone (clients already see it and it carries no number), so assert it is still present AND still
+--    null after the re-encode: an encoder that turned it into {} or dropped it would be a silent
+--    contract change for every client reading those frames.
+local mid_frame = 'data: {"id":"c4","object":"chat.completion.chunk","choices":[{"index":0,'
+               .. '"delta":{"content":"hi"},"finish_reason":null,"usage":null}],"usage":' .. usage
+               .. ',"actual_usage":' .. actual .. '}\n\n'
+local mo = run("strip_actual_usage", "text/event-stream", { mid_frame })
+assert(not mo:find("actual_usage", 1, true), "top-level actual_usage survived: " .. mo)
+assert(mo:find('"usage":null', 1, true), "the choices[0] usage:null placeholder was lost: " .. mo)
+local md = assert(cjson.decode(mo:match("data: ({[^\n]*})")))
+assert(md.usage.total_tokens == 4224, "top-level usage was damaged")
+assert(md.choices[1].delta.content == "hi")
+
+-- 9. DIVISION OF LABOUR, pinned rather than assumed. vllm_format's actual_usage entry is a TOP-LEVEL
+--    drop (case 5), so on the finish frame it leaves the per-choice copy in place. That is the current
+--    behaviour and this case records it, so the two handlers' scopes cannot drift unnoticed: a route
+--    that needs actual_usage gone on every frame shape names strip_actual_usage.
+local vf = run("vllm_format", "text/event-stream", { finish_frame })
+assert(vf:find("actual_usage", 1, true),
+       "vllm_format now strips the per-choice copy -- update case 9 and the README if deliberate")
+local vfd = assert(cjson.decode(vf:match("data: ({[^\n]*})")))
+assert(vfd.choices[1].usage.total_tokens == 4224, "vllm_format damaged the per-choice usage")
+
+-- 10. The whole measured stream, in order, split at every boundary: content frames with the null
+--     placeholder, the finish frame, the trailing usage frame, [DONE].
+local measured = 'data: {"id":"c5","choices":[{"index":0,"delta":{"content":"a"},"usage":null}]}\n\n'
+             .. 'data: {"id":"c5","choices":[{"index":0,"delta":{"content":"b"},"usage":null}]}\n\n'
+             .. finish_frame
+             .. 'data: {"id":"c5","choices":[],"usage":' .. usage
+             .. ',"actual_usage":' .. actual .. '}\n\n'
+             .. "data: [DONE]\n\n"
+for _, n in ipairs({ 1, 2, 5, 13, #measured }) do
+    local o = run("strip_actual_usage", "text/event-stream", pieces_of(measured, n))
+    assert(not o:find("actual_usage", 1, true),
+           "actual_usage survived somewhere in the measured stream (n=" .. n .. ")")
+    assert(o:sub(-14) == "data: [DONE]\n\n", "terminator changed (n=" .. n .. ")")
+    local frames = 0
+    for _ in o:gmatch("data: ") do frames = frames + 1 end
+    assert(frames == 5, "frame count changed from 5 to " .. frames .. " (n=" .. n .. ")")
+end
+
 print("strip_actual_usage SSE and JSON rewrite: PASS")
