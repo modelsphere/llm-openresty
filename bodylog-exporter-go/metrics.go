@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,6 +17,8 @@ type detailRecord struct {
 	Ts               string  `json:"ts"`
 	TsEnd            string  `json:"ts_end"`
 	RequestID        string  `json:"request_id"`
+	URI              string  `json:"uri"`
+	Method           string  `json:"method"`
 	Stream           *bool   `json:"stream"`
 	Status           int64   `json:"status"`
 	Backend          string  `json:"backend"`
@@ -33,20 +37,28 @@ type detailRecord struct {
 }
 
 type metrics struct {
-	requests         *prometheus.CounterVec // {backend,model,status_class,stream}
-	promptTok        *prometheus.CounterVec // {backend,model}
-	completionTok    *prometheus.CounterVec
-	cachedTok        *prometheus.CounterVec
-	reasoningTok     *prometheus.CounterVec
-	totalTok         *prometheus.CounterVec
-	reqBytes         *prometheus.CounterVec
-	respBytes        *prometheus.CounterVec
-	finishReason     *prometheus.CounterVec // {backend,model,finish_reason}
-	rt               *prometheus.HistogramVec
-	ttft             *prometheus.HistogramVec
-	outTokPerSec     *prometheus.HistogramVec
-	overallTokPerSec *prometheus.HistogramVec
-	decodeTokPerSec  *prometheus.HistogramVec
+	generationRequests     *prometheus.CounterVec
+	generationPrompt       *prometheus.CounterVec
+	generationCompletion   *prometheus.CounterVec
+	generationCached       *prometheus.CounterVec
+	generationMissingUsage *prometheus.CounterVec
+	generationTTFT         *prometheus.HistogramVec
+	generationOverall      *prometheus.HistogramVec
+	generationDecode       *prometheus.HistogramVec
+	requests               *prometheus.CounterVec // {backend,model,status_class,stream}
+	promptTok              *prometheus.CounterVec // {backend,model}
+	completionTok          *prometheus.CounterVec
+	cachedTok              *prometheus.CounterVec
+	reasoningTok           *prometheus.CounterVec
+	totalTok               *prometheus.CounterVec
+	reqBytes               *prometheus.CounterVec
+	respBytes              *prometheus.CounterVec
+	finishReason           *prometheus.CounterVec // {backend,model,finish_reason}
+	rt                     *prometheus.HistogramVec
+	ttft                   *prometheus.HistogramVec
+	outTokPerSec           *prometheus.HistogramVec
+	overallTokPerSec       *prometheus.HistogramVec
+	decodeTokPerSec        *prometheus.HistogramVec
 	// exporter 自监控
 	lines    prometheus.Counter
 	offset   prometheus.Gauge
@@ -80,16 +92,24 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		}, labels)
 	}
 	m := &metrics{
-		requests:      ctr("bodylog_requests_total", "请求数", []string{"service", "route", "backend", "model", "status_class", "stream"}),
-		promptTok:     ctr("bodylog_prompt_tokens_total", "prompt token 累计", srbm),
-		completionTok: ctr("bodylog_completion_tokens_total", "completion token 累计", srbm),
-		cachedTok:     ctr("bodylog_cached_tokens_total", "cached token 累计", srbm),
-		reasoningTok:  ctr("bodylog_reasoning_tokens_total", "reasoning token 累计", srbm),
-		totalTok:      ctr("bodylog_total_tokens_total", "total token 累计", srbm),
-		reqBytes:      ctr("bodylog_req_bytes_total", "请求体字节累计", srbm),
-		respBytes:     ctr("bodylog_resp_bytes_total", "响应体字节累计", srbm),
-		finishReason:  ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
-		rt:            hist("bodylog_rt_seconds", "总响应时间(秒)", []string{"service", "route", "backend", "model", "stream"}),
+		generationRequests:     ctr("bodylog_generation_requests_total", "Generation requests, excluding health and model discovery", []string{"service", "route", "backend"}),
+		generationPrompt:       ctr("bodylog_generation_prompt_tokens_total", "Generation prompt tokens", []string{"service", "route", "backend"}),
+		generationCompletion:   ctr("bodylog_generation_completion_tokens_total", "Generation completion tokens", []string{"service", "route", "backend"}),
+		generationCached:       ctr("bodylog_generation_cached_tokens_total", "Generation cached tokens", []string{"service", "route", "backend"}),
+		generationMissingUsage: ctr("bodylog_generation_missing_usage_requests_total", "Generation requests without usable token usage", []string{"service", "route", "backend"}),
+		generationTTFT:         hist("bodylog_generation_ttft_seconds", "Generation TTFT", []string{"service", "route", "backend"}),
+		generationOverall:      hist("bodylog_generation_overall_output_tok_per_second", "Generation overall TPS", []string{"service", "route", "backend"}),
+		generationDecode:       hist("bodylog_generation_decode_output_tok_per_second", "Generation decode TPS", []string{"service", "route", "backend"}),
+		requests:               ctr("bodylog_requests_total", "请求数", []string{"service", "route", "backend", "model", "status_class", "stream"}),
+		promptTok:              ctr("bodylog_prompt_tokens_total", "prompt token 累计", srbm),
+		completionTok:          ctr("bodylog_completion_tokens_total", "completion token 累计", srbm),
+		cachedTok:              ctr("bodylog_cached_tokens_total", "cached token 累计", srbm),
+		reasoningTok:           ctr("bodylog_reasoning_tokens_total", "reasoning token 累计", srbm),
+		totalTok:               ctr("bodylog_total_tokens_total", "total token 累计", srbm),
+		reqBytes:               ctr("bodylog_req_bytes_total", "请求体字节累计", srbm),
+		respBytes:              ctr("bodylog_resp_bytes_total", "响应体字节累计", srbm),
+		finishReason:           ctr("bodylog_finish_reason_total", "按 finish_reason 计数", []string{"service", "route", "backend", "model", "finish_reason"}),
+		rt:                     hist("bodylog_rt_seconds", "总响应时间(秒)", []string{"service", "route", "backend", "model", "stream"}),
 		// prompt_bucket:输入长度分档,用于“某 context 区间的 TTFT 分位数”。见 promptBucket()。
 		ttft: hist("bodylog_ttft_seconds", "首 token 时间/TTFT(秒,仅流式)", srbmp),
 		// 2026-08-26:分母从 rt 改为 rt-frt(扣除 prefill),仅流式 + 下限过滤,与 openresty 引擎
@@ -106,7 +126,8 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		recovers:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
 	}
 	reg.MustRegister(
-		m.requests, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
+		m.requests, m.generationRequests, m.generationPrompt, m.generationCompletion, m.generationCached,
+		m.generationMissingUsage, m.generationTTFT, m.generationOverall, m.generationDecode, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
 		m.reqBytes, m.respBytes, m.finishReason, m.rt, m.ttft, m.outTokPerSec,
 		m.overallTokPerSec, m.decodeTokPerSec,
 		m.lines, m.offset, m.lastTs, m.recovers,
@@ -145,6 +166,22 @@ func orDefault(s, def string) string {
 }
 
 // observe:把一条明细行累加进 Prometheus。0/空字段按"缺测"跳过,不污染分位/不造无谓 series。
+func generationRequest(d detailRecord) bool {
+	if d.Method != "POST" {
+		return false
+	}
+	u, err := url.ParseRequestURI(d.URI)
+	if err != nil {
+		return false
+	}
+	for _, suffix := range []string{"/v1/chat/completions", "/v1/completions", "/v1/messages", "/generate"} {
+		if strings.HasSuffix(u.Path, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *metrics) observe(d detailRecord) {
 	backend := orDefault(d.Backend, "(none)")
 	model := orDefault(d.Model, "unknown") // model 纯来自明细,不做兜底
@@ -164,6 +201,37 @@ func (m *metrics) observe(d detailRecord) {
 	sl := streamLabel(d.Stream)
 
 	m.requests.WithLabelValues(service, route, backend, model, sc, sl).Inc()
+	// Stable service/backend labels establish a baseline before the first model/usage appears.
+	generation := m.generationRequests.WithLabelValues(service, route, backend)
+	prompt := m.generationPrompt.WithLabelValues(service, route, backend)
+	completion := m.generationCompletion.WithLabelValues(service, route, backend)
+	cached := m.generationCached.WithLabelValues(service, route, backend)
+	missingUsage := m.generationMissingUsage.WithLabelValues(service, route, backend)
+	ttft := m.generationTTFT.WithLabelValues(service, route, backend)
+	overall := m.generationOverall.WithLabelValues(service, route, backend)
+	decode := m.generationDecode.WithLabelValues(service, route, backend)
+	if generationRequest(d) {
+		generation.Inc()
+		if d.PromptTokens < 0 || d.CompletionTokens < 0 || d.CachedTokens < 0 ||
+			d.PromptTokens == 0 && d.CompletionTokens == 0 && d.TotalTokens == 0 && d.CachedTokens == 0 {
+			missingUsage.Inc()
+		} else {
+			prompt.Add(float64(d.PromptTokens))
+			completion.Add(float64(d.CompletionTokens))
+			cached.Add(float64(d.CachedTokens))
+		}
+		if sc == "2xx" && d.Frt > 0 && d.Stream != nil && *d.Stream {
+			ttft.Observe(d.Frt)
+		}
+		if sc == "2xx" && d.CompletionTokens > 0 {
+			if d.Rt > 0 {
+				overall.Observe(float64(d.CompletionTokens) / d.Rt)
+			}
+			if duration := d.Lct - d.Frt; duration > .3 {
+				decode.Observe(float64(d.CompletionTokens) / duration)
+			}
+		}
+	}
 	if d.PromptTokens > 0 {
 		m.promptTok.WithLabelValues(service, route, backend, model).Add(float64(d.PromptTokens))
 	}
