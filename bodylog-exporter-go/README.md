@@ -21,6 +21,27 @@ into Prometheus, for Grafana boards and for **autoscaling** (LLMScaler / KEDA / 
 Endpoint: `GET <listen>/metrics` (default `:9110`, Prometheus text format, no
 authentication -- it carries aggregates only, never request bodies).
 
+### Generation metrics (dimensions: `service` / `route` / `backend`)
+
+`bodylog_generation_requests_total` counts POST requests to `/v1/chat/completions`,
+`/v1/completions`, `/v1/messages` and `/generate`, including failed requests and
+paths with route prefixes or query strings. Health and model-discovery requests
+can initialize a zero baseline but do not increase this counter. Records missing
+method or URI are retained in the existing HTTP metrics, but are not classified as
+generation requests. The existing `bodylog_requests_total` semantics and labels
+are unchanged.
+
+Generation metrics also include `bodylog_generation_prompt_tokens_total`,
+`bodylog_generation_completion_tokens_total`, `bodylog_generation_cached_tokens_total`,
+`bodylog_generation_missing_usage_requests_total`, `bodylog_generation_ttft_seconds`,
+`bodylog_generation_overall_output_tok_per_second`, and
+`bodylog_generation_decode_output_tok_per_second`. These metrics omit the `model`
+label and initialize zero counters and empty histograms when traffic is observed,
+so an initial short burst can be measured. Requests without usable usage are
+counted separately; they must not be interpreted as zero traffic. Histograms only
+include successful generation requests, and decode samples retain the existing
+0.3-second minimum duration. Histograms use native Prometheus format.
+
 ### Traffic metrics (dimensions: `service` / `route` / `backend` / `model`)
 
 **Every traffic metric carries four dimensions**: `service` (the ModelRoute's
