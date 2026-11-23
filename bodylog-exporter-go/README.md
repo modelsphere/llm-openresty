@@ -55,7 +55,7 @@ exist only in-cluster and degrade to `unknown` on bare metal.
 
 | Metric | Type | Extra labels | Meaning |
 |---|---|---|---|
-| `bodylog_requests_total` | counter | `req_model`, `status_class`, `stream` | Requests. `req_model` is the model the request body asked for (`unknown` if absent); unlike `model` it is set for requests openresty rejects itself (429/400), so `sum by(req_model)(rate(bodylog_requests_total{status_class="4xx"}[5m]))` counts rejections per model. The value comes from the client, so it is bounded: the first `BODYLOG_REQ_MODEL_MAX_VALUES` (default 128) distinct names are kept, later new ones become `other`, names are cut at 128 bytes |
+| `bodylog_requests_total` | counter | `req_model`, `status_class`, `stream` | Requests. `req_model` is the model the request body asked for (`unknown` if absent); unlike `model` it is set for requests openresty rejects itself (429/400), so `sum by(req_model)(rate(bodylog_requests_total{status_class="4xx"}[5m]))` counts rejections per model. The value comes from the client, so it is bounded: the first `BODYLOG_REQ_MODEL_MAX_VALUES` (default 128) distinct names are kept, later new ones become `other` (a value < 1 falls back to 128). Names are cut at 128 bytes, so names that differ only after byte 128 share one label |
 | `bodylog_prompt_tokens_total` | counter | — | Prompt tokens |
 | `bodylog_completion_tokens_total` | counter | — | Completion tokens |
 | `bodylog_cached_tokens_total` | counter | — | Cached (prefix-hit) tokens |

@@ -168,6 +168,11 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 	}
 	m.reqModels = map[string]struct{}{}
 	m.reqModelMax = envOrInt("BODYLOG_REQ_MODEL_MAX_VALUES", 128)
+	if m.reqModelMax < 1 {
+		// 0 or less would label every request "other" and make req_model useless.
+		log.Printf("warn: BODYLOG_REQ_MODEL_MAX_VALUES=%d is < 1, using 128", m.reqModelMax)
+		m.reqModelMax = 128
+	}
 	reg.MustRegister(
 		m.requests, m.generationRequests, m.generationPrompt, m.generationCompletion, m.generationCached,
 		m.generationMissingUsage, m.generationTTFT, m.generationOverall, m.generationDecode, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
