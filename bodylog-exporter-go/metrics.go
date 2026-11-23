@@ -167,7 +167,7 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		recovers:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
 	}
 	m.reqModels = map[string]struct{}{}
-	m.reqModelMax = envOrInt("BODYLOG_REQ_MODEL_MAX_VALUES", 64)
+	m.reqModelMax = envOrInt("BODYLOG_REQ_MODEL_MAX_VALUES", 128)
 	reg.MustRegister(
 		m.requests, m.generationRequests, m.generationPrompt, m.generationCompletion, m.generationCached,
 		m.generationMissingUsage, m.generationTTFT, m.generationOverall, m.generationDecode, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
