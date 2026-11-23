@@ -654,3 +654,23 @@ func TestResolverTargetsPerOpenresty(t *testing.T) {
 		t.Errorf("perService=false: %d targets, want 2 (kimi-k3 once + legacy): %v", n, r.getTargets())
 	}
 }
+
+// An openresty-side 429: no backend, no response model, only the request's model.
+// req_model carries it on bodylog_requests_total; model stays unknown.
+func TestObserveReqModelOnRejection(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := newMetrics(reg)
+	m.observe(detailRecord{Backend: "", Model: "", ReqModel: "kimi-k3", Status: 429})
+	lbl, ok := labelVals(t, reg, "bodylog_requests_total", "(none)")
+	if !ok {
+		t.Fatal("no series for the rejected request")
+	}
+	if lbl["req_model"] != "kimi-k3" || lbl["model"] != "unknown" || lbl["status_class"] != "4xx" {
+		t.Errorf("labels = %v, want req_model=kimi-k3 model=unknown status_class=4xx", lbl)
+	}
+	// Older listener without req_model → unknown, not an empty label.
+	m.observe(detailRecord{Backend: "10.0.0.9:8050", Model: "qwen", Status: 200})
+	if lbl, _ := labelVals(t, reg, "bodylog_requests_total", "10.0.0.9:8050"); lbl["req_model"] != "unknown" {
+		t.Errorf("req_model = %q, want unknown", lbl["req_model"])
+	}
+}

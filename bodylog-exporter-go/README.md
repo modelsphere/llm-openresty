@@ -55,7 +55,7 @@ exist only in-cluster and degrade to `unknown` on bare metal.
 
 | Metric | Type | Extra labels | Meaning |
 |---|---|---|---|
-| `bodylog_requests_total` | counter | `status_class`, `stream` | Requests |
+| `bodylog_requests_total` | counter | `req_model`, `status_class`, `stream` | Requests. `req_model` is the model the request body asked for (`unknown` if absent); unlike `model` it is set for requests openresty rejects itself (429/400), so `sum by(req_model)(rate(bodylog_requests_total{status_class="4xx"}[5m]))` counts rejections per model |
 | `bodylog_prompt_tokens_total` | counter | — | Prompt tokens |
 | `bodylog_completion_tokens_total` | counter | — | Completion tokens |
 | `bodylog_cached_tokens_total` | counter | — | Cached (prefix-hit) tokens |

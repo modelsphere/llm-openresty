@@ -23,6 +23,7 @@ type detailRecord struct {
 	Status           int64   `json:"status"`
 	Backend          string  `json:"backend"`
 	Model            string  `json:"model"`
+	ReqModel         string  `json:"req_model"` // model the request asked for; set even when openresty rejects it
 	FinishReason     string  `json:"finish_reason"`
 	Frt              float64 `json:"frt"` // ≈TTFT,秒
 	Lct              float64 `json:"lct"` // last chunk time,秒
@@ -100,7 +101,7 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		generationTTFT:         hist("bodylog_generation_ttft_seconds", "Generation TTFT", []string{"service", "route", "backend"}),
 		generationOverall:      hist("bodylog_generation_overall_output_tok_per_second", "Generation overall TPS", []string{"service", "route", "backend"}),
 		generationDecode:       hist("bodylog_generation_decode_output_tok_per_second", "Generation decode TPS", []string{"service", "route", "backend"}),
-		requests:               ctr("bodylog_requests_total", "请求数", []string{"service", "route", "backend", "model", "status_class", "stream"}),
+		requests:               ctr("bodylog_requests_total", "请求数", []string{"service", "route", "backend", "model", "req_model", "status_class", "stream"}),
 		promptTok:              ctr("bodylog_prompt_tokens_total", "prompt token 累计", srbm),
 		completionTok:          ctr("bodylog_completion_tokens_total", "completion token 累计", srbm),
 		cachedTok:              ctr("bodylog_cached_tokens_total", "cached token 累计", srbm),
@@ -185,6 +186,10 @@ func generationRequest(d detailRecord) bool {
 func (m *metrics) observe(d detailRecord) {
 	backend := orDefault(d.Backend, "(none)")
 	model := orDefault(d.Model, "unknown") // model 纯来自明细,不做兜底
+	// req_model is only a label on bodylog_requests_total: rejected requests (openresty's own
+	// 429/400) have no response model and no backend, so this is the one way to count them per
+	// model. Never used to fill `model`, which means what the response says served the request.
+	reqModel := orDefault(d.ReqModel, "unknown")
 	// 富化:后端 pod IP → service(= ns/name,主聚合维度)+ route(nginx.route,省略则 metadata.name)。未命中回退 unknown。
 	route, service := "unknown", "unknown"
 	if m.resolver != nil {
@@ -200,7 +205,7 @@ func (m *metrics) observe(d detailRecord) {
 	sc := statusClass(d.Status)
 	sl := streamLabel(d.Stream)
 
-	m.requests.WithLabelValues(service, route, backend, model, sc, sl).Inc()
+	m.requests.WithLabelValues(service, route, backend, model, reqModel, sc, sl).Inc()
 	// Stable service/backend labels establish a baseline before the first model/usage appears.
 	generation := m.generationRequests.WithLabelValues(service, route, backend)
 	prompt := m.generationPrompt.WithLabelValues(service, route, backend)
