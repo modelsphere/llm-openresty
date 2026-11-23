@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -68,6 +70,44 @@ type metrics struct {
 
 	// 富化:后端 pod IP → route/model(给每条指标打稳定的 route label)。nil=不富化(route=unknown)。
 	resolver *podRouteResolver
+
+	// req_model comes from the request body, i.e. from the client, so its values are not bounded
+	// by anything we configure (a route without per-model pools forwards any "model", and
+	// rejected requests are logged too). reqModels keeps the distinct values already used as
+	// labels; past reqModelMax new ones become "other". See reqModelLabel.
+	reqModelMu  sync.Mutex
+	reqModels   map[string]struct{}
+	reqModelMax int
+}
+
+// reqModelMaxLen caps one req_model label value; longer names are cut, not dropped.
+const reqModelMaxLen = 128
+
+// reqModelLabel maps a request's model to a bounded label value: "unknown" when absent, the
+// name itself while fewer than reqModelMax distinct names have been seen, "other" after that.
+// Without the bound any client could create series at will by sending random model names.
+func (m *metrics) reqModelLabel(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	if len(v) > reqModelMaxLen {
+		// Cut on bytes, then drop a rune split by the cut: a label value must be valid UTF-8
+		// (WithLabelValues panics otherwise).
+		v = strings.ToValidUTF8(v[:reqModelMaxLen], "")
+	}
+	m.reqModelMu.Lock()
+	defer m.reqModelMu.Unlock()
+	if _, ok := m.reqModels[v]; ok {
+		return v
+	}
+	if len(m.reqModels) >= m.reqModelMax {
+		return "other"
+	}
+	m.reqModels[v] = struct{}{}
+	if len(m.reqModels) == m.reqModelMax {
+		log.Printf("warn: req_model reached %d distinct values; further new ones are labelled \"other\" (BODYLOG_REQ_MODEL_MAX_VALUES)", m.reqModelMax)
+	}
+	return v
 }
 
 func newMetrics(reg *prometheus.Registry) *metrics {
@@ -126,6 +166,8 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 		lastTs:           prometheus.NewGauge(prometheus.GaugeOpts{Name: "bodylog_exporter_last_ts_seconds", Help: "最新 observe 行的结束时刻(unix 秒),判滞后"}),
 		recovers:         prometheus.NewCounter(prometheus.CounterOpts{Name: "bodylog_exporter_recovery_total", Help: "跨天缺口 HTTP 补读次数"}),
 	}
+	m.reqModels = map[string]struct{}{}
+	m.reqModelMax = envOrInt("BODYLOG_REQ_MODEL_MAX_VALUES", 64)
 	reg.MustRegister(
 		m.requests, m.generationRequests, m.generationPrompt, m.generationCompletion, m.generationCached,
 		m.generationMissingUsage, m.generationTTFT, m.generationOverall, m.generationDecode, m.promptTok, m.completionTok, m.cachedTok, m.reasoningTok, m.totalTok,
@@ -189,7 +231,7 @@ func (m *metrics) observe(d detailRecord) {
 	// req_model is only a label on bodylog_requests_total: rejected requests (openresty's own
 	// 429/400) have no response model and no backend, so this is the one way to count them per
 	// model. Never used to fill `model`, which means what the response says served the request.
-	reqModel := orDefault(d.ReqModel, "unknown")
+	reqModel := m.reqModelLabel(d.ReqModel)
 	// 富化:后端 pod IP → service(= ns/name,主聚合维度)+ route(nginx.route,省略则 metadata.name)。未命中回退 unknown。
 	route, service := "unknown", "unknown"
 	if m.resolver != nil {

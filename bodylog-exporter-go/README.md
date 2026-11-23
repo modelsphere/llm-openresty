@@ -28,8 +28,8 @@ authentication -- it carries aggregates only, never request bodies).
 paths with route prefixes or query strings. Health and model-discovery requests
 can initialize a zero baseline but do not increase this counter. Records missing
 method or URI are retained in the existing HTTP metrics, but are not classified as
-generation requests. The existing `bodylog_requests_total` semantics and labels
-are unchanged.
+generation requests. `bodylog_requests_total` keeps its semantics; its only new label is `req_model`
+(see the table below).
 
 Generation metrics also include `bodylog_generation_prompt_tokens_total`,
 `bodylog_generation_completion_tokens_total`, `bodylog_generation_cached_tokens_total`,
@@ -55,7 +55,7 @@ exist only in-cluster and degrade to `unknown` on bare metal.
 
 | Metric | Type | Extra labels | Meaning |
 |---|---|---|---|
-| `bodylog_requests_total` | counter | `req_model`, `status_class`, `stream` | Requests. `req_model` is the model the request body asked for (`unknown` if absent); unlike `model` it is set for requests openresty rejects itself (429/400), so `sum by(req_model)(rate(bodylog_requests_total{status_class="4xx"}[5m]))` counts rejections per model |
+| `bodylog_requests_total` | counter | `req_model`, `status_class`, `stream` | Requests. `req_model` is the model the request body asked for (`unknown` if absent); unlike `model` it is set for requests openresty rejects itself (429/400), so `sum by(req_model)(rate(bodylog_requests_total{status_class="4xx"}[5m]))` counts rejections per model. The value comes from the client, so it is bounded: the first `BODYLOG_REQ_MODEL_MAX_VALUES` (default 64) distinct names are kept, later new ones become `other`, names are cut at 128 bytes |
 | `bodylog_prompt_tokens_total` | counter | — | Prompt tokens |
 | `bodylog_completion_tokens_total` | counter | — | Completion tokens |
 | `bodylog_cached_tokens_total` | counter | — | Cached (prefix-hit) tokens |

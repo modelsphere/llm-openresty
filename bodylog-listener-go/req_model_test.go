@@ -28,6 +28,8 @@ func TestTopLevelString(t *testing.T) {
 		{"truncated before model", `{"messages":[{"content":"abc`, ""},
 		{"truncated inside value", `{"model":"kimi`, ""},
 		{"not an object", `["model","x"]`, ""},
+		{"duplicate key: last wins", `{"model":"a","messages":[],"model":"b"}`, "b"},
+		{"truncated after a match", `{"model":"a","messages":[{"content":"x`, "a"},
 	}
 	for _, c := range cases {
 		if got := topLevelString(c.body, "model"); got != c.want {

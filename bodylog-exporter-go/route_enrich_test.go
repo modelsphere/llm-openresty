@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -672,5 +674,44 @@ func TestObserveReqModelOnRejection(t *testing.T) {
 	m.observe(detailRecord{Backend: "10.0.0.9:8050", Model: "qwen", Status: 200})
 	if lbl, _ := labelVals(t, reg, "bodylog_requests_total", "10.0.0.9:8050"); lbl["req_model"] != "unknown" {
 		t.Errorf("req_model = %q, want unknown", lbl["req_model"])
+	}
+}
+
+// req_model comes from the client: distinct values are capped, overflow folds into "other",
+// and over-long names are cut without leaving invalid UTF-8 (which would panic in WithLabelValues).
+func TestReqModelLabelBounded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := newMetrics(reg)
+	m.reqModelMax = 3
+	for i := 0; i < 50; i++ {
+		m.observe(detailRecord{Backend: "", ReqModel: fmt.Sprintf("junk-%d", i), Status: 400})
+	}
+	m.observe(detailRecord{Backend: "", ReqModel: "junk-1", Status: 429}) // already admitted: kept
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, mf := range mfs {
+		if mf.GetName() != "bodylog_requests_total" {
+			continue
+		}
+		for _, s := range mf.GetMetric() {
+			for _, lp := range s.GetLabel() {
+				if lp.GetName() == "req_model" {
+					seen[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	if len(seen) != 4 || !seen["other"] || !seen["junk-0"] || !seen["junk-1"] || !seen["junk-2"] {
+		t.Errorf("req_model values = %v, want junk-0..2 + other", seen)
+	}
+
+	m2 := newMetrics(prometheus.NewRegistry())
+	long := strings.Repeat("a", reqModelMaxLen-1) + "模型" // the cut lands inside a multi-byte rune
+	got := m2.reqModelLabel(long)
+	if len(got) > reqModelMaxLen || !utf8.ValidString(got) {
+		t.Errorf("long name -> %q (len %d, valid=%v)", got, len(got), utf8.ValidString(got))
 	}
 }

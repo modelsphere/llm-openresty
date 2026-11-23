@@ -1315,9 +1315,12 @@ func extractReqModel(m map[string]any) string {
 // value is a string. It walks the bytes once, tracking nesting and string boundaries, instead of
 // json.Unmarshal-ing a body that can be several MB. Only depth-1 keys match: a "model" inside
 // metadata or tool schemas is ignored, and so is any "model" text inside message content (it
-// sits inside a JSON string there). A body cut short (truncated capture) just yields "".
+// sits inside a JSON string there). If the key appears more than once the last one wins, as in
+// cjson (openresty) and encoding/json, so the value is the one the request was routed by. A body
+// cut short (truncated capture) yields what was found before the cut, or "".
 func topLevelString(body, key string) string {
 	want := `"` + key + `"`
+	found := ""
 	depth := 0
 	for i := 0; i < len(body); i++ {
 		switch body[i] {
@@ -1328,7 +1331,7 @@ func topLevelString(body, key string) string {
 		case '"':
 			end := stringEnd(body, i)
 			if end < 0 {
-				return ""
+				return found
 			}
 			if depth == 1 && body[i:end+1] == want {
 				j := skipSpace(body, end+1)
@@ -1337,20 +1340,20 @@ func topLevelString(body, key string) string {
 					if j < len(body) && body[j] == '"' {
 						vend := stringEnd(body, j)
 						if vend < 0 {
-							return ""
+							return found
 						}
 						var v string
-						if json.Unmarshal([]byte(body[j:vend+1]), &v) != nil {
-							return ""
+						if json.Unmarshal([]byte(body[j:vend+1]), &v) == nil {
+							found = v
 						}
-						return v
+						end = vend
 					}
 				}
 			}
 			i = end
 		}
 	}
-	return ""
+	return found
 }
 
 // stringEnd returns the index of the closing quote of the JSON string opening at body[start],

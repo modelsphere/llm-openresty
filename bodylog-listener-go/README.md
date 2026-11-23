@@ -59,7 +59,7 @@ per-minute aggregates in `metrics/`. Retention and archiving therefore never tou
   - 内部按 (minute, peer, **stream**) 分桶。**默认跨 stream 合并**回 (minute,peer)(`buckets[]` 仍一行一 (minute,peer),monitor 兼容);`stream=true|false` 时只返回该类请求的聚合。stream 取自请求参数(从 req_body 提取,未传/未知归入空桶,默认合并里照常计入)。
 - `GET /metrics?start=&end=[&model=&req_model=&peer=&status=&min_frt=&stream=&limit=]` → **时间窗内每条请求的 metrics 明细**
   - `start`/`end`:RFC3339(`2026-06-18T12:48:00+08:00`)、`YYYY-MM-DDTHH:MM:SS`(按本地时区)或 Unix 秒。必填。
-  - 可选过滤:`model`、`peer`(匹配 backend 或原始 peer)、`status`、`min_frt`(秒)、`stream`(`true`只流式/`false`只非流式/`null`只未传 stream)、`limit`(默认=上限 5000)。
+  - 可选过滤:`model`、`req_model` (the model the request body asked for; set for rejected requests too)、`peer`(匹配 backend 或原始 peer)、`status`、`min_frt`(秒)、`stream`(`true`只流式/`false`只非流式/`null`只未传 stream)、`limit`(默认=上限 5000)。
   - 历史天读 `metrics/details/<date>.parquet`,当天读 live `<date>.jsonl`,两支 **`UNION ALL BY NAME`** 合并(DuckDB 无单函数同吃两格式)。
   - 结果**按 `(ts, request_id)` 升序**(确定全序;`ts` 不唯一,`request_id`=nginx `$request_id` 唯一兜底)。`ts` = openresty `bodylog_finalize` 写的请求时间戳(ISO8601 +08:00)。
   - 返回 `{"count":N,"truncated":bool,"rows":[…]}`;**硬上限 5000 条**(≈2.5MB),超限只回前 5000 + `truncated:true`。
