@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -652,5 +654,64 @@ func TestResolverTargetsPerOpenresty(t *testing.T) {
 	r.refresh(context.Background())
 	if n := len(r.getTargets()); n != 2 {
 		t.Errorf("perService=false: %d targets, want 2 (kimi-k3 once + legacy): %v", n, r.getTargets())
+	}
+}
+
+// An openresty-side 429: no backend, no response model, only the request's model.
+// req_model carries it on bodylog_requests_total; model stays unknown.
+func TestObserveReqModelOnRejection(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := newMetrics(reg)
+	m.observe(detailRecord{Backend: "", Model: "", ReqModel: "kimi-k3", Status: 429})
+	lbl, ok := labelVals(t, reg, "bodylog_requests_total", "(none)")
+	if !ok {
+		t.Fatal("no series for the rejected request")
+	}
+	if lbl["req_model"] != "kimi-k3" || lbl["model"] != "unknown" || lbl["status_class"] != "4xx" {
+		t.Errorf("labels = %v, want req_model=kimi-k3 model=unknown status_class=4xx", lbl)
+	}
+	// Older listener without req_model → unknown, not an empty label.
+	m.observe(detailRecord{Backend: "10.0.0.9:8050", Model: "qwen", Status: 200})
+	if lbl, _ := labelVals(t, reg, "bodylog_requests_total", "10.0.0.9:8050"); lbl["req_model"] != "unknown" {
+		t.Errorf("req_model = %q, want unknown", lbl["req_model"])
+	}
+}
+
+// req_model comes from the client: distinct values are capped, overflow folds into "other",
+// and over-long names are cut without leaving invalid UTF-8 (which would panic in WithLabelValues).
+func TestReqModelLabelBounded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := newMetrics(reg)
+	m.reqModelMax = 3
+	for i := 0; i < 50; i++ {
+		m.observe(detailRecord{Backend: "", ReqModel: fmt.Sprintf("junk-%d", i), Status: 400})
+	}
+	m.observe(detailRecord{Backend: "", ReqModel: "junk-1", Status: 429}) // already admitted: kept
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, mf := range mfs {
+		if mf.GetName() != "bodylog_requests_total" {
+			continue
+		}
+		for _, s := range mf.GetMetric() {
+			for _, lp := range s.GetLabel() {
+				if lp.GetName() == "req_model" {
+					seen[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	if len(seen) != 4 || !seen["other"] || !seen["junk-0"] || !seen["junk-1"] || !seen["junk-2"] {
+		t.Errorf("req_model values = %v, want junk-0..2 + other", seen)
+	}
+
+	m2 := newMetrics(prometheus.NewRegistry())
+	long := strings.Repeat("a", reqModelMaxLen-1) + "模型" // the cut lands inside a multi-byte rune
+	got := m2.reqModelLabel(long)
+	if len(got) > reqModelMaxLen || !utf8.ValidString(got) {
+		t.Errorf("long name -> %q (len %d, valid=%v)", got, len(got), utf8.ValidString(got))
 	}
 }

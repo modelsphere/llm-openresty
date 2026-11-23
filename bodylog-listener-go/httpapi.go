@@ -252,7 +252,7 @@ func parseTimeParam(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("bad time %q (want RFC3339 or unix seconds)", s)
 }
 
-// metricsHandler: GET /metrics?start=&end=[&model=&peer=&status=&min_frt=&limit=]
+// metricsHandler: GET /metrics?start=&end=[&model=&req_model=&peer=&status=&min_frt=&limit=]
 //
 // 返回时间窗内每条请求的 metrics 明细（JSON 数组，非流式）。历史天读 metrics/details/<date>.parquet，
 // 当天读 live <date>.jsonl，两支用 UNION ALL BY NAME 合并（DuckDB 没有单函数同时吃两种格式）。
@@ -346,11 +346,16 @@ func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	var branches []string
 	if len(parquets) > 0 {
-		branches = append(branches, "SELECT * FROM read_parquet("+fileList(parquets)+")")
+		// union_by_name: parquets written before a column existed (e.g. req_model) sit next to
+		// newer ones; without it DuckDB reads multiple files by position and rejects the mismatch.
+		branches = append(branches, "SELECT * FROM read_parquet("+fileList(parquets)+", union_by_name=true)")
 	}
 	if len(jsonls) > 0 {
 		branches = append(branches, "SELECT * FROM "+readDetailsJSON(fileList(jsonls)))
 	}
+	// Zero-row branch that pins columns added later: a window covering only older parquets has no
+	// req_model column, and filtering on it would fail to bind instead of matching nothing.
+	branches = append(branches, "SELECT CAST(NULL AS VARCHAR) AS req_model WHERE false")
 	src := strings.Join(branches, " UNION ALL BY NAME ")
 
 	// 过滤/排序/游标统一按【结束时刻】(与 /summary 的结束时刻分桶口径一致)，已是 TIMESTAMPTZ。
@@ -374,6 +379,9 @@ func (a *aggregator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if v := q.Get("model"); v != "" {
 		where = append(where, "model = "+sqlStr(v))
+	}
+	if v := q.Get("req_model"); v != "" {
+		where = append(where, "req_model = "+sqlStr(v))
 	}
 	if v := q.Get("peer"); v != "" {
 		where = append(where, "(backend = "+sqlStr(v)+" OR peer = "+sqlStr(v)+")")
