@@ -158,7 +158,8 @@ type detailRecord struct {
 	Backend          string  `json:"backend"`                // 归一化后的真实后端 host:port（= 聚合用的 peer key）
 	Mode             string  `json:"mode,omitempty"`
 	SessionSrc       string  `json:"session_src,omitempty"`
-	Model            string  `json:"model,omitempty"`
+	Model            string  `json:"model,omitempty"`     // model the response reports (2xx only; what actually served it)
+	ReqModel         string  `json:"req_model,omitempty"` // model the client asked for, from req_body (set even when openresty rejects)
 	FinishReason     string  `json:"finish_reason,omitempty"`
 	Frt              float64 `json:"frt"` // first_chunk_t（≈ TTFT，流式首 token）
 	Lct              float64 `json:"lct"` // last_chunk_t
@@ -185,6 +186,7 @@ func extractDetail(m map[string]any) detailRecord {
 		URI:              getString(m["uri"]),
 		Method:           getString(m["method"]),
 		Stream:           streamOf(m),
+		ReqModel:         extractReqModel(m),
 		Status:           getInt64(m["status"]),
 		Peer:             getString(m["peer"]),
 		ForwardedTo:      getString(m["forwarded_to"]),
@@ -1296,6 +1298,82 @@ func extractStream(m map[string]any) *bool {
 	return &v
 }
 
+// extractReqModel returns the top-level "model" of the request body, i.e. the model the client
+// asked for. It is kept apart from Model (the name the response reports): the two can differ
+// (aliases, routers that rewrite it), and Model is empty whenever there is no 2xx response --
+// openresty's own 429/400 replies carry no model -- so without this those rejections cannot be
+// attributed to a model at all.
+// Empty when req_body is empty, base64 (non-utf8) or has no top-level string "model".
+func extractReqModel(m map[string]any) string {
+	if b, _ := m["req_body_b64"].(bool); b {
+		return ""
+	}
+	return topLevelString(getString(m["req_body"]), "model")
+}
+
+// topLevelString finds key in the outermost JSON object of body and returns its value if that
+// value is a string. It walks the bytes once, tracking nesting and string boundaries, instead of
+// json.Unmarshal-ing a body that can be several MB. Only depth-1 keys match: a "model" inside
+// metadata or tool schemas is ignored, and so is any "model" text inside message content (it
+// sits inside a JSON string there). A body cut short (truncated capture) just yields "".
+func topLevelString(body, key string) string {
+	want := `"` + key + `"`
+	depth := 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+		case '"':
+			end := stringEnd(body, i)
+			if end < 0 {
+				return ""
+			}
+			if depth == 1 && body[i:end+1] == want {
+				j := skipSpace(body, end+1)
+				if j < len(body) && body[j] == ':' {
+					j = skipSpace(body, j+1)
+					if j < len(body) && body[j] == '"' {
+						vend := stringEnd(body, j)
+						if vend < 0 {
+							return ""
+						}
+						var v string
+						if json.Unmarshal([]byte(body[j:vend+1]), &v) != nil {
+							return ""
+						}
+						return v
+					}
+				}
+			}
+			i = end
+		}
+	}
+	return ""
+}
+
+// stringEnd returns the index of the closing quote of the JSON string opening at body[start],
+// or -1 if the body ends first.
+func stringEnd(body string, start int) int {
+	for i := start + 1; i < len(body); i++ {
+		switch body[i] {
+		case '\\':
+			i++
+		case '"':
+			return i
+		}
+	}
+	return -1
+}
+
+func skipSpace(body string, i int) int {
+	for i < len(body) && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == '\r') {
+		i++
+	}
+	return i
+}
+
 // streamOf 取请求的 stream(*bool)。handleConn 会预先把 extractStream 结果缓存进
 // m["__stream"](避免 ingest 与 extractDetail 各扫一遍 req_body);没缓存时现算兜底。
 func streamOf(m map[string]any) *bool {
@@ -1338,7 +1416,7 @@ func sqlStr(s string) string {
 const detailsColumns = "{" +
 	"'ts':'VARCHAR','ts_end':'VARCHAR','request_id':'VARCHAR','source_addr':'VARCHAR','uri':'VARCHAR'," +
 	"'method':'VARCHAR','stream':'BOOLEAN','status':'BIGINT','peer':'VARCHAR','forwarded_to':'VARCHAR'," +
-	"'backend':'VARCHAR','mode':'VARCHAR','session_src':'VARCHAR','model':'VARCHAR'," +
+	"'backend':'VARCHAR','mode':'VARCHAR','session_src':'VARCHAR','model':'VARCHAR','req_model':'VARCHAR'," +
 	"'finish_reason':'VARCHAR','frt':'DOUBLE','lct':'DOUBLE','rt':'DOUBLE'," +
 	"'chunk_count':'BIGINT','req_bytes':'BIGINT','resp_bytes':'BIGINT'," +
 	"'prompt_tokens':'BIGINT','completion_tokens':'BIGINT','cached_tokens':'BIGINT'," +

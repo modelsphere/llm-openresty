@@ -11,7 +11,7 @@
 | 分钟聚合 | `metrics/YYYY-MM-DD.jsonl` | per-minute × per-peer × **stream** 汇总(`/summary` 用) | ~29MB/天 |
 | **每请求 metrics 明细** | `metrics/details/YYYY-MM-DD.jsonl`(跨天 `→ .parquet`) | 每请求一行,**剥所有正文** | ~400-500B/行,~187MB/天 jsonl / ~25MB parquet |
 
-明细字段(无正文):`ts, request_id, source_addr, uri, method, stream(从 req_body 提取的请求参数,null=未传), status, peer, forwarded_to, backend(归一化真实后端 host:port), mode, session_src, model, finish_reason, frt(=first_chunk_t/TTFT), lct, rt, chunk_count, req_bytes, resp_bytes, prompt_tokens, completion_tokens, cached_tokens, total_tokens, reasoning_tokens`。
+明细字段(无正文):`ts, request_id, source_addr, uri, method, stream(从 req_body 提取的请求参数,null=未传), status, peer, forwarded_to, backend(归一化真实后端 host:port), mode, session_src, model (the model the response reports; empty without a 2xx response, e.g. openresty's own 429), req_model (top-level `model` of the request body; set even for rejected requests), finish_reason, frt(=first_chunk_t/TTFT), lct, rt, chunk_count, req_bytes, resp_bytes, prompt_tokens, completion_tokens, cached_tokens, total_tokens, reasoning_tokens`。
 **显式不含** `req_body/resp_body/req_headers/resp_meta.reasoning/resp_meta.tool_calls`。
 
 明细当天用 jsonl 热写(append 友好);跨天封口后由 `housekeep`(跨天 + 每 6h)经进程内 DuckDB
@@ -57,7 +57,7 @@ per-minute aggregates in `metrics/`. Retention and archiving therefore never tou
 - `GET /healthz` → `OK`(无需鉴权)
 - `GET /summary?minutes=5[&breakdown=true][&stream=true|false]` → N 分钟 per-peer 分钟聚合
   - 内部按 (minute, peer, **stream**) 分桶。**默认跨 stream 合并**回 (minute,peer)(`buckets[]` 仍一行一 (minute,peer),monitor 兼容);`stream=true|false` 时只返回该类请求的聚合。stream 取自请求参数(从 req_body 提取,未传/未知归入空桶,默认合并里照常计入)。
-- `GET /metrics?start=&end=[&model=&peer=&status=&min_frt=&stream=&limit=]` → **时间窗内每条请求的 metrics 明细**
+- `GET /metrics?start=&end=[&model=&req_model=&peer=&status=&min_frt=&stream=&limit=]` → **时间窗内每条请求的 metrics 明细**
   - `start`/`end`:RFC3339(`2026-06-18T12:48:00+08:00`)、`YYYY-MM-DDTHH:MM:SS`(按本地时区)或 Unix 秒。必填。
   - 可选过滤:`model`、`peer`(匹配 backend 或原始 peer)、`status`、`min_frt`(秒)、`stream`(`true`只流式/`false`只非流式/`null`只未传 stream)、`limit`(默认=上限 5000)。
   - 历史天读 `metrics/details/<date>.parquet`,当天读 live `<date>.jsonl`,两支 **`UNION ALL BY NAME`** 合并(DuckDB 无单函数同吃两格式)。
