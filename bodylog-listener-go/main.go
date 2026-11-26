@@ -186,7 +186,7 @@ func extractDetail(m map[string]any) detailRecord {
 		URI:              getString(m["uri"]),
 		Method:           getString(m["method"]),
 		Stream:           streamOf(m),
-		ReqModel:         extractReqModel(m),
+		ReqModel:         reqModelOf(m),
 		Status:           getInt64(m["status"]),
 		Peer:             getString(m["peer"]),
 		ForwardedTo:      getString(m["forwarded_to"]),
@@ -664,15 +664,31 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 		m["source_addr"] = sourceAddr
 	}
 	// req_body：utf8 → 直接放，否则 base64
+	reqStr := string(req) // one copy, shared by req_body and the req_model scan below
 	if len(req) > 0 {
-		if utf8.Valid(req) {
-			m["req_body"] = string(req)
+		if utf8.ValidString(reqStr) {
+			m["req_body"] = reqStr
 		} else {
 			m["req_body"] = base64.StdEncoding.EncodeToString(req)
 			m["req_body_b64"] = true
 		}
 	} else {
 		m["req_body"] = ""
+	}
+	// req_model in the full record too, not only in the details: whatever reads the hourly files
+	// (log shippers into a log store, ad-hoc greps) gets the requested model without parsing a
+	// body of up to 10 MiB itself. Absent when the body names no top-level model.
+	//
+	// Read from the raw bytes, not from req_body: a body that is not valid UTF-8 is stored as
+	// base64 above, and that is common for exactly the bodies this matters for -- openresty cuts
+	// a body at 10 MiB on a byte boundary, often inside a multi-byte character -- while the
+	// top-level "model" itself is still plain JSON.
+	reqModel := topLevelString(reqStr, "model")
+	if reqModel != "" {
+		m["req_model"] = reqModel
+	} else {
+		// The record and the details must agree: no stale value from the sender's meta.
+		delete(m, "req_model")
 	}
 	// resp_body 处理（option D）：
 	//   - status >= 400：完整 SSE wire（lossless 复盘）
@@ -724,6 +740,9 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 	if err != nil {
 		return nil, nil, fmt.Errorf("entry marshal: %w", err)
 	}
+	// Cached after marshalling (so it stays out of the record), empty included: a body without a
+	// model is not scanned again for the details record.
+	m["__req_model"] = reqModel
 	return m, append(out, '\n'), nil
 }
 
@@ -1309,6 +1328,15 @@ func extractReqModel(m map[string]any) string {
 		return ""
 	}
 	return topLevelString(getString(m["req_body"]), "model")
+}
+
+// reqModelOf returns the value assembleEntry cached in m (empty included), so the details record
+// does not scan the body a second time; a map that did not come from assembleEntry is scanned.
+func reqModelOf(m map[string]any) string {
+	if v, ok := m["__req_model"].(string); ok {
+		return v
+	}
+	return extractReqModel(m)
 }
 
 // topLevelString finds key in the outermost JSON object of body and returns its value if that

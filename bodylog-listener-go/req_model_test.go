@@ -133,3 +133,62 @@ func TestMetricsReqModelMixedSchemas(t *testing.T) {
 		t.Fatalf("old-only window: got %d rows, want 0", len(rows))
 	}
 }
+
+// The full (hourly) record carries req_model too, for readers of those files that do not parse
+// the body themselves; the internal cache key stays out of it, and details reuse the same value.
+func TestAssembleEntryRawReqModel(t *testing.T) {
+	meta := []byte(`{"ts":"2026-11-26T15:00:00.000+08:00","request_id":"r1","status":429,"rt":0.001}`)
+	cases := []struct {
+		name string
+		req  []byte
+		want string // "" = field absent
+	}{
+		{"429 with model after messages", []byte(`{"messages":[{"role":"user","content":"hi"}],"model":"kimi-k3"}`), "kimi-k3"},
+		{"no model in body", []byte(`{"messages":[]}`), ""},
+		{"non-utf8 body without model (stored base64)", []byte{0xff, 0xfe, '{', '}'}, ""},
+		// A stray Latin-1 byte in the content: the body is stored as base64, the model is still read.
+		{"non-utf8 body with model", []byte("{\"messages\":[{\"content\":\"caf\xe9\"}],\"model\":\"kimi-k3\"}"), "kimi-k3"},
+		// openresty's 10 MiB cut lands inside a multi-byte character: model first, body cut mid-rune.
+		{"capture cut mid-rune", append([]byte(`{"model":"glm-5.3","messages":[{"content":"`), []byte("模型")[:4]...), "glm-5.3"},
+		{"empty body", nil, ""},
+	}
+	for _, c := range cases {
+		m, out, err := assembleEntry(meta, c.req, []byte(`{"error":"concurrency limit exceeded"}`), "10.0.0.1")
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(out, &raw); err != nil {
+			t.Fatalf("%s: record is not JSON: %v", c.name, err)
+		}
+		got, has := raw["req_model"]
+		if c.want == "" && has {
+			t.Errorf("%s: raw req_model should be absent, got %v", c.name, got)
+		}
+		if c.want != "" && got != c.want {
+			t.Errorf("%s: raw req_model=%v, want %q", c.name, got, c.want)
+		}
+		if _, leaked := raw["__req_model"]; leaked {
+			t.Errorf("%s: internal __req_model leaked into the record", c.name)
+		}
+		if d := extractDetail(m); d.ReqModel != c.want {
+			t.Errorf("%s: details req_model=%q, want %q", c.name, d.ReqModel, c.want)
+		}
+	}
+
+	// A req_model in the sender's meta must not survive when the body names none: the record and
+	// the details would then disagree.
+	metaRM := []byte(`{"ts":"2026-11-26T15:00:00.000+08:00","request_id":"r2","status":200,"rt":0.1,"req_model":"from-meta"}`)
+	m, out, err := assembleEntry(metaRM, []byte(`{"messages":[]}`), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	_ = json.Unmarshal(out, &raw)
+	if v, has := raw["req_model"]; has {
+		t.Errorf("meta req_model kept in the record: %v", v)
+	}
+	if d := extractDetail(m); d.ReqModel != "" {
+		t.Errorf("details req_model=%q, want empty", d.ReqModel)
+	}
+}
