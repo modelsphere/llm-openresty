@@ -186,7 +186,7 @@ func extractDetail(m map[string]any) detailRecord {
 		URI:              getString(m["uri"]),
 		Method:           getString(m["method"]),
 		Stream:           streamOf(m),
-		ReqModel:         extractReqModel(m),
+		ReqModel:         reqModelOf(m),
 		Status:           getInt64(m["status"]),
 		Peer:             getString(m["peer"]),
 		ForwardedTo:      getString(m["forwarded_to"]),
@@ -674,6 +674,13 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 	} else {
 		m["req_body"] = ""
 	}
+	// req_model in the full record too, not only in the details: whatever reads the hourly files
+	// (log shippers into a log store, ad-hoc greps) gets the requested model without parsing a
+	// body of up to 10 MiB itself. Absent when the body names no top-level model.
+	reqModel := extractReqModel(m)
+	if reqModel != "" {
+		m["req_model"] = reqModel
+	}
 	// resp_body 处理（option D）：
 	//   - status >= 400：完整 SSE wire（lossless 复盘）
 	//   - status < 400：抽取 content 文本 + resp_meta（finish_reason/usage/model/tool_calls/...）
@@ -724,6 +731,9 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 	if err != nil {
 		return nil, nil, fmt.Errorf("entry marshal: %w", err)
 	}
+	// Cached after marshalling (so it stays out of the record), empty included: a body without a
+	// model is not scanned again for the details record.
+	m["__req_model"] = reqModel
 	return m, append(out, '\n'), nil
 }
 
@@ -1309,6 +1319,15 @@ func extractReqModel(m map[string]any) string {
 		return ""
 	}
 	return topLevelString(getString(m["req_body"]), "model")
+}
+
+// reqModelOf returns the value assembleEntry cached in m (empty included), so the details record
+// does not scan the body a second time; a map that did not come from assembleEntry is scanned.
+func reqModelOf(m map[string]any) string {
+	if v, ok := m["__req_model"].(string); ok {
+		return v
+	}
+	return extractReqModel(m)
 }
 
 // topLevelString finds key in the outermost JSON object of body and returns its value if that

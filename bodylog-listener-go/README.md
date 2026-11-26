@@ -7,7 +7,7 @@
 
 | 产物 | 路径 | 内容 | 大小量级 |
 |---|---|---|---|
-| 全量 bodylog | `YYYY-MM-DD/HH.jsonl`(跨天 `→ YYYY-MM-DD.tar.gz`) | 每请求一行,**含 req/resp 正文** | ~84KB/行,~18GB/天 |
+| 全量 bodylog | `YYYY-MM-DD/HH.jsonl`(跨天 `→ YYYY-MM-DD.tar.gz`) | 每请求一行,**含 req/resp 正文**; also `req_model` (top-level `model` of the request body, absent when it has none), so readers of these files need not parse the body | ~84KB/行,~18GB/天 |
 | 分钟聚合 | `metrics/YYYY-MM-DD.jsonl` | per-minute × per-peer × **stream** 汇总(`/summary` 用) | ~29MB/天 |
 | **每请求 metrics 明细** | `metrics/details/YYYY-MM-DD.jsonl`(跨天 `→ .parquet`) | 每请求一行,**剥所有正文** | ~400-500B/行,~187MB/天 jsonl / ~25MB parquet |
 
