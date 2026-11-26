@@ -664,9 +664,10 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 		m["source_addr"] = sourceAddr
 	}
 	// req_body：utf8 → 直接放，否则 base64
+	reqStr := string(req) // one copy, shared by req_body and the req_model scan below
 	if len(req) > 0 {
-		if utf8.Valid(req) {
-			m["req_body"] = string(req)
+		if utf8.ValidString(reqStr) {
+			m["req_body"] = reqStr
 		} else {
 			m["req_body"] = base64.StdEncoding.EncodeToString(req)
 			m["req_body_b64"] = true
@@ -677,9 +678,17 @@ func assembleEntry(metaJSON, req, resp []byte, sourceAddr string) (map[string]an
 	// req_model in the full record too, not only in the details: whatever reads the hourly files
 	// (log shippers into a log store, ad-hoc greps) gets the requested model without parsing a
 	// body of up to 10 MiB itself. Absent when the body names no top-level model.
-	reqModel := extractReqModel(m)
+	//
+	// Read from the raw bytes, not from req_body: a body that is not valid UTF-8 is stored as
+	// base64 above, and that is common for exactly the bodies this matters for -- openresty cuts
+	// a body at 10 MiB on a byte boundary, often inside a multi-byte character -- while the
+	// top-level "model" itself is still plain JSON.
+	reqModel := topLevelString(reqStr, "model")
 	if reqModel != "" {
 		m["req_model"] = reqModel
+	} else {
+		// The record and the details must agree: no stale value from the sender's meta.
+		delete(m, "req_model")
 	}
 	// resp_body 处理（option D）：
 	//   - status >= 400：完整 SSE wire（lossless 复盘）
